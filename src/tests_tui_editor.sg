@@ -1,0 +1,69 @@
+import tui;
+
+def editor_assert(value: bool, message: &str) -> Result<bool, i64> { if not value { println(message); return Result { is_ok: false, value: false, error: 1 }; }; tui_true() }
+def editor_key(kind: i64, code: i64, modifiers: i64, text: &str) -> TerminalEvent { TerminalEvent { kind: kind, code: code, modifiers: modifiers, width: 110, height: 35, data: cli_text(text) } }
+def editor_character(app: &mut UiApp, code: i64, text: &str) -> Result<UiAction, i64> { let event = editor_key(1, code, 0, text); tui_event(app, &event) }
+def editor_command(app: &mut UiApp, text: &str) -> Result<bool, i64> { tui_set_draft(app, text)?; let enter = editor_key(1, 13, 0, ""); let first = tui_event(app, &enter)?; let second = tui_event(app, &enter)?; editor_assert(first.kind == 0 and second.kind == 0, "internal editor commands never reach the provider") }
+
+def editor_tests() -> Result<i64, i64> {
+    let mut app = tui_new("fixture", "fixture", "fixture", "fixture"); app.keymap = keys_new();
+    let base = commands_registry(); let names = commands_names(&base)?; let enabled = commands_names(&app.registry)?;
+    editor_assert(not str_contains(names.as_str(), "/keys") and not str_contains(names.as_str(), "/read") and str_contains(enabled.as_str(), "/keys") and str_contains(enabled.as_str(), "/read"), "editor/read are fullscreen-only capabilities")?;
+    let enter = editor_key(1, 13, 0, ""); let esc = editor_key(1, 27, 0, ""); let cancel = editor_key(4, 3, 4, "");
+    tui_set_draft(&mut app, "/keys vi")?; editor_assert(app.menu_open and app.completions.len() == 1 and app.keymap.mode.as_str() == "default", "keys mode has registry-owned argument completion")?;
+    editor_assert(tui_event(&mut app, &enter)?.kind == 0 and app.draft.as_str() == "/keys vim " and app.keymap.mode.as_str() == "default", "first Enter only completes editor selection")?;
+    editor_assert(tui_event(&mut app, &enter)?.kind == 0 and app.keymap.mode.as_str() == "vim" and app.vim.insert, "second Enter selects Vim INSERT without a model request")?;
+    tui_set_draft(&mut app, "x👨‍👩‍👧‍👦")?; tui_event(&mut app, &esc)?;
+    editor_assert(not app.vim.insert and str_contains(tui_frame(&app)?.as_str(), "VIM NORMAL"), "Vim state is visible")?;
+    editor_character(&mut app, 104, "h")?; editor_character(&mut app, 120, "x")?;
+    editor_assert(app.draft.as_str() == "x" and app.cursor == 1, "Vim edit uses Unicode 17 graphemes")?;
+    editor_character(&mut app, 117, "u")?; editor_assert(app.draft.as_str() == "x👨‍👩‍👧‍👦", "Vim undo restores composer")?;
+    let sent = tui_event(&mut app, &enter)?; editor_assert(sent.kind == 1 and app.draft.len() == 0 and app.vim.undo.len() == 0 and app.vim.insert, "explicit send resets undo and editor mode")?;
+    tui_event(&mut app, &esc)?; editor_character(&mut app, 117, "u")?; editor_assert(app.draft.len() == 0, "undo cannot restore a submitted task")?;
+    let paste = editor_key(2, 0, 0, "dd\n/permissions auto-edit"); editor_assert(tui_event(&mut app, &paste)?.kind == 0 and app.vim.insert and app.draft.as_str() == "dd\n/permissions auto-edit", "paste is literal and switches NORMAL to INSERT")?;
+    tui_set_draft(&mut app, "typed 中文")?; let backspace = editor_key(1, 8, 0, ""); tui_event(&mut app, &backspace)?; tui_event(&mut app, &esc)?; editor_character(&mut app, 117, "u")?;
+    editor_assert(app.draft.as_str() == "typed 中文", "an insert session starting with deletion remains undoable")?;
+
+    tui_set_draft(&mut app, "draft to preserve")?; tui_begin(&mut app)?; tui_event(&mut app, &esc)?;
+    editor_assert(app.busy and not app.vim.insert and str_contains(tui_footer(&app), "Ctrl+C cancel"), "Vim Escape only changes mode; explicit cancel hint remains visible")?;
+    editor_assert(tui_event(&mut app, &cancel)?.kind == 2 and app.draft.as_str() == "draft to preserve", "Ctrl+C cancels through Vim without changing draft")?;
+    tui_set_approval(&mut app, "fresh-editor", "Write a file?", false)?; editor_character(&mut app, 105, "i")?; editor_character(&mut app, 121, "y")?;
+    let deny = tui_event(&mut app, &enter)?; editor_assert(deny.kind == 5 and deny.text.as_str() == "no" and not app.vim.insert and app.draft.as_str() == "draft to preserve", "approval focus cannot be edited or approved through Vim keys")?;
+    let choices: Vec<UiCandidate> = vec_new(); choices.push(UiCandidate { id: cli_text("one"), label: cli_text("one"), detail: string_new(), value: cli_text("one") });
+    tui_set_candidates(&mut app, "model", "Choose model", choices)?; editor_character(&mut app, 105, "i")?;
+    editor_assert(app.picker_query.as_str() == "i" and not app.vim.insert and app.draft.as_str() == "draft to preserve", "picker owns text while Vim is NORMAL")?; tui_event(&mut app, &esc)?;
+    tui_finish(&mut app, true)?;
+
+    editor_command(&mut app, "/keys default")?; editor_assert(app.keymap.mode.as_str() == "default", "explicit default editor selection")?;
+    app.keymap = keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"alt+b\",\"action\":\"word_left\"}]}", "fixture")?;
+    tui_set_draft(&mut app, "中文 next")?; let altb = editor_key(1, 98, 2, "b"); tui_event(&mut app, &altb)?;
+    editor_assert(app.cursor == 7 and app.draft.as_str() == "中文 next", "custom composer keys apply without inserting modifier text")?;
+    tui_set_approval(&mut app, "fresh-custom", "Run a command?", false)?; tui_event(&mut app, &altb)?; let custom_deny = tui_event(&mut app, &enter)?;
+    editor_assert(custom_deny.kind == 5 and custom_deny.text.as_str() == "no" and app.cursor == 7, "custom keymap does not penetrate approval focus")?;
+    editor_command(&mut app, "/keys reset")?; editor_assert(app.keymap.bindings.len() == 0 and app.keymap.mode.as_str() == "default", "reset affects in-memory editor only")?;
+
+    let mut index = 0; while index < 24 { let row = cli_text("history "); row.push_i64(index)?; tui_message(&mut app, "assistant", row.as_str())?; index = index + 1; };
+    tui_set_draft(&mut app, "untouched 中文 draft")?; app.cursor = 3; tui_begin(&mut app)?; tui_delta(&mut app, "live output\n")?;
+    app.queue.push(InputHistory { text: cli_text("queued task") }); let read = editor_key(1, 18, 4, ""); tui_event(&mut app, &read)?;
+    editor_assert(app.reading.active and app.draft.as_str() == "untouched 中文 draft" and app.cursor == 3 and str_contains(tui_frame(&app)?.as_str(), "READING"), "Ctrl+R reads output without taking the composer")?;
+    editor_character(&mut app, 107, "k")?; let anchored = app.scroll; tui_delta(&mut app, "new while reading\n")?;
+    editor_assert(app.scroll > anchored and app.cursor == 3 and app.draft.as_str() == "untouched 中文 draft", "streaming preserves reading anchor and draft")?;
+    let before_finish = app.transcript.len() + app.stream_lines.len() + app.tail_rows.len() + 2; let previous_scroll = app.scroll;
+    tui_finish(&mut app, true)?; let expected_scroll = previous_scroll + app.transcript.len() - before_finish;
+    editor_assert(app.scroll == if expected_scroll > 0 { expected_scroll } else { 0 }, "finishing a stream preserves the reading anchor when live rows become transcript rows")?;
+    editor_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 1, "reading focus prevents automatic queue dispatch")?;
+    editor_assert(tui_event(&mut app, &enter)?.kind == 0 and app.reading.active and app.draft.as_str() == "untouched 中文 draft", "reading Enter is inert")?;
+    tui_set_approval(&mut app, "fresh-read", "Approve?", false)?; let read_deny = tui_event(&mut app, &enter)?;
+    editor_assert(read_deny.kind == 5 and read_deny.text.as_str() == "no" and app.reading.active, "approval takes priority over reading focus")?;
+    editor_character(&mut app, 113, "q")?;
+    editor_assert(not app.reading.active and app.draft.as_str() == "untouched 中文 draft" and app.cursor == 3 and tui_take_submission(&mut app)?.kind == 0 and app.queue_paused, "explicit reading return restores the composer and retains the earlier Ctrl+C queue pause")?;
+    tui_queue_pick(&mut app, "queue", "resume")?;
+    editor_assert(tui_take_submission(&mut app)?.text.as_str() == "queued task", "only explicit queue resume permits dispatch after cancellation")?;
+    tui_begin(&mut app)?; editor_assert(tui_event(&mut app, &esc)?.kind == 2 and app.draft.as_str() == "untouched 中文 draft", "default editor Escape still cancels active work")?;
+    tui_finish(&mut app, false)?; editor_command(&mut app, "/read")?; editor_assert(app.reading.active, "/read is internal and starts reading focus")?; tui_event(&mut app, &esc)?;
+    editor_command(&mut app, "/keys")?; editor_assert(app.picker.as_str() == "keys", "keys command opens a discoverable picker")?; tui_event(&mut app, &enter)?;
+    editor_assert(app.picker.len() == 0 and app.keymap.mode.as_str() == "default", "default picker choice keeps current editor")?;
+    println("editor integration: fullscreen gates, two-step selection, Unicode Vim, safe keys, approvals, queue, reading focus and unchanged default cancellation passed"); cli_ok(0)
+}
+
+def main() -> i64 { let result = editor_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

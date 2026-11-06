@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "runtimeId": "codex-app-server",
+  "releaseTag": "rust-v0.144.4",
+  "version": "0.144.4",
+  "platform": "windows",
+  "architecture": "x86_64",
+  "targetTriple": "x86_64-pc-windows-msvc",
+  "asset": {
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.144.4/codex-app-server-x86_64-pc-windows-msvc.exe.zip",
+    "archiveSize": 94026799,
+    "maximumArchiveSize": 100663296,
+    "sha256": "a7dd606b95e891ad4a272ed3048b909f7192495bf94466966eaae1152cbe7865",
+    "archiveEntry": "codex-app-server-x86_64-pc-windows-msvc.exe"
+  },
+  "installRelativePath": "codex/0.144.4/x86_64-pc-windows-msvc/codex-app-server.exe",
+  "schema": {
+    "fingerprintSha256": "ce60b1ce3632c026f26c6eedfd516ab2836384b6dcc20bde540f5cffbaa2ce21",
+    "generatorAssetUrl": "https://github.com/openai/codex/releases/download/rust-v0.144.4/codex-x86_64-pc-windows-msvc.exe.zip",
+    "generatorArchiveSize": 114554684,
+    "generatorMaximumArchiveSize": 125829120,
+    "generatorSha256": "d731eee110fe287fcb8e201e9bdf39920e863bfc3c97f21e2d697a35d38c63c5",
+    "generatorExecutableEntry": "codex-x86_64-pc-windows-msvc.exe",
+    "generatorArchiveEntries": [
+      "codex-command-runner.exe",
+      "codex-windows-sandbox-setup.exe",
+      "codex-x86_64-pc-windows-msvc.exe"
+    ],
+    "generatedFileCount": 267,
+    "generatedTotalBytes": 2720160,
+    "combinedSchemaFile": "codex_app_server_protocol.schemas.json"
+  }
+}

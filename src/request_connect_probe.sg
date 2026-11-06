@@ -1,0 +1,27 @@
+import common;
+import std::net;
+import std::env;
+import std::time;
+import command_line;
+
+def probe() -> Result<bool, i64> {
+    let args = cli_arguments()?;
+    let port = cli_parse_unsigned(args.root().object_get("positionals")?.array_get(0)?.string_value()?.as_str(), 10)?;
+    let stream = net_stream_start("127.0.0.1", port, false, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 1000, 1000, 4096)?;
+    let buffer = ffi_buffer_new(4096)?;
+    let started = time_unix_ms();
+    loop {
+        let read = stream.read_into(buffer);
+        if read.ready {
+            println(read.error); println(read.eof); println(stream.request_started()?);
+            if read.error != 0 { println("network error branch"); } else { println("no network error branch"); };
+            if read.eof { println("EOF branch"); } else { println("not EOF branch"); };
+            break;
+        };
+        if time_since_ms(started) > 5000 { return Result { is_ok: false, value: false, error: 11 }; };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 { let result = probe(); if not result.is_ok() { println(result.error); return 1; }; 0 }

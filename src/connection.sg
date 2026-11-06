@@ -1,0 +1,189 @@
+import provider;
+
+struct ProviderConnection {
+    id: String,
+    base: String,
+    model: String,
+    effort: String,
+    protocol: i64,
+    images: bool,
+}
+
+impl ProviderConnection {
+    def connection_id(&self) -> &str { self.id.as_str() }
+    def base_url(&self) -> &str { self.base.as_str() }
+    def model_id(&self) -> &str { self.model.as_str() }
+    def effort_id(&self) -> &str { self.effort.as_str() }
+    def protocol_id(&self) -> i64 { self.protocol }
+    def images_allowed(&self) -> bool { self.images }
+}
+
+// Image input is opt-in for an exact enabled model. Protocol support and model
+// names alone never grant a vision capability.
+def connection_images_supported(source: JsonValue, model: &str) -> Result<bool, i64> {
+    if source.object_has("capabilities") {
+        let caps = source.object_get("capabilities")?;
+        if caps.object_has("visionSupported") and not caps.object_get("visionSupported")?.bool_value()? { return Result { is_ok: true, value: false, error: 0 }; };
+    };
+    if not source.object_has("enabledModels") { return Result { is_ok: true, value: false, error: 0 }; };
+    let models = source.object_get("enabledModels")?;
+    if models.array_len()? > 256 { return Result { is_ok: false, value: false, error: 13 }; };
+    let mut index = 0;
+    while index < models.array_len()? {
+        let item = models.array_get(index)?;
+        if cli_json_optional_string(item, "id").as_str() == model and item.object_has("capabilities") {
+            let caps = item.object_get("capabilities")?;
+            let supported = caps.object_has("visionSupported") and caps.object_get("visionSupported")?.bool_value()?;
+            return Result { is_ok: true, value: supported, error: 0 };
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: false, error: 0 }
+}
+
+// The desktop workbench exposes exactly these levels. Keep this helper in the
+// connection boundary so every picker and request path shares the same closed
+// vocabulary; an empty request selects medium when the exact model permits it.
+// A capability denial or a subset without medium keeps the provider default.
+def connection_effort_valid(effort: &str) -> bool {
+    effort.len() == 0 or effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh" or effort == "max"
+}
+
+def connection_default_effort() -> &str { "medium" }
+
+def connection_efforts_copy(document: &JsonDoc, source: JsonValue, output: JsonValue) -> Result<bool, i64> {
+    if source.kind()? != JSON_KIND_ARRAY() { return Result { is_ok: true, value: true, error: 0 }; };
+    let mut index = 0;
+    while index < source.array_len()? and index < 16 {
+        let entry = source.array_get(index)?;
+        let value = if entry.kind()? == JSON_KIND_STRING() { entry.string_value()? } else {
+            if entry.kind()? != JSON_KIND_OBJECT() { index = index + 1; continue; };
+            if entry.object_has("value") { cli_json_optional_string(entry, "value") } else { cli_json_optional_string(entry, "id") }
+        };
+        if connection_effort_valid(value.as_str()) and value.len() > 0 {
+            let mut duplicate = false; let mut previous = 0;
+            while previous < output.array_len()? { if output.array_get(previous)?.string_value()?.as_str() == value.as_str() { duplicate = true; break; }; previous = previous + 1; };
+            if not duplicate { output.array_push(document.new_string(value.as_str())?)?; (); };
+        };
+        index = index + 1;
+    }; Result { is_ok: true, value: true, error: 0 }
+}
+
+def connection_efforts_denied(value: JsonValue) -> Result<bool, i64> {
+    if not value.object_has("capabilities") or value.object_get("capabilities")?.kind()? != JSON_KIND_OBJECT() { return Result { is_ok: true, value: false, error: 0 }; };
+    let caps = value.object_get("capabilities")?;
+    if caps.object_has("reasoningEffort") and not caps.object_get("reasoningEffort")?.bool_value()? { return Result { is_ok: true, value: true, error: 0 }; };
+    if caps.object_has("supportsReasoningEffort") and not caps.object_get("supportsReasoningEffort")?.bool_value()? { return Result { is_ok: true, value: true, error: 0 }; };
+    Result { is_ok: true, value: false, error: 0 }
+}
+
+// Shared capability admission for the public picker and the request snapshot.
+// Explicit model lists narrow connection capabilities. Empty lists are a real
+// denial, and normalized picker rows retain their narrowed `efforts` list.
+def connection_efforts(document: &JsonDoc, connection: JsonValue, model: JsonValue) -> Result<JsonValue, i64> {
+    let output = document.new_array()?;
+    if connection_efforts_denied(connection)? or connection_efforts_denied(model)? { return Result { is_ok: true, value: output, error: 0 }; };
+    let mut found = false;
+    if model.object_has("efforts") { connection_efforts_copy(document, model.object_get("efforts")?, output)?; found = true; };
+    if not found and model.object_has("supportedReasoningEfforts") { connection_efforts_copy(document, model.object_get("supportedReasoningEfforts")?, output)?; found = true; };
+    if not found and model.object_has("reasoningEfforts") { connection_efforts_copy(document, model.object_get("reasoningEfforts")?, output)?; found = true; };
+    if not found and model.object_has("capabilities") and model.object_get("capabilities")?.kind()? == JSON_KIND_OBJECT() {
+        let caps = model.object_get("capabilities")?;
+        if caps.object_has("supportedReasoningEfforts") { connection_efforts_copy(document, caps.object_get("supportedReasoningEfforts")?, output)?; found = true; };
+        if not found and caps.object_has("reasoningEfforts") { connection_efforts_copy(document, caps.object_get("reasoningEfforts")?, output)?; found = true; };
+    };
+    if not found and connection.object_has("capabilities") and connection.object_get("capabilities")?.kind()? == JSON_KIND_OBJECT() {
+        let caps = connection.object_get("capabilities")?;
+        if caps.object_has("supportedReasoningEfforts") { connection_efforts_copy(document, caps.object_get("supportedReasoningEfforts")?, output)?; found = true; };
+        if not found and caps.object_has("reasoningEfforts") { connection_efforts_copy(document, caps.object_get("reasoningEfforts")?, output)?; found = true; };
+    };
+    if not found {
+        // Native protocol support is an encoder contract, not a promise that
+        // every remote endpoint accepts the field. Explicit false above wins.
+        let kind = cli_json_optional_string(connection, "kind");
+        let mut protocol = cli_json_optional_string(connection, "protocol");
+        if protocol.as_str() == "auto" { protocol = if connection.object_has("successfulProtocol") { cli_json_optional_string(connection, "successfulProtocol") } else { cli_json_optional_string(connection, "successful_protocol") }; };
+        let mut enabled = (kind.len() == 0 or kind.as_str() == "customApi") and provider_protocol(protocol.as_str()) >= 0;
+        if connection.object_has("capabilities") and connection.object_get("capabilities")?.kind()? == JSON_KIND_OBJECT() {
+            let caps = connection.object_get("capabilities")?;
+            if caps.object_has("reasoningEffort") { enabled = caps.object_get("reasoningEffort")?.bool_value()?; };
+            if caps.object_has("supportsReasoningEffort") { enabled = caps.object_get("supportsReasoningEffort")?.bool_value()?; };
+        };
+        if model.object_has("capabilities") and model.object_get("capabilities")?.kind()? == JSON_KIND_OBJECT() {
+            let caps = model.object_get("capabilities")?;
+            if caps.object_has("reasoningEffort") and caps.object_get("reasoningEffort")?.bool_value()? { enabled = true; };
+            if caps.object_has("supportsReasoningEffort") and caps.object_get("supportsReasoningEffort")?.bool_value()? { enabled = true; };
+        };
+        if enabled {
+            output.array_push(document.new_string("low")?)?; output.array_push(document.new_string("medium")?)?;
+            output.array_push(document.new_string("high")?)?; output.array_push(document.new_string("xhigh")?)?;
+            output.array_push(document.new_string("max")?)?; ();
+        };
+    }; Result { is_ok: true, value: output, error: 0 }
+}
+
+def connection_effort_from_options(efforts: JsonValue, requested: &str) -> Result<String, i64> {
+    if not connection_effort_valid(requested) { return string_result_err(2); };
+    let desired = if requested.len() > 0 { requested } else { connection_default_effort() };
+    let mut index = 0;
+    while index < efforts.array_len()? {
+        if efforts.array_get(index)?.string_value()?.as_str() == desired { return string_from_str(desired); };
+        index = index + 1;
+    };
+    if requested.len() > 0 { return string_result_err(8); };
+    string_from_str("")
+}
+
+def connection_effective_effort(source: JsonValue, model: &str, requested: &str) -> Result<String, i64> {
+    let temporary = json_doc_object()?;
+    let mut selected = temporary.new_object()?;
+    let mut models = JsonValue { doc_handle: 0, node_id: 0 };
+    if source.object_has("enabledModels") { models = source.object_get("enabledModels")?; } else {
+        if source.object_has("enabled_models") { models = source.object_get("enabled_models")?; };
+    };
+    if models.doc_handle != 0 {
+        if models.array_len()? > 256 { return string_result_err(13); };
+        let mut index = 0;
+        while index < models.array_len()? { let item = models.array_get(index)?; if cli_json_optional_string(item, "id").as_str() == model { selected = item; break; }; index = index + 1; };
+    };
+    let efforts = connection_efforts(&temporary, source, selected)?;
+    connection_effort_from_options(efforts, requested)
+}
+
+def connection_validate_effort(effort: &str) -> Result<String, i64> {
+    if not connection_effort_valid(effort) { return string_result_err(2); };
+    string_from_str(effort)
+}
+
+def connection_normalize(record: &JsonDoc, requested_model: &str) -> Result<ProviderConnection, i64> {
+    connection_with_effort(record, requested_model, "")
+}
+
+def connection_with_effort(record: &JsonDoc, requested_model: &str, requested_effort: &str) -> Result<ProviderConnection, i64> {
+    let root = record.root();
+    let id = if root.object_has("id") { cli_json_string(root, "id")? } else { cli_json_string(root, "connection_id")? };
+    let mut config = json_doc_object()?;
+    if root.object_has("config_json") { let text = cli_json_string(root, "config_json")?; config = json_parse(text.as_str())?; } else {
+        if root.object_has("configJson") { let text = cli_json_string(root, "configJson")?; config = json_parse(text.as_str())?; } else { config.root().object_set("value", config.copy(root)?)?; (); };
+    };
+    let source = if config.root().object_has("value") { config.root().object_get("value")? } else { config.root() };
+    let base = if source.object_has("base_url") { cli_json_string(source, "base_url")? } else { cli_json_string(source, "baseUrl")? };
+    let protocol_name = cli_json_string(source, "protocol")?;
+    let mut protocol = provider_protocol(protocol_name.as_str());
+    if protocol_name.as_str() == "auto" {
+        let successful = if source.object_has("successfulProtocol") { cli_json_string(source, "successfulProtocol")? } else { cli_json_optional_string(source, "successful_protocol") };
+        protocol = provider_protocol(successful.as_str());
+    };
+    let model = if requested_model.len() > 0 { cli_text(requested_model) } else {
+        if source.object_has("model") { cli_json_string(source, "model")? } else {
+            if source.object_has("selectedModelId") { cli_json_string(source, "selectedModelId")? } else { cli_json_string(source, "selected_model_id")? }
+        }
+    };
+    let images = connection_images_supported(source, model.as_str())?;
+    // Resolve once while the connection snapshot is captured. Later picker or
+    // configuration changes cannot change an in-flight request's owned value.
+    let effort = connection_effective_effort(source, model.as_str(), requested_effort)?;
+    let value = ProviderConnection { id: id, base: base, model: model, effort: effort, protocol: protocol, images: images };
+    if protocol < 0 or value.model.len() == 0 or not connection_effort_valid(requested_effort) { return Result { is_ok: false, value: value, error: 2 }; };
+    Result { is_ok: true, value: value, error: 0 }
+}

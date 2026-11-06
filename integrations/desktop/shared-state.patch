@@ -1,0 +1,1839 @@
+diff --git a/windows/sencode-desktop/src-tauri/Cargo.toml b/windows/sencode-desktop/src-tauri/Cargo.toml
+index aeb42b28..cb269536 100644
+--- a/windows/sencode-desktop/src-tauri/Cargo.toml
++++ b/windows/sencode-desktop/src-tauri/Cargo.toml
+@@ -81,7 +81,7 @@ tempfile = "3.27.0"
+ url = "2"
+ sha2 = "0.10.9"
+ zip = { version = "=8.1.0", default-features = false, features = ["deflate"] }
+-rusqlite = { version = "0.39.0", features = ["bundled", "backup"] }
++rusqlite = { version = "0.39.0", features = ["bundled", "backup", "functions"] }
+ chrono = { version = "0.4", features = ["serde"] }
+ sencode-voice = { path = "../../sencode-runtime/crates/codegen/sencode-voice" }
+ 
+diff --git a/windows/sencode-desktop/src-tauri/build.rs b/windows/sencode-desktop/src-tauri/build.rs
+index 0a5d0809..b45e9ecb 100644
+--- a/windows/sencode-desktop/src-tauri/build.rs
++++ b/windows/sencode-desktop/src-tauri/build.rs
+@@ -11,6 +11,13 @@ const SCHEMA_PATH: &str = "src/codex_runtime/protocol/codex_app_server_protocol.
+ const CONTRACT_PATH: &str = "src/codex_runtime/protocol/contract.json";
+ 
+ fn main() {
++    // Unit-test executables also link rfd/Windows TaskDialogIndirect. Cargo's
++    // test harness does not inherit Tauri's executable resources, so request
++    // common-controls v6 explicitly for every native executable.
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
++        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
++        println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
++    }
+     println!("cargo:rerun-if-changed={MANIFEST_PATH}");
+     println!("cargo:rerun-if-changed={SCHEMA_PATH}");
+     println!("cargo:rerun-if-changed={CONTRACT_PATH}");
+diff --git a/windows/sencode-desktop/src-tauri/src/persistence/mod.rs b/windows/sencode-desktop/src-tauri/src/persistence/mod.rs
+index 0e595516..e4dd14e7 100644
+--- a/windows/sencode-desktop/src-tauri/src/persistence/mod.rs
++++ b/windows/sencode-desktop/src-tauri/src/persistence/mod.rs
+@@ -11,13 +11,15 @@ use serde::{Deserialize, Serialize};
+ mod fusion;
+ mod subagents;
+ mod session_preferences;
++mod session_catalog;
+ mod plan_canvases;
++pub(crate) mod shared_store;
+ 
+ pub use fusion::*;
+ pub use subagents::*;
+ pub use session_preferences::*;
+ 
+-pub const CURRENT_SCHEMA_VERSION: i64 = 28;
++pub const CURRENT_SCHEMA_VERSION: i64 = 29;
+ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+ const MAX_SESSION_TITLE_SCALARS: usize = 30;
+ 
+@@ -1221,7 +1223,8 @@ fn title_session_from_message(
+             "UPDATE sessions
+              SET title = ?2, title_source = 'first_message',
+                  updated_at = MAX(updated_at, ?3)
+-             WHERE id = ?1 AND title_source = 'placeholder'",
++             WHERE id = ?1 AND title_source = 'placeholder'
++               AND (trim(title)='' OR lower(replace(trim(title),' ','')) IN('newchat','newtask'))",
+             rusqlite::params![message.session_id, title, message.created_at_ms],
+         )
+         .map_err(PersistenceError::from)?;
+@@ -1392,6 +1395,7 @@ pub struct LatestPromptReplaySessionState {
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct LatestPromptReplayRollback {
+     pub session_id: String,
++    pub replacement_message_id: String,
+     pub target_revision: i64,
+     pub session: LatestPromptReplaySessionState,
+     pub messages: Vec<LocalMessage>,
+@@ -1683,6 +1687,9 @@ pub struct HistoryImportResult {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct TerminalTurnCommit {
++    /// The accepted user message carries the immutable execution fence. None
++    /// is reserved for legacy records without any shared execution history.
++    pub accepted_user_message_id: Option<String>,
+     pub assistant_message: LocalMessage,
+     pub tools: Vec<LocalToolCall>,
+     pub binding: RuntimeBindingRecord,
+@@ -1708,6 +1715,7 @@ pub struct TerminalCommitOutcome {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct DispatchTurnPersist {
++    pub accepted_user_message_id: Option<String>,
+     pub assistant_message: LocalMessage,
+     pub binding: RuntimeBindingRecord,
+     pub accepted_at_ms: i64,
+@@ -2339,6 +2347,7 @@ enum ActorCommand {
+     },
+     CommitRuntimeErrorTerminal {
+         message: LocalMessage,
++        accepted_user_message_id: Option<String>,
+         accepted_at_ms: i64,
+         outcome: crate::dto::TurnOutcome,
+         reply: tokio::sync::oneshot::Sender<Result<TerminalCommitOutcome, PersistenceError>>,
+@@ -3062,6 +3071,7 @@ impl PersistenceActor {
+                         }
+                         ActorCommand::CommitRuntimeErrorTerminal {
+                             message,
++                            accepted_user_message_id,
+                             accepted_at_ms,
+                             outcome,
+                             reply,
+@@ -3071,6 +3081,7 @@ impl PersistenceActor {
+                                 accepted_at_ms,
+                                 outcome,
+                                 viewed_session_id.as_deref(),
++                                accepted_user_message_id.as_deref(),
+                             ));
+                         }
+                         ActorCommand::ComputeTerminalAttention {
+@@ -3468,6 +3479,64 @@ impl PersistenceActor {
+             .map_err(|_| PersistenceError::actor_stopped())?
+     }
+ 
++    pub async fn set_session_run_state_for_turn(
++        &self,
++        session_id: impl Into<String>,
++        accepted_user_message_id: impl Into<String>,
++        run_state: impl Into<String>,
++        updated_at_ms: i64,
++    ) -> Result<(), PersistenceError> {
++        let session_id = session_id.into();
++        let user = accepted_user_message_id.into();
++        let run_state = run_state.into();
++        self.fusion_op(move |database| {
++            database.set_session_run_state_for_turn(&session_id, &user, &run_state, updated_at_ms)
++        }).await
++    }
++
++    pub async fn validate_turn_fence(
++        &self,
++        session_id: impl Into<String>,
++        accepted_user_message_id: impl Into<String>,
++    ) -> Result<(), PersistenceError> {
++        let session_id = session_id.into();
++        let user = accepted_user_message_id.into();
++        self.fusion_op(move |database| {
++            shared_store::SharedStore::validate_turn_fence(&database.connection, &session_id, &user)
++        }).await
++    }
++
++    pub async fn upsert_runtime_binding_for_turn(
++        &self,
++        binding: RuntimeBindingRecord,
++        accepted_user_message_id: impl Into<String>,
++    ) -> Result<(), PersistenceError> {
++        let user = accepted_user_message_id.into();
++        self.fusion_op(move |database| {
++            shared_store::SharedStore::validate_turn_fence(&database.connection, &binding.session_id, &user)?;
++            database.upsert_runtime_binding(&binding)
++        }).await
++    }
++
++    /// Persist the fallback ACP projection and release its lease in one actor
++    /// operation. The user fence is checked before any new assistant is inserted.
++    pub async fn finish_projection_turn(
++        &self,
++        session_id: impl Into<String>,
++        accepted_user_message_id: impl Into<String>,
++        message: Option<LocalMessage>,
++        tools: Vec<LocalToolCall>,
++        run_state: impl Into<String>,
++        completed_at_ms: i64,
++    ) -> Result<(), PersistenceError> {
++        let session_id = session_id.into();
++        let user = accepted_user_message_id.into();
++        let run_state = run_state.into();
++        self.fusion_op(move |database| {
++            database.finish_projection_turn(&session_id, &user, message.as_ref(), &tools, &run_state, completed_at_ms)
++        }).await
++    }
++
+     pub async fn delete_session(
+         &self,
+         session_id: impl Into<String>,
+@@ -4456,11 +4525,13 @@ impl PersistenceActor {
+         message: LocalMessage,
+         accepted_at_ms: i64,
+         outcome: crate::dto::TurnOutcome,
++        accepted_user_message_id: Option<String>,
+     ) -> Result<TerminalCommitOutcome, PersistenceError> {
+         let (reply, response) = tokio::sync::oneshot::channel();
+         self.tx
+             .send(ActorCommand::CommitRuntimeErrorTerminal {
+                 message,
++                accepted_user_message_id,
+                 accepted_at_ms,
+                 outcome,
+                 reply,
+@@ -5031,6 +5102,7 @@ impl From<rusqlite::Error> for PersistenceError {
+ pub struct Database {
+     path: PathBuf,
+     connection: Connection,
++    shared: shared_store::SharedStore,
+ }
+ 
+ fn unix_now_ms() -> i64 {
+@@ -5339,6 +5411,8 @@ impl Database {
+             })?;
+         }
+         let mut connection = Connection::open(&path).map_err(PersistenceError::from)?;
++        let shared = shared_store::SharedStore::new(&connection, &path)?;
++        let _migration_lock = shared.migration_lock()?;
+         connection
+             .busy_timeout(busy_timeout)
+             .map_err(PersistenceError::from)?;
+@@ -5351,13 +5425,15 @@ impl Database {
+         create_pre_migration_backup(&connection, &path)?;
+         apply_pending_migrations(&connection)?;
+         prune_pre_migration_backups(&path);
+-        backfill_placeholder_titles(&mut connection)?;
+-        recover_interrupted_work(&connection)?;
+-        plan_canvases::recover_plan_builds(&connection)?;
+-        recover_meeting_work(&mut connection)?;
+-        fusion::recover_fusion_work(&mut connection)?;
+-        subagents::recover_native_subagent_work(&mut connection)?;
+-        Ok(Self { path, connection })
++        if let Some(_recovery_locks) = shared.recovery_locks(&connection)? {
++            backfill_placeholder_titles(&mut connection)?;
++            recover_interrupted_work(&connection)?;
++            plan_canvases::recover_plan_builds(&connection)?;
++            recover_meeting_work(&mut connection)?;
++            fusion::recover_fusion_work(&mut connection)?;
++            subagents::recover_native_subagent_work(&mut connection)?;
++        }
++        Ok(Self { path, connection, shared })
+     }
+ 
+     pub fn path(&self) -> &Path {
+@@ -5523,16 +5599,19 @@ impl Database {
+                     END,
+                     archived = excluded.archived,
+                     updated_at = excluded.updated_at, last_sent_at = excluded.last_sent_at,
+-                     run_state = excluded.run_state,
++                     run_state = CASE WHEN EXISTS(SELECT 1 FROM shared_executions e WHERE e.session_id=sessions.id)
++                        THEN sessions.run_state ELSE excluded.run_state END,
+                      unread = excluded.unread,
+-                     selected_connection_id = COALESCE(
++                     selected_connection_id = CASE WHEN EXISTS(SELECT 1 FROM shared_executions e WHERE e.session_id=sessions.id)
++                        THEN sessions.selected_connection_id ELSE COALESCE(
+                         excluded.selected_connection_id,
+                         sessions.selected_connection_id
+-                     ),
+-                     selected_model_id = COALESCE(
++                     ) END,
++                     selected_model_id = CASE WHEN EXISTS(SELECT 1 FROM shared_executions e WHERE e.session_id=sessions.id)
++                        THEN sessions.selected_model_id ELSE COALESCE(
+                         excluded.selected_model_id,
+                         sessions.selected_model_id
+-                     )",
++                     ) END",
+                 rusqlite::params![
+                     session.id,
+                     session.project_id,
+@@ -5585,19 +5664,12 @@ impl Database {
+         let mut statement = self
+             .connection
+             .prepare(
+-                "SELECT id, project_id, title, archived, created_at, updated_at,
+-                        last_sent_at, run_state, unread,
+-                        selected_connection_id, selected_model_id
+-                 FROM sessions
+-                 WHERE project_id = ?1 AND archived = ?2
+-                   AND (?3 IS NULL OR title LIKE '%' || ?3 || '%' COLLATE NOCASE)
+-                 ORDER BY CASE WHEN last_sent_at IS NULL THEN 1 ELSE 0 END,
+-                          last_sent_at DESC, created_at DESC, id",
++                &session_catalog::list_sql(),
+             )
+             .map_err(PersistenceError::from)?;
+         let rows = statement
+-            .query_map(rusqlite::params![project_id, archived, query], |row| {
+-                Ok(LocalSession {
++            .query_map(rusqlite::params![project_id, archived], |row| {
++                Ok((LocalSession {
+                     id: row.get(0)?,
+                     project_id: row.get(1)?,
+                     title: row.get(2)?,
+@@ -5608,11 +5680,21 @@ impl Database {
+                     run_state: row.get(7)?,
+                     unread: row.get(8)?,
+                     model_ref: optional_model_ref(row, 9, 10)?,
+-                })
++                }, row.get::<_,String>(11)?))
+             })
+             .map_err(PersistenceError::from)?;
+-        rows.collect::<rusqlite::Result<Vec<_>>>()
+-            .map_err(PersistenceError::from)
++        let stored=rows.collect::<rusqlite::Result<Vec<_>>>().map_err(PersistenceError::from)?;
++        let mut sessions=Vec::with_capacity(stored.len());
++        let mut search=self.connection.prepare("SELECT ?1 LIKE '%' || ?2 || '%'")?;
++        for (mut session,source) in stored {
++            session.title=session_catalog::display_title(&self.connection,&session.id,&session.title,&source)?;
++            if let Some(query)=query {
++                let matches:bool=search.query_row(rusqlite::params![session.title,query],|row|row.get(0))?;
++                if !matches {continue;}
++            }
++            sessions.push(session);
++        }
++        Ok(sessions)
+     }
+ 
+     fn set_session_archived(
+@@ -5850,6 +5932,26 @@ impl Database {
+         expected_history_revision: u64,
+         replacement: &LocalMessage,
+         sent_at_ms: i64,
++    ) -> Result<LatestPromptReplayCommit, PersistenceError> {
++        // Preserve the replay conflict checks before claiming, then check again
++        // under the lease. Every path which dispatches a provider owns a lease.
++        validate_latest_prompt_replay(&self.connection, &replacement.session_id,
++            target_message_id, expected_history_revision)?;
++        self.shared.claim(&self.connection, &replacement.session_id)?;
++        let result = self.replace_latest_prompt_claimed(target_message_id,
++            expected_history_revision, replacement, sent_at_ms);
++        if result.is_err() {
++            let _ = self.shared.release(&self.connection, &replacement.session_id);
++        }
++        result
++    }
++
++    fn replace_latest_prompt_claimed(
++        &mut self,
++        target_message_id: &str,
++        expected_history_revision: u64,
++        replacement: &LocalMessage,
++        sent_at_ms: i64,
+     ) -> Result<LatestPromptReplayCommit, PersistenceError> {
+         if replacement.role != "user"
+             || replacement
+@@ -6069,6 +6171,7 @@ impl Database {
+             discarded_message_ids,
+             rollback: LatestPromptReplayRollback {
+                 session_id: replacement.session_id.clone(),
++                replacement_message_id: replacement.id.clone(),
+                 target_revision: target.revision,
+                 session: rollback_session,
+                 messages: discarded_messages,
+@@ -6281,6 +6384,8 @@ impl Database {
+             .connection
+             .transaction()
+             .map_err(PersistenceError::from)?;
++        shared_store::SharedStore::validate_turn_fence(&transaction,
++            &rollback.session_id, &rollback.replacement_message_id)?;
+         let removed_message_ids = {
+             let mut statement = transaction
+                 .prepare(
+@@ -6405,6 +6510,7 @@ impl Database {
+                 .map_err(PersistenceError::from)?;
+         }
+         transaction.commit().map_err(PersistenceError::from)?;
++        self.shared.release(&self.connection, &rollback.session_id)?;
+         Ok(removed_message_ids)
+     }
+ 
+@@ -6423,6 +6529,8 @@ impl Database {
+             });
+         }
+         let content_blocks_json = serialize_content_blocks(&message.content_blocks)?;
++        self.shared.claim(&self.connection, &message.session_id)?;
++        let result = (|| {
+         let transaction = self
+             .connection
+             .transaction()
+@@ -6508,6 +6616,11 @@ impl Database {
+         let generated_title = title_session_from_message(&transaction, message)?;
+         transaction.commit().map_err(PersistenceError::from)?;
+         Ok(generated_title)
++        })();
++        if result.is_err() {
++            let _ = self.shared.release(&self.connection, &message.session_id);
++        }
++        result
+     }
+ 
+     fn begin_runtime_turn(
+@@ -6533,6 +6646,10 @@ impl Database {
+             .connection
+             .transaction()
+             .map_err(PersistenceError::from)?;
++        match dispatch.accepted_user_message_id.as_deref() {
++            Some(user) => shared_store::SharedStore::validate_turn_fence(&transaction, &message.session_id, user)?,
++            None => shared_store::SharedStore::validate_legacy_execution(&transaction, &message.session_id)?,
++        }
+         transaction
+             .execute(
+                 "INSERT INTO messages(
+@@ -6603,6 +6720,9 @@ impl Database {
+         run_state: &str,
+         updated_at_ms: i64,
+     ) -> Result<(), PersistenceError> {
++        // Legacy administrative callers have no turn identity. They cannot
++        // change or release a session that has entered the shared protocol.
++        shared_store::SharedStore::validate_legacy_execution(&self.connection, session_id)?;
+         self.require_changed(
+             self.connection
+                 .execute(
+@@ -6611,7 +6731,61 @@ impl Database {
+                 )
+                 .map_err(PersistenceError::from)?,
+             "session",
+-        )
++        )?;
++        if matches!(run_state, "idle" | "interrupted" | "error") {
++            self.shared.release(&self.connection, session_id)?;
++        }
++        Ok(())
++    }
++
++    fn set_session_run_state_for_turn(
++        &mut self,
++        session_id: &str,
++        accepted_user_message_id: &str,
++        run_state: &str,
++        updated_at_ms: i64,
++    ) -> Result<(), PersistenceError> {
++        let transaction = self.connection.transaction().map_err(PersistenceError::from)?;
++        shared_store::SharedStore::validate_turn_fence(&transaction, session_id, accepted_user_message_id)?;
++        transaction.execute(
++            "UPDATE sessions SET run_state=?2,updated_at=?3 WHERE id=?1",
++            rusqlite::params![session_id,run_state,updated_at_ms],
++        ).map_err(PersistenceError::from)?;
++        transaction.commit().map_err(PersistenceError::from)?;
++        if matches!(run_state, "idle" | "interrupted" | "error") {
++            self.shared.release(&self.connection, session_id)?;
++        }
++        Ok(())
++    }
++
++    fn finish_projection_turn(
++        &mut self,
++        session_id: &str,
++        accepted_user_message_id: &str,
++        message: Option<&LocalMessage>,
++        tools: &[LocalToolCall],
++        run_state: &str,
++        completed_at_ms: i64,
++    ) -> Result<(), PersistenceError> {
++        let transaction = self.connection.transaction().map_err(PersistenceError::from)?;
++        shared_store::SharedStore::validate_turn_fence(&transaction, session_id, accepted_user_message_id)?;
++        if let Some(message) = message {
++            if message.session_id != session_id || message.role != "assistant" {
++                return Err(PersistenceError { code: PersistenceErrorCode::Conflict,
++                    message: "projection terminal does not belong to the accepted turn".into() });
++            }
++            let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)",
++                [&message.id], |row| row.get(0)).map_err(PersistenceError::from)?;
++            if exists {
++                shared_store::SharedStore::validate_message_fence(&transaction, &message.id)?;
++            } else {
++                Self::insert_message_bundle_into_transaction(&transaction, message, tools)?;
++            }
++        }
++        transaction.execute("UPDATE sessions SET run_state=?2,updated_at=?3 WHERE id=?1",
++            rusqlite::params![session_id,run_state,completed_at_ms]).map_err(PersistenceError::from)?;
++        transaction.commit().map_err(PersistenceError::from)?;
++        self.shared.release(&self.connection, session_id)
+     }
+ 
+     fn delete_session(&self, session_id: &str) -> Result<(), PersistenceError> {
+@@ -6703,6 +6877,7 @@ impl Database {
+         reasoning: &str,
+         completed_at_ms: Option<i64>,
+     ) -> Result<(), PersistenceError> {
++        shared_store::SharedStore::validate_message_fence(&self.connection, message_id)?;
+         let transaction = self
+             .connection
+             .transaction()
+@@ -6732,7 +6907,11 @@ impl Database {
+                 )
+                 .map_err(PersistenceError::from)?;
+         }
+-        transaction.commit().map_err(PersistenceError::from)
++        let session: String = transaction.query_row("SELECT session_id FROM messages WHERE id=?1", [message_id], |row| row.get(0))
++            .map_err(PersistenceError::from)?;
++        transaction.commit().map_err(PersistenceError::from)?;
++        if completed_at_ms.is_some() { self.shared.release(&self.connection, &session)?; }
++        Ok(())
+     }
+ 
+     fn get_message(&self, message_id: &str) -> Result<Option<LocalMessage>, PersistenceError> {
+@@ -10543,6 +10722,15 @@ DELETE FROM runtime_events
+                 run_state: commit.run_state.clone(),
+             });
+         }
++        match commit.accepted_user_message_id.as_deref() {
++            Some(user) => shared_store::SharedStore::validate_turn_fence(&transaction, &message.session_id, user)?,
++            None => shared_store::SharedStore::validate_legacy_execution(&transaction, &message.session_id)?,
++        }
++        let existing: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)",
++            [&message.id], |row| row.get(0)).map_err(PersistenceError::from)?;
++        if existing {
++            shared_store::SharedStore::validate_message_fence(&transaction, &message.id)?;
++        }
+         let content_blocks_json = serialize_content_blocks(&message.content_blocks)?;
+         let message_changed = transaction
+             .execute(
+@@ -10699,6 +10887,7 @@ DELETE FROM runtime_events
+             });
+         }
+         transaction.commit().map_err(PersistenceError::from)?;
++        self.shared.release(&self.connection, &message.session_id)?;
+         Ok(TerminalCommitOutcome {
+             committed: true,
+             session_id: message.session_id.clone(),
+@@ -10720,6 +10909,7 @@ DELETE FROM runtime_events
+         accepted_at_ms: i64,
+         outcome: crate::dto::TurnOutcome,
+         viewed_session_id: Option<&str>,
++        accepted_user_message_id: Option<&str>,
+     ) -> Result<TerminalCommitOutcome, PersistenceError> {
+         if message.role != "assistant" {
+             return Err(PersistenceError {
+@@ -10758,6 +10948,15 @@ DELETE FROM runtime_events
+                 run_state: "error".into(),
+             });
+         }
++        match accepted_user_message_id {
++            Some(user) => shared_store::SharedStore::validate_turn_fence(&transaction, &message.session_id, user)?,
++            None => shared_store::SharedStore::validate_legacy_execution(&transaction, &message.session_id)?,
++        }
++        let existing: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)",
++            [&message.id], |row| row.get(0)).map_err(PersistenceError::from)?;
++        if existing {
++            shared_store::SharedStore::validate_message_fence(&transaction, &message.id)?;
++        }
+         let message_changed = transaction
+             .execute(
+                 "UPDATE messages
+@@ -10838,6 +11037,7 @@ DELETE FROM runtime_events
+             });
+         }
+         transaction.commit().map_err(PersistenceError::from)?;
++        self.shared.release(&self.connection, &message.session_id)?;
+         Ok(TerminalCommitOutcome {
+             committed: true,
+             session_id: message.session_id.clone(),
+@@ -11908,6 +12108,7 @@ fn apply_pending_migrations(connection: &Connection) -> Result<(), PersistenceEr
+         (26, MIGRATION_26),
+         (27, MIGRATION_27),
+         (28, MIGRATION_28),
++        (29, &format!("{}\n{}", shared_store::MIGRATION, shared_store::TRIGGERS)),
+     ] {
+         if version > current {
+             apply_migration_batch(connection, version, sql)?;
+@@ -11925,6 +12126,7 @@ fn backfill_placeholder_titles(connection: &mut Connection) -> Result<(), Persis
+                  FROM sessions
+                  JOIN messages ON messages.session_id = sessions.id
+                  WHERE sessions.title_source = 'placeholder'
++                   AND (trim(sessions.title)='' OR lower(replace(trim(sessions.title),' ','')) IN('newchat','newtask'))
+                    AND messages.role = 'user'
+                    AND messages.cancelled = 0
+                  ORDER BY sessions.id, messages.created_at, messages.revision, messages.id",
+@@ -13759,7 +13961,7 @@ INSERT INTO messages(
+             .await
+             .unwrap();
+         actor
+-            .set_session_run_state("session-1", "idle", 11)
++            .set_session_run_state_for_turn("session-1", "message-1", "idle", 11)
+             .await
+             .unwrap();
+         actor
+@@ -14020,7 +14222,7 @@ INSERT INTO messages(
+             .await
+             .unwrap();
+         actor
+-            .set_session_run_state("session-1", "idle", 11)
++            .set_session_run_state_for_turn("session-1", "message-1", "idle", 11)
+             .await
+             .unwrap();
+         actor
+@@ -15226,6 +15428,7 @@ INSERT INTO messages(
+             .unwrap();
+         actor
+             .begin_runtime_turn(DispatchTurnPersist {
++                accepted_user_message_id: Some("user-queued".into()),
+                 assistant_message: LocalMessage {
+                     id: "assistant-dispatched".into(),
+                     session_id: "session-1".into(),
+@@ -15360,6 +15563,7 @@ INSERT INTO messages(
+         seed_project_and_session(&actor, "idle").await;
+         actor
+             .begin_runtime_turn(DispatchTurnPersist {
++                accepted_user_message_id: None,
+                 assistant_message: LocalMessage {
+                     id: "assistant-1".into(),
+                     session_id: "session-1".into(),
+@@ -15390,6 +15594,7 @@ INSERT INTO messages(
+         assert!(
+             actor
+                 .commit_runtime_terminal(TerminalTurnCommit {
++                    accepted_user_message_id: None,
+                     assistant_message: LocalMessage {
+                         id: "assistant-1".into(),
+                         session_id: "session-1".into(),
+@@ -15428,6 +15633,7 @@ INSERT INTO messages(
+         assert!(
+             !actor
+                 .commit_runtime_terminal(TerminalTurnCommit {
++                    accepted_user_message_id: None,
+                     assistant_message: LocalMessage {
+                         id: "assistant-1".into(),
+                         session_id: "session-1".into(),
+@@ -15495,6 +15701,7 @@ INSERT INTO messages(
+         };
+         actor
+             .begin_runtime_turn(DispatchTurnPersist {
++                accepted_user_message_id: None,
+                 assistant_message: LocalMessage {
+                     id: "assistant-1".into(),
+                     session_id: "session-1".into(),
+@@ -15531,6 +15738,7 @@ INSERT INTO messages(
+         };
+         let terminal =
+             |provider_event_id: &str, text: &str, completed_at_ms: i64| TerminalTurnCommit {
++                accepted_user_message_id: None,
+                 assistant_message: terminal_message(text, completed_at_ms),
+                 tools: vec![tool("tool-1", "assistant-1")],
+                 binding: RuntimeBindingRecord {
+diff --git a/windows/sencode-desktop/src-tauri/src/providers.rs b/windows/sencode-desktop/src-tauri/src/providers.rs
+index 3db5b5d4..3b757e19 100644
+--- a/windows/sencode-desktop/src-tauri/src/providers.rs
++++ b/windows/sencode-desktop/src-tauri/src/providers.rs
+@@ -440,6 +440,11 @@ impl ProviderStore {
+     }
+ 
+     pub async fn upsert(&self, input: CustomApiConnectionInput) -> CommandResult<ApiProvider> {
++        let _shared_lease = if let Some(id) = input.id.as_deref() {
++            let id = normalize_connection_id(id)?;
++            Some(self.persistence.shared_connection_lock(&id).await
++                .map_err(|error| CommandError::conflict(error.to_string()))?)
++        } else { None };
+         let prepared = self.prepare(input, false).await?;
+         let target = CredentialTarget::for_connection(&prepared.connection_id)
+             .map_err(|error| CommandError::validation(error.to_string()))?;
+@@ -658,6 +663,8 @@ impl ProviderStore {
+         } else {
+             format!("custom-{provider_id}")
+         };
++        let _shared_lease = self.persistence.shared_connection_lock(&connection_id).await
++            .map_err(|error| CommandError::conflict(error.to_string()))?;
+         let target = CredentialTarget::for_connection(&connection_id)
+             .map_err(|error| CommandError::validation(error.to_string()))?;
+         let secret = self.credentials.get(&target).ok();
+diff --git a/windows/sencode-desktop/src-tauri/src/send_transaction.rs b/windows/sencode-desktop/src-tauri/src/send_transaction.rs
+index 3ca42f9f..4bf37093 100644
+--- a/windows/sencode-desktop/src-tauri/src/send_transaction.rs
++++ b/windows/sencode-desktop/src-tauri/src/send_transaction.rs
+@@ -142,6 +142,7 @@ impl AcceptedUserTurn {
+ #[derive(Debug, Clone)]
+ struct TerminalErrorMaterial {
+     session_id: String,
++    user_message_id: String,
+     assistant_message_id: String,
+     connection_id: String,
+     model_id: String,
+@@ -153,6 +154,7 @@ impl TerminalErrorMaterial {
+     fn from_request(request: &SendTransactionRequest, accepted_at_ms: i64) -> Self {
+         Self {
+             session_id: request.session_id.clone(),
++            user_message_id: request.user_message_id.clone(),
+             assistant_message_id: request.assistant_message_id.clone(),
+             connection_id: request.connection_id.clone(),
+             model_id: request.model_id.clone(),
+@@ -406,6 +408,8 @@ impl SendTransactionCoordinator {
+         accepted: AcceptedUserTurn,
+         mut on_progress: impl FnMut(SendTransactionProgress),
+     ) -> Result<SendTransactionOutcome, RuntimeError> {
++        self.persistence.validate_turn_fence(&request.session_id, &request.user_message_id)
++            .await.map_err(persistence_error)?;
+         if let Some(title) = accepted.generated_title.clone() {
+             on_progress(SendTransactionProgress::SessionTitleChanged(title));
+         }
+@@ -499,13 +503,15 @@ impl SendTransactionCoordinator {
+                 },
+                 material.accepted_at_ms,
+                 outcome,
++                Some(material.user_message_id.clone()),
+             )
+             .await
+             .is_ok();
+         if !committed {
+             let _ = self
+                 .persistence
+-                .set_session_run_state(&material.session_id, "error", material.accepted_at_ms)
++                .set_session_run_state_for_turn(&material.session_id, &material.user_message_id,
++                    "error", material.accepted_at_ms)
+                 .await;
+         }
+     }
+@@ -602,10 +608,10 @@ impl SendTransactionCoordinator {
+                 let accepted_at_ms = i64::try_from(request.accepted_at_ms)
+                     .map_err(|_| invalid_request("accepted timestamp exceeds SQLite range"))?;
+                 self.persistence
+-                    .upsert_runtime_binding(RuntimeBindingRecord::from_runtime(
++                    .upsert_runtime_binding_for_turn(RuntimeBindingRecord::from_runtime(
+                         &restored,
+                         accepted_at_ms,
+-                    ))
++                    ), &request.user_message_id)
+                     .await
+                     .map_err(persistence_error)?;
+                 return Ok(restored);
+@@ -684,6 +690,8 @@ impl SendTransactionCoordinator {
+             .collect();
+         let bridge_images = bridge_images_for_target(bridge_images, request.target_supports_vision);
+         let bridge_turn_id = format!("{}:bridge", request.turn_id);
++        self.persistence.validate_turn_fence(&request.session_id, &request.user_message_id)
++            .await.map_err(persistence_error)?;
+         self.runtimes
+             .lock()
+             .await
+@@ -714,11 +722,11 @@ impl SendTransactionCoordinator {
+             });
+         }
+         self.persistence
+-            .upsert_runtime_binding(RuntimeBindingRecord::from_runtime(
++            .upsert_runtime_binding_for_turn(RuntimeBindingRecord::from_runtime(
+                 &binding,
+                 i64::try_from(request.accepted_at_ms)
+                     .map_err(|_| invalid_request("accepted timestamp exceeds SQLite range"))?,
+-            ))
++            ), &request.user_message_id)
+             .await
+             .map_err(persistence_error)?;
+         Ok(binding)
+@@ -740,6 +748,7 @@ impl SendTransactionCoordinator {
+             .await?;
+         self.persistence
+             .begin_runtime_turn(DispatchTurnPersist {
++                accepted_user_message_id: Some(request.user_message_id.clone()),
+                 assistant_message: LocalMessage {
+                     id: request.assistant_message_id.clone(),
+                     session_id: request.session_id.clone(),
+@@ -943,6 +952,7 @@ impl SendTransactionCoordinator {
+         let terminal = self
+             .persistence
+             .commit_runtime_terminal(TerminalTurnCommit {
++                accepted_user_message_id: Some(request.user_message_id.clone()),
+                 assistant_message: LocalMessage {
+                     id: request.assistant_message_id.clone(),
+                     session_id: request.session_id.clone(),
+@@ -2837,6 +2847,42 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn stale_pre_dispatch_error_cannot_finish_a_later_turn_in_the_same_desktop() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = database_path(temp.path());
++        let persistence = PersistenceActor::start(&path).unwrap();
++        seed(&persistence).await;
++        let mut coordinator = SendTransactionCoordinator::new(persistence.clone(), RuntimeManager::default());
++        let first = request("custom-fixture", "fixture", "turn-A", "first", 100);
++        let accepted_first = coordinator.accept_user_turn(&first).await.unwrap();
++        let delayed = super::TerminalErrorMaterial::from_request(&first, 100);
++        persistence.set_session_run_state_for_turn("session-1", &first.user_message_id, "idle", 101)
++            .await.unwrap();
++        let second = request("custom-fixture", "fixture", "turn-B", "second", 102);
++        let accepted_second = coordinator.accept_user_turn(&second).await.unwrap();
++        let observer = PersistenceActor::start(&path).unwrap();
++
++        // There was never an A placeholder. Both the error envelope and its
++        // fallback must retain A's authority rather than acquiring B's fence.
++        coordinator.persist_terminal_error(&delayed, &super::runtime_not_running()).await;
++        assert!(coordinator.execute_accepted_with_progress(first, accepted_first, |_| {}).await.is_err());
++        assert!(persistence.get_message("turn-A-assistant").await.unwrap().is_none());
++        assert_eq!(persistence.list_sessions("project-1", false, None).await.unwrap()[0].run_state, "running");
++        let third = request("custom-fixture", "fixture", "turn-C", "third", 104);
++        let mut other_coordinator = SendTransactionCoordinator::new(observer.clone(), RuntimeManager::default());
++        assert!(other_coordinator.accept_user_turn(&third).await.is_err());
++
++        // A genuine pre-dispatch failure still persists B's explanation and
++        // relinquishes the OS lease, allowing an idle handoff.
++        assert!(coordinator.execute_accepted_with_progress(second, accepted_second, |_| {}).await.is_err());
++        assert!(persistence.get_message("turn-B-assistant").await.unwrap().unwrap().completed_at_ms.is_some());
++        other_coordinator.accept_user_turn(&third).await.unwrap();
++        observer.set_session_run_state_for_turn("session-1", &third.user_message_id, "idle", 105).await.unwrap();
++        observer.shutdown().await.unwrap();
++        persistence.shutdown().await.unwrap();
++    }
++
+     #[tokio::test]
+     async fn accepted_user_turn_is_durable_before_runtime_execution() {
+         let temp = tempfile::tempdir().unwrap();
+diff --git a/windows/sencode-desktop/src-tauri/src/state/projection.rs b/windows/sencode-desktop/src-tauri/src/state/projection.rs
+index effd1d8a..cf5043d5 100644
+--- a/windows/sencode-desktop/src-tauri/src/state/projection.rs
++++ b/windows/sencode-desktop/src-tauri/src/state/projection.rs
+@@ -8,7 +8,7 @@ use crate::dto::{
+     AgentConnectionSummary, AgentState, ApiProvider, AppSnapshot, ChatMessage, ChatMode,
+     CodingCredits, CommandError, CommandResult, ConnectionError, ConnectionErrorCode,
+     ConnectionKind, ConnectionStatus, ConnectionUsage, ContentBlock, CredentialState,
+-    CreditsStatus, EventOrigin, FeatureFlags, Interaction, LoginAttempt, MeetingRunState,
++    CreditsStatus, DesktopEventPayload, EventOrigin, FeatureFlags, Interaction, LoginAttempt, MeetingRunState,
+     MeetingSnapshot, MeetingTurnKind, MeetingTurnResult, MessageRole, ModelInfo, ProfileScope,
+     ProjectSummary, ReasoningEffort, RuntimeCapabilities, RuntimeDownloadState, SencodeAccount,
+     SessionHistoryPage, SessionRunState, SessionSnapshot, SessionSummary, TodoItem, ToolCall,
+@@ -481,6 +481,31 @@ impl Projection {
+         }
+     }
+ 
++    /// Refresh only externally changed sessions; never overwrite a desktop
++    /// runtime's unrelated streaming context or permission interactions.
++    pub fn merge_shared_local(&mut self, snapshot: LocalProjectionSnapshot, ids: &[String]) {
++        let mut staged = Projection::new(EventLog::new());
++        staged.hydrate_local(snapshot);
++        for id in ids {
++            if let Some(detail) = staged.sessions.remove(id) {
++                self.events.emit(DesktopEventPayload::SessionUpsert { summary: detail.summary.clone() },
++                    Some(id.clone()), EventOrigin::Local, None);
++                for message_id in &detail.message_order {
++                    if let Some(message) = detail.messages.get(message_id) {
++                        self.events.emit(DesktopEventPayload::MessageUpsert { session_id:id.clone(),message:message.clone() },
++                            Some(id.clone()), EventOrigin::Local, None);
++                    }
++                }
++                if !self.session_order.contains(id) { self.session_order.push(id.clone()); }
++                self.sessions.insert(id.clone(),detail);
++            } else if self.sessions.remove(id).is_some() {
++                self.session_order.retain(|existing| existing!=id);
++                self.events.emit(DesktopEventPayload::SessionRemoved {session_id:id.clone()},
++                    Some(id.clone()),EventOrigin::Local,None);
++            }
++        }
++    }
++
+     pub fn history_page_from_local(session_id: &str, page: LocalHistoryPage) -> SessionHistoryPage {
+         let LocalHistoryPage {
+             revision,
+diff --git a/windows/sencode-desktop/src-tauri/src/supervisor.rs b/windows/sencode-desktop/src-tauri/src/supervisor.rs
+index 87a69495..c73f8ad7 100644
+--- a/windows/sencode-desktop/src-tauri/src/supervisor.rs
++++ b/windows/sencode-desktop/src-tauri/src/supervisor.rs
+@@ -120,6 +120,45 @@ fn sync_meeting_public_event(
+     true
+ }
+ 
++fn spawn_shared_store_reconciler(
++    persistence: Option<crate::persistence::PersistenceActor>,
++    providers: Option<ProviderStore>,
++    projection: Arc<Mutex<Projection>>,
++) {
++    let Some(persistence) = persistence else { return; };
++    tokio::task::spawn_local(async move {
++        let mut cursor = 0;
++        let mut interval = tokio::time::interval(Duration::from_millis(250));
++        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        loop {
++            interval.tick().await;
++            let Ok((next, sessions, connections)) = persistence.shared_changes_since(cursor).await else {
++                continue;
++            };
++            if !sessions.is_empty() {
++                match persistence.projection_snapshot().await {
++                    Ok(snapshot) => projection.lock().merge_shared_local(snapshot, &sessions),
++                    Err(_) => continue,
++                }
++            }
++            if connections {
++                if let Some(store) = providers.as_ref() {
++                    match store.load_summaries().await {
++                        Ok(summaries) => projection.lock().set_api_providers(summaries),
++                        Err(_) => continue,
++                    }
++                }
++                match persistence.preferred_connection_id().await {
++                    Ok(Some(preferred)) => { let _ = projection.lock().set_active_connection(&preferred); },
++                    Ok(None) => {},
++                    Err(_) => continue,
++                }
++            }
++            cursor = next;
++        }
++    });
++}
++
+ fn spawn_meeting_public_projection_reconciler(
+     events: &EventLog,
+     projection: Arc<Mutex<Projection>>,
+@@ -516,6 +555,10 @@ fn prepare_meeting_start_request(
+     ))
+ }
+ 
++#[cfg(test)]
++#[path = "supervisor_shared_execution_tests.rs"]
++mod shared_execution_tests;
++
+ #[cfg(test)]
+ mod meeting_start_request_tests {
+     use super::*;
+@@ -4827,6 +4870,7 @@ async fn run_supervisor(
+     } else {
+         Vec::new()
+     };
++    spawn_shared_store_reconciler(persistence.clone(), provider_store.clone(), Arc::clone(&projection));
+     let broker = Rc::new(std::cell::RefCell::new(InteractionBroker::new()));
+     // §3.4: Supervisor-owned Auto-review coordination state (bounded
+     // admission + request-id deduplication), shared by every custom-runtime
+@@ -14630,7 +14674,7 @@ pub(crate) async fn begin_prompt(
+             .await
+             .map_err(|error| CommandError::internal(format!("persist session: {error}")))?;
+         generated_title = persistence
+-            .insert_message_bundle(
++            .accept_user_turn(
+                 crate::persistence::LocalMessage {
+                     id: message_id,
+                     session_id: session_id.into(),
+@@ -14641,18 +14685,14 @@ pub(crate) async fn begin_prompt(
+                     completed_at_ms: Some(sent_at_ms as i64),
+                     cancelled: false,
+                     connection_id: Some(connection_id.to_string()),
+-                    model_id: None,
++                    model_id: Some(model_id.clone()),
+                     revision,
+                     content_blocks: Some(user_blocks.clone()),
+                 },
+-                Vec::new(),
++                sent_at_ms as i64,
+             )
+             .await
+             .map_err(|error| CommandError::internal(format!("persist user message: {error}")))?;
+-        persistence
+-            .mark_session_sent(session_id, sent_at_ms as i64)
+-            .await
+-            .map_err(|error| CommandError::internal(format!("persist send activity: {error}")))?;
+     }
+     {
+         let mut p = projection.lock();
+@@ -14694,7 +14734,14 @@ pub(crate) async fn begin_prompt(
+             blocks.push(acp::ContentBlock::Text(acp::TextContent::new("")));
+         }
+         let req = acp::PromptRequest::new(acp::SessionId::new(sid.clone()), blocks).meta(meta);
+-        let (ok, cancelled, error) = match client.prompt(req).await {
++        let response = client.prompt(req).await;
++        if let Some(persistence) = persistence.as_ref() {
++            if let Err(error) = persistence.validate_turn_fence(&sid, format!("msg-user-{prompt_id}")).await {
++                warn!(%error, session = %sid, "ignoring stale Sencode prompt completion");
++                return;
++            }
++        }
++        let (ok, cancelled, error) = match response {
+             Ok(resp) => {
+                 let cancelled = matches!(resp.stop_reason, acp::StopReason::Cancelled);
+                 proj.lock().complete_turn(&sid, cancelled);
+@@ -14726,6 +14773,7 @@ pub(crate) async fn begin_prompt(
+                 persist_sencode_projection_turn(persistence, &snapshot, &prompt_id).await
+             {
+                 warn!(%error, session = %sid, "failed to persist Sencode dual-write turn");
++                return;
+             } else if let Ok(page) = persistence.history_page(&sid, None, 1).await {
+                 if let Some(detail) = proj.lock().sessions.get_mut(&sid) {
+                     detail.history_revision = page.revision.max(0) as u64;
+@@ -14750,16 +14798,15 @@ async fn persist_sencode_projection_turn(
+     prompt_id: &str,
+ ) -> Result<(), crate::persistence::PersistenceError> {
+     let assistant_id = format!("msg-asst-{prompt_id}");
+-    if persistence.get_message(&assistant_id).await?.is_some() {
+-        return Ok(());
+-    }
++    let user_id = format!("msg-user-{prompt_id}");
++    let run_state = if snapshot.run_state == SessionRunState::Error { "error" } else { "idle" };
+     let Some(assistant) = snapshot
+         .messages
+         .iter()
+         .find(|message| message.id == assistant_id)
+     else {
+         persistence
+-            .set_session_run_state(&snapshot.session_id, "idle", now_ms() as i64)
++            .finish_projection_turn(&snapshot.session_id, &user_id, None, Vec::new(), run_state, now_ms() as i64)
+             .await?;
+         return Ok(());
+     };
+@@ -14781,8 +14828,10 @@ async fn persist_sencode_projection_turn(
+         .map(|value| value.min(i64::MAX as u64) as i64)
+         .unwrap_or_else(|| now_ms() as i64);
+     persistence
+-        .insert_message_bundle(
+-            crate::persistence::LocalMessage {
++        .finish_projection_turn(
++            &snapshot.session_id,
++            &user_id,
++            Some(crate::persistence::LocalMessage {
+                 id: assistant_id,
+                 session_id: snapshot.session_id.clone(),
+                 role: "assistant".into(),
+@@ -14791,16 +14840,15 @@ async fn persist_sencode_projection_turn(
+                 created_at_ms: assistant.created_at_ms.min(i64::MAX as u64) as i64,
+                 completed_at_ms: Some(completed_at_ms),
+                 cancelled: assistant.cancelled,
+-                connection_id: Some("sencode-shared".into()),
++                connection_id: snapshot.model_ref.as_ref().map(|model| model.connection_id.clone()),
+                 model_id: (!snapshot.model_id.is_empty()).then(|| snapshot.model_id.clone()),
+                 revision,
+                 content_blocks: Some(assistant.blocks.clone()),
+-            },
++            }),
+             tools,
++            run_state,
++            completed_at_ms,
+         )
+-        .await?;
+-    persistence
+-        .set_session_run_state(&snapshot.session_id, "idle", completed_at_ms)
+         .await
+ }
+ 
+diff --git a/windows/sencode-desktop/src-tauri/src/persistence/session_catalog.rs b/windows/sencode-desktop/src-tauri/src/persistence/session_catalog.rs
+new file mode 100644
+--- /dev/null
++++ b/windows/sencode-desktop/src-tauri/src/persistence/session_catalog.rs
+@@ -0,0 +1,85 @@
++//! Shared non-executable session provenance and ordinary task-list projection.
++pub(super) const CHILDREN_SQL: &str = include_str!("../../../../sencode-cli/shared-state/session-children-v1.sql");
++
++pub(super) fn list_sql() -> String {
++    format!("{CHILDREN_SQL}
++        SELECT s.id,s.project_id,s.title,s.archived,s.created_at,s.updated_at,
++               s.last_sent_at,s.run_state,s.unread,
++               s.selected_connection_id,s.selected_model_id,s.title_source
++        FROM sessions s
++        WHERE s.project_id=?1 AND s.archived=?2
++          AND s.id NOT IN(SELECT id FROM child_sessions)
++        ORDER BY CASE WHEN s.last_sent_at IS NULL THEN 1 ELSE 0 END,
++                 s.last_sent_at DESC,s.created_at DESC,s.id")
++}
++
++pub(super) fn placeholder(title: &str) -> bool {
++    let normalized: String = title.split_whitespace().collect::<String>().to_ascii_lowercase();
++    normalized.is_empty() || matches!(normalized.as_str(), "newtask" | "newchat")
++}
++
++pub(super) fn display_title(connection: &rusqlite::Connection, session: &str, title: &str, source: &str) -> Result<String, super::PersistenceError> {
++    if source != "placeholder" || !placeholder(title) { return Ok(title.to_owned()); }
++    let mut statement=connection.prepare("SELECT substr(text,1,8192) FROM messages WHERE session_id=?1 AND role='user' AND cancelled=0 ORDER BY revision,created_at,id")?;
++    let mut rows=statement.query([session])?;
++    while let Some(row)=rows.next()? {
++        let text:String=row.get(0)?;
++        if let Some(title)=super::derive_session_title(&text) { return Ok(title); }
++    }
++    Ok(title.to_owned())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use rusqlite::{Connection, params};
++
++    #[test]
++    fn session_origin_and_exact_legacy_evidence_hide_children_without_guessing() {
++        let connection=Connection::open_in_memory().unwrap();
++        connection.execute_batch("CREATE TABLE sessions(id TEXT,project_id TEXT,title TEXT,archived INTEGER,created_at INTEGER,updated_at INTEGER,last_sent_at INTEGER,run_state TEXT,unread INTEGER,selected_connection_id TEXT,selected_model_id TEXT,title_source TEXT); CREATE TABLE messages(id TEXT,session_id TEXT,role TEXT,text TEXT,cancelled INTEGER,revision INTEGER,created_at INTEGER); CREATE TABLE shared_modes(session_id TEXT,mode_json TEXT); CREATE TABLE shared_tool_ledger(session_id TEXT,name TEXT,state TEXT,result TEXT); CREATE TABLE subagent_runs(session_id TEXT,child_session_id TEXT,hidden_session_id TEXT);").unwrap();
++        for (id,project) in [("parent","p"),("child","p"),("legacy","p"),("foreign","q"),("orphan","p"),("desktop-child","p"),("branch","p")] {
++            connection.execute("INSERT INTO sessions VALUES(?1,?2,'New task',0,1,1,NULL,'idle',0,NULL,NULL,'placeholder')",params![id,project]).unwrap();
++        }
++        connection.execute("INSERT INTO shared_modes VALUES('child',?1)",[r#"{"session_origin":{"version":1,"kind":"child","parent_session_id":"parent"}}"#]).unwrap();
++        connection.execute("INSERT INTO shared_modes VALUES('branch',?1)",[r#"{"session_origin":{"version":1,"kind":"branch","source_session_id":"child"}}"#]).unwrap();
++        connection.execute("INSERT INTO shared_tool_ledger VALUES('parent','spawn_agent','complete',?1)",[r#"{"session_id":"legacy","role":"explore"}"#]).unwrap();
++        connection.execute("INSERT INTO shared_tool_ledger VALUES('parent','spawn_agent','complete',?1)",[r#"{"session_id":"foreign","role":"explore"}"#]).unwrap();
++        connection.execute("INSERT INTO shared_tool_ledger VALUES('parent','spawn_agent','running',?1)",[r#"{"session_id":"orphan","role":"explore"}"#]).unwrap();
++        connection.execute("INSERT INTO subagent_runs VALUES('parent','desktop-child',NULL)",[]).unwrap();
++        let sql=list_sql(); let mut query=connection.prepare(&sql).unwrap();
++        let ids=query.query_map(params!["p",false],|row|row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
++        assert_eq!(ids,vec!["branch","orphan","parent"]);
++    }
++
++    #[test]
++    fn placeholder_projection_keeps_manual_titles_and_unicode() {
++        let connection=Connection::open_in_memory().unwrap();
++        connection.execute_batch("CREATE TABLE messages(session_id TEXT,role TEXT,text TEXT,cancelled INTEGER,revision INTEGER,created_at INTEGER,id TEXT); INSERT INTO messages VALUES('one','user','# **修复中文😀**  输入\n第二行',0,1,1,'m');").unwrap();
++        assert_eq!(display_title(&connection,"one","New task","placeholder").unwrap(),"修复中文😀 输入 第二行");
++        assert_eq!(display_title(&connection,"one","我的标题","placeholder").unwrap(),"我的标题");
++        assert_eq!(display_title(&connection,"one","New task","user").unwrap(),"New task");
++    }
++
++    #[test]
++    fn desktop_catalog_projects_cli_titles_without_writes_and_preserves_empty_drafts() {
++        let temp=tempfile::tempdir().unwrap();
++        let database=super::super::Database::open(temp.path().join("catalog.sqlite3")).unwrap();
++        database.connection.execute("INSERT INTO projects VALUES('p','C:/fixture','fixture',1,1)",[]).unwrap();
++        for id in ["ordinary","child","empty","renamed"] {
++            database.connection.execute("INSERT INTO sessions(id,project_id,title,created_at,updated_at) VALUES(?1,'p','New task',1,1)",[id]).unwrap();
++        }
++        database.connection.execute("UPDATE sessions SET title='旧版手工标题' WHERE id='renamed'",[]).unwrap();
++        for id in ["ordinary","child","renamed"] {
++            database.connection.execute("INSERT INTO messages(id,session_id,role,text,created_at,revision) VALUES(?1,?1,'user','# 修复中文😀',1,1)",[id]).unwrap();
++        }
++        database.connection.execute("INSERT INTO shared_modes VALUES('child',?1,1)",[r#"{"session_origin":{"version":1,"kind":"child","parent_session_id":"ordinary"}}"#]).unwrap();
++        let rows=database.list_sessions("p",false,None).unwrap();
++        assert_eq!(rows.iter().map(|r|r.id.as_str()).collect::<Vec<_>>(),vec!["empty","ordinary","renamed"]);
++        assert_eq!(rows[1].title,"修复中文😀");
++        assert_eq!(rows[2].title,"旧版手工标题");
++        assert_eq!(database.list_sessions("p",false,Some("修复")).unwrap().len(),1);
++        assert_eq!(database.list_sessions("p",false,Some("修%😀")).unwrap().len(),1);
++        assert_eq!(database.connection.query_row("SELECT title FROM sessions WHERE id='ordinary'",[],|row|row.get::<_,String>(0)).unwrap(),"New task");
++    }
++}
+diff --git a/windows/sencode-desktop/src-tauri/src/persistence/shared_store.rs b/windows/sencode-desktop/src-tauri/src/persistence/shared_store.rs
+new file mode 100644
+--- /dev/null
++++ b/windows/sencode-desktop/src-tauri/src/persistence/shared_store.rs
+@@ -0,0 +1,501 @@
++//! Shared desktop/Sengoo store contract. No model or tool business logic.
++use super::{PersistenceError, PersistenceErrorCode};
++use rusqlite::{params, Connection};
++use sha2::{Digest, Sha256};
++use std::{cell::RefCell, collections::HashMap, fs::{File, OpenOptions}, path::{Path, PathBuf}};
++
++pub(super) const MIGRATION: &str = include_str!("../../../../sencode-cli/shared-state/migration-29.sql");
++pub(super) const TRIGGERS: &str = include_str!("../../../../sencode-cli/shared-state/triggers-v1.sql");
++
++fn error(message: impl ToString) -> PersistenceError {
++    PersistenceError { code: PersistenceErrorCode::Conflict, message: message.to_string() }
++}
++
++pub(crate) fn lock_path(database: &Path, scope: &str, identity: &str) -> PathBuf {
++    let digest = Sha256::digest(format!("{scope}:{identity}").as_bytes());
++    let hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
++    PathBuf::from(format!("{}.locks", database.display())).join(format!("{hash}.lock"))
++}
++
++pub(crate) fn lock_file(database: &Path, scope: &str, identity: &str) -> Result<File, PersistenceError> {
++    let path = lock_path(database, scope, identity);
++    std::fs::create_dir_all(path.parent().unwrap()).map_err(error)?;
++    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
++        .open(path).map_err(error)?;
++    file.try_lock().map_err(|_| error("shared resource is busy in another Sencode process"))?;
++    Ok(file)
++}
++
++#[derive(Debug)]
++pub(super) struct SharedStore {
++    pub instance: String,
++    database: PathBuf,
++    leases: RefCell<HashMap<String, File>>,
++}
++
++impl SharedStore {
++    pub fn new(connection: &Connection, path: &Path) -> Result<Self, PersistenceError> {
++        let instance = format!("desktop-{}-{}", std::process::id(), uuid::Uuid::new_v4());
++        let captured = instance.clone();
++        connection.create_scalar_function("sengoo_context", 1,
++            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
++            move |context| {
++                let key: String = context.get(0)?;
++                Ok(if key == "instance_id" { Some(captured.clone()) } else { None })
++            }).map_err(PersistenceError::from)?;
++        let database = std::fs::canonicalize(path).map_err(error)?;
++        #[cfg(windows)]
++        let database = PathBuf::from(database.to_string_lossy().strip_prefix(r"\\?\")
++            .unwrap_or(&database.to_string_lossy()).to_string());
++        Ok(Self { instance, database, leases: RefCell::new(HashMap::new()) })
++    }
++
++    pub fn migration_lock(&self) -> Result<File, PersistenceError> {
++        lock_file(&self.database, "migration", "schema")
++    }
++
++    /// Hold every session's OS lock throughout legacy recovery. If any session
++    /// is alive, skip global recovery altogether; accepting an idle/dead task
++    /// later performs its own local recovery under its lock.
++    pub fn recovery_locks(&self, connection: &Connection) -> Result<Option<Vec<File>>, PersistenceError> {
++        let mut query = connection.prepare("SELECT id FROM sessions ORDER BY id").map_err(PersistenceError::from)?;
++        let ids = query.query_map([], |row| row.get::<_,String>(0)).map_err(PersistenceError::from)?
++            .collect::<rusqlite::Result<Vec<_>>>().map_err(PersistenceError::from)?;
++        let mut files = Vec::new();
++        for id in &ids {
++            match lock_file(&self.database, "session", id) {
++                Ok(file) => files.push(file),
++                Err(_) => return Ok(None),
++            }
++        }
++        connection.execute("UPDATE shared_executions SET cleanup_required=CASE WHEN engine<>'sengoo' OR EXISTS(SELECT 1 FROM shared_tool_ledger t WHERE t.session_id=shared_executions.session_id AND t.state='running') THEN 1 ELSE cleanup_required END,active=0 WHERE active=1", [])
++            .map_err(PersistenceError::from)?;
++        Ok(Some(files))
++    }
++
++    pub fn claim(&self, connection: &Connection, session: &str) -> Result<(), PersistenceError> {
++        if self.leases.borrow().contains_key(session) {
++            return Err(error("session already has an active turn"));
++        }
++        let file = lock_file(&self.database, "session", session)?;
++        let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)", [session], |row| row.get(0))
++            .map_err(PersistenceError::from)?;
++        if !exists { return Err(error("session not found")); }
++        connection.execute_batch("BEGIN IMMEDIATE").map_err(PersistenceError::from)?;
++        let result = (|| {
++            let pending_cleanup: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM shared_executions e WHERE e.session_id=?1 AND (e.cleanup_required=1 OR (e.active=1 AND (e.engine<>'sengoo' OR EXISTS(SELECT 1 FROM shared_tool_ledger t WHERE t.session_id=e.session_id AND t.state='running')))))",[session],|row|row.get(0))?;
++            if pending_cleanup { return Err(rusqlite::Error::InvalidParameterName("session cleanup is unverified; takeover requires proof that the previous executor and tool processes exited".into())); }
++            // Opaque sessions belong to an engine. A CLI continuation invalidates
++            // the desktop binding; its next dispatch rebuilds from public history.
++            connection.execute("DELETE FROM runtime_bindings WHERE session_id=?1 AND EXISTS(SELECT 1 FROM shared_executions WHERE session_id=?1 AND engine<>'desktop')", [session])?;
++            connection.execute("UPDATE shared_executions SET active=0 WHERE session_id=?1", [session])?;
++            // Incomplete executions require a cleanup certificate above, in
++            // addition to the released lock. Heartbeats never grant authority.
++            connection.execute("UPDATE sessions SET run_state='interrupted' WHERE id=?1 AND run_state IN('running','awaiting-interaction','cancelling','loading')", [session])?;
++            connection.execute("INSERT INTO shared_executions(session_id,owner_instance_id,execution_id,engine,fence,active,started_at,updated_at) VALUES(?1,?2,?3,'desktop',1,1,?4,?4) ON CONFLICT(session_id) DO UPDATE SET owner_instance_id=excluded.owner_instance_id,execution_id=excluded.execution_id,engine='desktop',fence=shared_executions.fence+1,active=1,started_at=excluded.started_at,updated_at=excluded.updated_at",
++                params![session,self.instance,uuid::Uuid::new_v4().to_string(),super::unix_now_ms()])?;
++            connection.execute_batch("COMMIT")
++        })();
++        if let Err(cause) = result {
++            let _ = connection.execute_batch("ROLLBACK");
++            return Err(PersistenceError::from(cause));
++        }
++        self.leases.borrow_mut().insert(session.to_string(),file);
++        Ok(())
++    }
++
++    pub fn release(&self, connection: &Connection, session: &str) -> Result<(), PersistenceError> {
++        connection.execute("UPDATE shared_executions SET active=0,updated_at=?3 WHERE session_id=?1 AND owner_instance_id=?2",
++            params![session,self.instance,super::unix_now_ms()]).map_err(PersistenceError::from)?;
++        self.leases.borrow_mut().remove(session);
++        Ok(())
++    }
++
++    /// Authorize a callback through the immutable user envelope accepted for
++    /// its turn, including failures before an assistant envelope was created.
++    pub fn validate_turn_fence(
++        connection: &Connection,
++        session: &str,
++        accepted_user_message_id: &str,
++    ) -> Result<(), PersistenceError> {
++        let valid: bool = connection.query_row(
++            "SELECT EXISTS(SELECT 1 FROM messages m JOIN shared_executions e ON e.session_id=m.session_id WHERE m.id=?1 AND m.session_id=?2 AND m.role='user' AND m.shared_fence IS NOT NULL AND e.active=1 AND e.fence=m.shared_fence AND e.owner_instance_id=sengoo_context('instance_id'))",
++            params![accepted_user_message_id, session], |row| row.get(0),
++        ).map_err(PersistenceError::from)?;
++        if !valid {
++            return Err(error("stale execution fence: accepted user message does not authorize this turn"));
++        }
++        Ok(())
++    }
++
++    /// Older persistence callers have no turn token. They cannot acquire the
++    /// authority of any shared execution, even after that execution ended.
++    pub fn validate_legacy_execution(
++        connection: &Connection,
++        session: &str,
++    ) -> Result<(), PersistenceError> {
++        let exists: bool = connection.query_row(
++            "SELECT EXISTS(SELECT 1 FROM shared_executions WHERE session_id=?1)",
++            [session], |row| row.get(0),
++        ).map_err(PersistenceError::from)?;
++        if exists {
++            return Err(error("execution fence required for a shared session"));
++        }
++        Ok(())
++    }
++
++    /// A message retains the fence captured when its turn was accepted. In
++    /// particular, callbacks from the same desktop instance must not acquire
++    /// the authority of a later turn merely by sharing an instance ID.
++    pub fn validate_message_fence(connection: &Connection, message: &str) -> Result<(), PersistenceError> {
++        let valid: bool = connection.query_row(
++            "SELECT EXISTS(SELECT 1 FROM messages m WHERE m.id=?1 AND ((m.shared_fence IS NULL AND NOT EXISTS(SELECT 1 FROM shared_executions e WHERE e.session_id=m.session_id)) OR (m.shared_fence IS NOT NULL AND EXISTS(SELECT 1 FROM shared_executions e WHERE e.session_id=m.session_id AND e.active=1 AND e.fence=m.shared_fence AND e.owner_instance_id=sengoo_context('instance_id')))))",
++            [message], |row| row.get(0),
++        ).map_err(PersistenceError::from)?;
++        if !valid { return Err(error("stale execution fence: message is absent or belongs to an inactive or replaced turn")); }
++        Ok(())
++    }
++
++}
++
++impl super::PersistenceActor {
++    pub async fn shared_connection_lock(&self, id: &str) -> Result<File, PersistenceError> {
++        let id = id.to_string();
++        self.fusion_op(move |database| lock_file(&database.shared.database, "connection", &id)).await
++    }
++
++    pub async fn shared_changes_since(&self, cursor: i64) -> Result<(i64,Vec<String>,bool),PersistenceError> {
++        self.fusion_op(move |database| {
++            let mut query = database.connection.prepare("SELECT seq,entity,entity_id,COALESCE(instance_id,'') FROM shared_changes WHERE seq>?1 ORDER BY seq LIMIT 256").map_err(PersistenceError::from)?;
++            let mut rows = query.query([cursor]).map_err(PersistenceError::from)?;
++            let mut high = cursor;
++            let mut sessions = std::collections::HashSet::new();
++            let mut connections = false;
++            while let Some(row) = rows.next().map_err(PersistenceError::from)? {
++                high = row.get(0).map_err(PersistenceError::from)?;
++                let instance: String = row.get(3).map_err(PersistenceError::from)?;
++                if instance==database.shared.instance { continue; }
++                let entity: String = row.get(1).map_err(PersistenceError::from)?;
++                let id: String = row.get(2).map_err(PersistenceError::from)?;
++                if entity=="connection_configs" || entity=="app_preferences" { connections=true; }
++                else if entity=="shared_usage" { /* Usage is refreshed separately from history. */ }
++                else if !database.shared.leases.borrow().contains_key(&id) { sessions.insert(id); }
++            }
++            Ok((high,sessions.into_iter().collect(),connections))
++        }).await
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::{BufRead, BufReader, Write};
++    use std::process::{Command, Stdio};
++
++    #[tokio::test]
++    #[ignore = "requires the compiled Sengoo tests_state.exe; run test-shared-store.ps1"]
++    async fn native_cli_and_desktop_exchange_a_live_then_idle_session() {
++        let executable = std::env::var_os("SENCODE_SHARED_CLI_TEST").expect("set SENCODE_SHARED_CLI_TEST");
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        let mut child = Command::new(&executable).args(["--database",path.to_str().unwrap(),"--prompt","hold"])
++            .current_dir(temp.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
++        let mut output = BufReader::new(child.stdout.take().unwrap());
++        let mut session = String::new();
++        output.read_line(&mut session).unwrap();
++        let session = session.trim();
++        assert!(session.starts_with("session-"),"{session}");
++        let actor = super::super::PersistenceActor::start(&path).unwrap();
++        let snapshot = actor.projection_snapshot().await.unwrap();
++        assert_eq!(snapshot.sessions[0].run_state,"running");
++        assert!(snapshot.histories[0].messages.iter().any(|message| message.text=="CLI 共享会话😀"));
++        let message = super::super::LocalMessage {
++            id:"desktop-user".into(),session_id:session.into(),role:"user".into(),
++            text:"Desktop continuation 中文".into(),reasoning:String::new(),created_at_ms:2,
++            completed_at_ms:Some(2),cancelled:false,connection_id:Some("custom-fixture".into()),
++            model_id:Some("model-b".into()),revision:0,content_blocks:None,
++        };
++        assert!(actor.accept_user_turn(message.clone(),2).await.is_err());
++        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
++        assert!(child.wait().unwrap().success());
++        actor.accept_user_turn(message,3).await.unwrap();
++        actor.set_session_run_state_for_turn(session,"desktop-user","idle",4).await.unwrap();
++        actor.shutdown().await.unwrap();
++        let readback = Command::new(executable).args(["--database",path.to_str().unwrap(),"--prompt","inspect","--label",session])
++            .current_dir(temp.path()).output().unwrap();
++        assert!(readback.status.success(),"{}",String::from_utf8_lossy(&readback.stderr));
++        let history: serde_json::Value = serde_json::from_slice(&readback.stdout).unwrap();
++        assert!(history["messages"].as_array().unwrap().iter().any(|message|message["content"]=="Desktop continuation 中文"));
++    }
++    fn fixture(path: &Path) -> super::super::Database {
++        let database = super::super::Database::open(path).unwrap();
++        database.connection.execute_batch("INSERT INTO projects(id,directory,display_name,created_at,updated_at) VALUES('p','C:/fixture','fixture',1,1); INSERT INTO sessions(id,project_id,title,created_at,updated_at) VALUES('one','p','fixture',1,1)").unwrap();
++        database
++    }
++
++    #[test]
++    fn second_client_open_does_not_recover_live_session() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        let first = fixture(&path);
++        first.shared.claim(&first.connection,"one").unwrap();
++        first.connection.execute("UPDATE sessions SET run_state='running' WHERE id='one'",[]).unwrap();
++        let second = super::super::Database::open(&path).unwrap();
++        let status: String = second.connection.query_row("SELECT run_state FROM sessions WHERE id='one'",[],|row|row.get(0)).unwrap();
++        assert_eq!(status,"running");
++        assert!(second.shared.claim(&second.connection,"one").is_err());
++        assert!(second.connection.execute("UPDATE sessions SET run_state='idle' WHERE id='one'",[]).is_err());
++    }
++
++    #[test]
++    fn idle_handoff_increments_fence_and_blocks_old_owner() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        let first = fixture(&path);
++        let second = super::super::Database::open(&path).unwrap();
++        first.shared.claim(&first.connection,"one").unwrap();
++        assert!(first.shared.claim(&first.connection,"one").is_err());
++        first.shared.release(&first.connection,"one").unwrap();
++        second.shared.claim(&second.connection,"one").unwrap();
++        let fence: i64 = second.connection.query_row("SELECT fence FROM shared_executions WHERE session_id='one'",[],|row|row.get(0)).unwrap();
++        assert_eq!(fence,2);
++        assert!(first.connection.execute("UPDATE sessions SET run_state='idle' WHERE id='one'",[]).is_err());
++        second.shared.release(&second.connection,"one").unwrap();
++    }
++
++    #[test]
++    fn released_os_lease_does_not_certify_crashed_desktop_tool_cleanup() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        {
++            let first = fixture(&path);
++            first.shared.claim(&first.connection,"one").unwrap();
++            first.connection.execute("UPDATE sessions SET run_state='running' WHERE id='one'",[]).unwrap();
++        }
++        let second = super::super::Database::open(&path).unwrap();
++        let state: (String,i64) = second.connection.query_row("SELECT s.run_state,e.active FROM sessions s JOIN shared_executions e ON e.session_id=s.id WHERE s.id='one'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
++        assert_eq!(state,("interrupted".into(),0));
++        let cleanup: i64 = second.connection.query_row("SELECT cleanup_required FROM shared_executions WHERE session_id='one'",[],|row|row.get(0)).unwrap();
++        assert_eq!(cleanup,1);
++        assert!(second.shared.claim(&second.connection,"one").is_err());
++    }
++
++    #[test]
++    fn changelog_rolls_back_with_shared_mutation() {
++        let temp = tempfile::tempdir().unwrap();
++        let first = fixture(&temp.path().join("sessions.sqlite3"));
++        let before: i64 = first.connection.query_row("SELECT COUNT(*) FROM shared_changes",[],|row|row.get(0)).unwrap();
++        first.connection.execute_batch("BEGIN IMMEDIATE; UPDATE sessions SET title='uncommitted' WHERE id='one'; ROLLBACK").unwrap();
++        let after: i64 = first.connection.query_row("SELECT COUNT(*) FROM shared_changes",[],|row|row.get(0)).unwrap();
++        assert_eq!(before,after);
++        first.connection.execute("UPDATE sessions SET title='committed' WHERE id='one'",[]).unwrap();
++        let after: i64 = first.connection.query_row("SELECT COUNT(*) FROM shared_changes",[],|row|row.get(0)).unwrap();
++        assert_eq!(after,before+1);
++    }
++
++    #[test]
++    fn engine_binding_mirror_tracks_insert_update_delete_atomically() {
++        let temp = tempfile::tempdir().unwrap();
++        let database = fixture(&temp.path().join("sessions.sqlite3"));
++        database.connection.execute("INSERT INTO runtime_bindings(session_id,connection_id,generation,native_session_id,synced_revision,updated_at) VALUES('one','custom-a',1,'native-a',2,3)",[]).unwrap();
++        let binding: (String,i64,i64) = database.connection.query_row("SELECT native_session_id,synced_revision,generation FROM shared_engine_bindings WHERE session_id='one' AND connection_id='custom-a' AND engine='desktop'",[],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
++        assert_eq!(binding,("native-a".into(),2,1));
++        database.connection.execute_batch("BEGIN IMMEDIATE; UPDATE runtime_bindings SET native_session_id='rolled-back'; ROLLBACK").unwrap();
++        let native: String = database.connection.query_row("SELECT native_session_id FROM shared_engine_bindings",[],|row|row.get(0)).unwrap();
++        assert_eq!(native,"native-a");
++        database.connection.execute("UPDATE runtime_bindings SET connection_id='custom-b',native_session_id='native-b',generation=4,synced_revision=5",[]).unwrap();
++        let binding: (String,String,i64) = database.connection.query_row("SELECT connection_id,native_session_id,generation FROM shared_engine_bindings",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
++        assert_eq!(binding,("custom-b".into(),"native-b".into(),4));
++        database.connection.execute("DELETE FROM runtime_bindings",[]).unwrap();
++        assert_eq!(database.connection.query_row("SELECT COUNT(*) FROM shared_engine_bindings",[],|row|row.get::<_,i64>(0)).unwrap(),0);
++    }
++
++    #[tokio::test]
++    async fn default_connection_changes_are_shared_and_cursor_refreshable() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        let first = super::super::PersistenceActor::start(&path).unwrap();
++        let second = super::super::PersistenceActor::start(&path).unwrap();
++        first.set_preferred_connection_id(Some("custom-fixture".into())).await.unwrap();
++        let (own_cursor,own_sessions,own_connections) = first.shared_changes_since(0).await.unwrap();
++        assert!(own_cursor>0 && own_sessions.is_empty() && !own_connections,"own changes advance the cursor without replaying projection events");
++        assert_eq!(second.preferred_connection_id().await.unwrap().as_deref(),Some("custom-fixture"));
++        let (cursor,sessions,connections) = second.shared_changes_since(0).await.unwrap();
++        assert!(cursor>0 && connections && sessions.is_empty());
++        first.set_preferred_connection_id(None).await.unwrap();
++        assert_eq!(second.preferred_connection_id().await.unwrap(),None);
++        let (next,sessions,connections) = second.shared_changes_since(cursor).await.unwrap();
++        assert!(next>cursor && connections && sessions.is_empty());
++        assert!(!second.shared_changes_since(next).await.unwrap().2);
++        first.shutdown().await.unwrap(); second.shutdown().await.unwrap();
++    }
++
++    #[test]
++    fn same_desktop_delayed_message_cannot_modify_a_new_turn_or_release_its_lease() {
++        let temp = tempfile::tempdir().unwrap();
++        let mut database = fixture(&temp.path().join("sessions.sqlite3"));
++        database.shared.claim(&database.connection,"one").unwrap();
++        database.connection.execute("INSERT INTO messages(id,session_id,role,text,created_at,revision) VALUES('old','one','assistant','first',1,1)",[]).unwrap();
++        database.append_message_delta("old"," done","",Some(2)).unwrap();
++        database.shared.claim(&database.connection,"one").unwrap();
++        database.connection.execute("UPDATE sessions SET run_state='running' WHERE id='one'",[]).unwrap();
++        assert!(database.append_message_delta("old","late","",Some(5)).is_err());
++        let state: (String,i64) = database.connection.query_row("SELECT s.run_state,e.active FROM sessions s JOIN shared_executions e ON e.session_id=s.id WHERE s.id='one'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
++        assert_eq!(state,("running".into(),1));
++        let text: String = database.connection.query_row("SELECT text FROM messages WHERE id='old'",[],|row|row.get(0)).unwrap();
++        assert_eq!(text,"first done");
++        assert!(database.shared.leases.borrow().contains_key("one"));
++        database.shared.release(&database.connection,"one").unwrap();
++    }
++
++    fn message(id: &str, role: &str, timestamp: i64) -> super::super::LocalMessage {
++        super::super::LocalMessage {
++            id: id.into(), session_id: "one".into(), role: role.into(),
++            text: id.into(), reasoning: String::new(), created_at_ms: timestamp,
++            completed_at_ms: (role == "user").then_some(timestamp),
++            cancelled: false, connection_id: Some("custom-fixture".into()),
++            model_id: Some("model-fixture".into()), revision: timestamp,
++            content_blocks: None,
++        }
++    }
++
++    fn binding(timestamp: i64) -> super::super::RuntimeBindingRecord {
++        super::super::RuntimeBindingRecord {
++            session_id: "one".into(), connection_id: "custom-fixture".into(),
++            generation: 1, native_session_id: "native-fixture".into(),
++            synced_revision: timestamp as u64, updated_at_ms: timestamp,
++        }
++    }
++
++    #[test]
++    fn turn_authority_requires_the_accepted_user_and_current_owner() {
++        let temp = tempfile::tempdir().unwrap();
++        let mut database = fixture(&temp.path().join("sessions.sqlite3"));
++        database.connection.execute("INSERT INTO messages(id,session_id,role,text,created_at,revision) VALUES('legacy','one','assistant','legacy',1,1)",[]).unwrap();
++        SharedStore::validate_legacy_execution(&database.connection,"one").unwrap();
++        SharedStore::validate_message_fence(&database.connection,"legacy").unwrap();
++        assert!(SharedStore::validate_message_fence(&database.connection,"absent").is_err());
++        database.accept_user_turn(&message("accepted","user",2),2).unwrap();
++        SharedStore::validate_turn_fence(&database.connection,"one","accepted").unwrap();
++        assert!(SharedStore::validate_turn_fence(&database.connection,"other","accepted").is_err());
++        assert!(SharedStore::validate_turn_fence(&database.connection,"one","absent").is_err());
++        assert!(SharedStore::validate_legacy_execution(&database.connection,"one").is_err());
++        assert!(SharedStore::validate_message_fence(&database.connection,"legacy").is_err());
++        database.connection.execute("INSERT INTO messages(id,session_id,role,text,created_at,revision) VALUES('assistant','one','assistant','assistant',3,3)",[]).unwrap();
++        assert!(SharedStore::validate_turn_fence(&database.connection,"one","assistant").is_err());
++        let other = super::super::Database::open(&temp.path().join("sessions.sqlite3")).unwrap();
++        assert!(SharedStore::validate_turn_fence(&other.connection,"one","accepted").is_err());
++        database.set_session_run_state_for_turn("one","accepted","idle",4).unwrap();
++        assert!(SharedStore::validate_turn_fence(&database.connection,"one","accepted").is_err());
++        assert!(SharedStore::validate_legacy_execution(&database.connection,"one").is_err());
++    }
++
++    #[test]
++    fn delayed_turn_without_assistant_cannot_dispatch_or_terminate_its_successor() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        let mut database = fixture(&path);
++        database.accept_user_turn(&message("user-A","user",1),1).unwrap();
++        database.set_session_run_state_for_turn("one","user-A","idle",2).unwrap();
++        database.accept_user_turn(&message("user-B","user",3),3).unwrap();
++
++        assert!(database.set_session_run_state_for_turn("one","user-A","error",2).is_err());
++        assert!(database.set_session_run_state("one","idle",2).is_err());
++        let mut late_assistant = message("missing-assistant-A","assistant",2);
++        for accepted in [Some("user-A"),None] {
++            late_assistant.completed_at_ms = None;
++            let dispatch_error = database.begin_runtime_turn(&super::super::DispatchTurnPersist {
++                accepted_user_message_id: accepted.map(str::to_owned),
++                assistant_message: late_assistant.clone(), binding: binding(2), accepted_at_ms: 1,
++            }).unwrap_err();
++            assert_eq!(dispatch_error.code,PersistenceErrorCode::Conflict);
++            late_assistant.completed_at_ms = Some(4);
++            let error_terminal = database.commit_runtime_error_terminal(
++                &late_assistant,1,crate::dto::TurnOutcome::Error,None,accepted,
++            ).unwrap_err();
++            assert_eq!(error_terminal.code,PersistenceErrorCode::Conflict);
++            let terminal_error = database.commit_runtime_terminal(&super::super::TerminalTurnCommit {
++                accepted_user_message_id: accepted.map(str::to_owned),
++                assistant_message: late_assistant.clone(), tools: Vec::new(), binding: binding(2),
++                provider_event_id: "late-A".into(), run_state: "idle".into(), accepted_at_ms: 1,
++                outcome: crate::dto::TurnOutcome::Success,
++            },None).unwrap_err();
++            assert_eq!(terminal_error.code,PersistenceErrorCode::Conflict);
++        }
++        let state: (String,i64,i64) = database.connection.query_row(
++            "SELECT s.run_state,e.active,e.fence FROM sessions s JOIN shared_executions e ON e.session_id=s.id WHERE s.id='one'",[],
++            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
++        ).unwrap();
++        assert_eq!(state,("running".into(),1,2));
++        assert!(database.get_message("missing-assistant-A").unwrap().is_none());
++        assert!(database.shared.leases.borrow().contains_key("one"));
++        assert!(lock_file(&path,"session","one").is_err());
++
++        // A valid callback may still create an assistant and finish this turn.
++        let mut current_assistant = message("assistant-B","assistant",4);
++        database.begin_runtime_turn(&super::super::DispatchTurnPersist {
++            accepted_user_message_id: Some("user-B".into()), assistant_message: current_assistant.clone(),
++            binding: binding(4), accepted_at_ms: 3,
++        }).unwrap();
++        current_assistant.completed_at_ms = Some(5);
++        database.commit_runtime_error_terminal(
++            &current_assistant,3,crate::dto::TurnOutcome::Error,None,Some("user-B"),
++        ).unwrap();
++        assert!(!database.shared.leases.borrow().contains_key("one"));
++        assert!(lock_file(&path,"session","one").is_ok());
++    }
++
++    #[test]
++    fn edited_resend_holds_lease_until_rollback_or_terminal_cleanup() {
++        for rollback_turn in [true,false] {
++            let temp = tempfile::tempdir().unwrap();
++            let path = temp.path().join("sessions.sqlite3");
++            let mut database = fixture(&path);
++            database.insert_message_bundle(&message("original-user","user",1),&[]).unwrap();
++            let mut original_assistant = message("original-assistant","assistant",2);
++            original_assistant.completed_at_ms = Some(2);
++            database.insert_message_bundle(&original_assistant,&[]).unwrap();
++            let second = super::super::Database::open(&path).unwrap();
++            let replaced = database.replace_latest_prompt(
++                "original-user",2,&message("replacement-user","user",3),3,
++            ).unwrap();
++            SharedStore::validate_turn_fence(&database.connection,"one","replacement-user").unwrap();
++            assert!(second.shared.claim(&second.connection,"one").is_err());
++            assert!(lock_file(&path,"session","one").is_err());
++
++            if rollback_turn {
++                database.rollback_latest_prompt_replay(&replaced.rollback).unwrap();
++                assert!(database.get_message("original-user").unwrap().is_some());
++                assert!(database.get_message("original-assistant").unwrap().is_some());
++                assert!(database.get_message("replacement-user").unwrap().is_none());
++            } else {
++                database.set_session_run_state_for_turn("one","replacement-user","idle",4).unwrap();
++            }
++            assert!(!database.shared.leases.borrow().contains_key("one"));
++            second.shared.claim(&second.connection,"one").unwrap();
++            second.shared.release(&second.connection,"one").unwrap();
++        }
++    }
++
++    #[test]
++    fn unadapted_writer_fails_closed() {
++        let temp = tempfile::tempdir().unwrap();
++        let path = temp.path().join("sessions.sqlite3");
++        let _first = fixture(&path);
++        let unadapted = Connection::open(&path).unwrap();
++        assert!(unadapted.execute("UPDATE sessions SET title='old writer' WHERE id='one'",[]).is_err());
++    }
++
++    #[test]
++    fn cross_connection_lock_is_exclusive_and_persistent() {
++        let temp = tempfile::tempdir().unwrap();
++        let db = temp.path().join("sessions.sqlite3");
++        let first = lock_file(&db,"session","one").unwrap();
++        assert!(lock_file(&db,"session","one").is_err());
++        let other = lock_file(&db,"session","two").unwrap();
++        drop(first);
++        assert!(lock_path(&db,"session","one").exists());
++        assert!(lock_file(&db,"session","one").is_ok());
++        drop(other);
++    }
++}
+diff --git a/windows/sencode-desktop/src-tauri/src/supervisor_shared_execution_tests.rs b/windows/sencode-desktop/src-tauri/src/supervisor_shared_execution_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/windows/sencode-desktop/src-tauri/src/supervisor_shared_execution_tests.rs
+@@ -0,0 +1,230 @@
++use super::*;
++use crate::acp::{ClientBridge, ClientHandler};
++use crate::persistence::{LocalMessage, LocalProject, LocalSession, PersistenceActor};
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
++
++fn pending_prompt_peer() -> (
++    SencodeAcpClient,
++    oneshot::Receiver<()>,
++    oneshot::Sender<()>,
++    tokio::task::JoinHandle<()>,
++) {
++    let (client_io, peer_io) = tokio::io::duplex(16 * 1024);
++    let (reader, writer) = tokio::io::split(client_io);
++    let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
++    let (connection, io_task) = acp::ClientSideConnection::new(
++        ClientHandler::new(ClientBridge::new(inbound_tx)),
++        writer.compat_write(),
++        reader.compat(),
++        |future| {
++            tokio::task::spawn_local(future);
++        },
++    );
++    tokio::task::spawn_local(async move {
++        let _ = io_task.await;
++    });
++    let client = SencodeAcpClient::from_parts_for_test(
++        Rc::new(connection),
++        ExternalCapabilities::embedded_custom_api(),
++    );
++    let (started_tx, started_rx) = oneshot::channel();
++    let (release_tx, release_rx) = oneshot::channel();
++    let peer = tokio::task::spawn_local(async move {
++        let (reader, mut writer) = tokio::io::split(peer_io);
++        let mut reader = BufReader::new(reader);
++        let mut started = Some(started_tx);
++        let mut release = Some(release_rx);
++        loop {
++            let mut line = String::new();
++            let count = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
++                .await
++                .expect("ACP request timed out")
++                .unwrap();
++            assert_ne!(count, 0, "ACP client closed before its prompt");
++            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
++            let method = request["method"].as_str().expect("ACP request method");
++            let result = match method {
++                "session/load" | "session/set_model" => serde_json::json!({}),
++                "session/prompt" => {
++                    started.take().unwrap().send(()).unwrap();
++                    tokio::time::timeout(Duration::from_secs(3), release.take().unwrap())
++                        .await
++                        .expect("test did not release pending ACP prompt")
++                        .unwrap();
++                    serde_json::json!({"stopReason":"end_turn"})
++                }
++                other => panic!("unexpected ACP request: {other}"),
++            };
++            let response = serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result});
++            writer
++                .write_all(format!("{response}\n").as_bytes())
++                .await
++                .unwrap();
++            writer.flush().await.unwrap();
++            if method == "session/prompt" {
++                break;
++            }
++        }
++    });
++    (client, started_rx, release_tx, peer)
++}
++
++async fn fallback_prompt_owns_shared_execution(connection_id: &str) {
++    let temp = tempfile::tempdir().unwrap();
++    let path = temp.path().join("shared-execution.sqlite3");
++    let directory = temp.path().to_string_lossy().into_owned();
++    let mut state = Projection::new(EventLog::new());
++    let project = state.remember_project(&directory);
++    state.upsert_session(SessionSummary {
++        id: "fallback-task".into(),
++        project_id: project.id.clone(),
++        title: "Fallback test".into(),
++        updated_at_ms: 1,
++        run_state: SessionRunState::Idle,
++        pending_interactions: 0,
++        attention: crate::dto::SessionAttention::None,
++    });
++    let selected = ModelRef {
++        connection_id: connection_id.into(),
++        model_id: "test-model".into(),
++    };
++    let detail = state.sessions.get_mut("fallback-task").unwrap();
++    detail.model_ref = Some(selected.clone());
++    detail.model_id = selected.model_id.clone();
++    let projection = Arc::new(Mutex::new(state));
++    let first = PersistenceActor::start(&path).unwrap();
++    first
++        .upsert_project(LocalProject {
++            id: project.id.clone(),
++            directory: project.directory,
++            display_name: project.name,
++            created_at_ms: 1,
++            updated_at_ms: 1,
++        })
++        .await
++        .unwrap();
++    first
++        .upsert_session(LocalSession {
++            id: "fallback-task".into(),
++            project_id: project.id,
++            title: "Fallback test".into(),
++            archived: false,
++            created_at_ms: 1,
++            updated_at_ms: 1,
++            last_sent_at_ms: None,
++            run_state: "idle".into(),
++            unread: false,
++            model_ref: Some(selected),
++        })
++        .await
++        .unwrap();
++    let second = PersistenceActor::start(&path).unwrap();
++    let (client, started, release, peer) = pending_prompt_peer();
++    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
++    assert!(
++        begin_prompt(
++            "fallback-task",
++            "hold this prompt",
++            Vec::new(),
++            &projection,
++            Some(&first),
++            Some(client),
++            connection_id,
++            &internal_tx,
++            None,
++            None,
++        )
++        .await
++        .unwrap()
++        .accepted
++    );
++    tokio::time::timeout(Duration::from_secs(3), started)
++        .await
++        .expect("provider did not receive pending prompt")
++        .unwrap();
++    let other_message = LocalMessage {
++        id: "second-user".into(),
++        session_id: "fallback-task".into(),
++        role: "user".into(),
++        text: "competing continuation".into(),
++        reasoning: String::new(),
++        created_at_ms: 10,
++        completed_at_ms: Some(10),
++        cancelled: false,
++        connection_id: Some("custom-second".into()),
++        model_id: Some("second-model".into()),
++        revision: 0,
++        content_blocks: None,
++    };
++    let busy = second
++        .accept_user_turn(other_message.clone(), 10)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        busy.code(),
++        crate::persistence::PersistenceErrorCode::Conflict
++    );
++    assert_eq!(
++        first
++            .history_page("fallback-task", None, 10)
++            .await
++            .unwrap()
++            .messages
++            .len(),
++        1,
++        "the rejected second user must not enter the accepted transcript"
++    );
++    release.send(()).unwrap();
++    let terminal = tokio::time::timeout(Duration::from_secs(3), internal_rx.recv())
++        .await
++        .expect("fallback prompt did not persist and release its lease")
++        .expect("terminal event sender closed");
++    assert!(matches!(
++        terminal,
++        InternalMsg::RuntimeTurnFinished {
++            ok: true,
++            cancelled: false,
++            ..
++        }
++    ));
++    tokio::time::timeout(Duration::from_secs(3), peer)
++        .await
++        .unwrap()
++        .unwrap();
++    second.accept_user_turn(other_message, 11).await.unwrap();
++    second
++        .set_session_run_state_for_turn("fallback-task", "second-user", "idle", 12)
++        .await
++        .unwrap();
++    first.shutdown().await.unwrap();
++    second.shutdown().await.unwrap();
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn shared_acp_fallback_holds_lease_until_prompt_terminal() {
++    tokio::task::LocalSet::new()
++        .run_until(async {
++            tokio::time::timeout(
++                Duration::from_secs(10),
++                fallback_prompt_owns_shared_execution("sencode-shared"),
++            )
++            .await
++            .expect("shared fallback acceptance exceeded its test deadline");
++        })
++        .await;
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn managed_acp_fallback_holds_lease_until_prompt_terminal() {
++    tokio::task::LocalSet::new()
++        .run_until(async {
++            tokio::time::timeout(
++                Duration::from_secs(10),
++                fallback_prompt_owns_shared_execution("sencode-managed"),
++            )
++            .await
++            .expect("managed fallback acceptance exceeded its test deadline");
++        })
++        .await;
++}

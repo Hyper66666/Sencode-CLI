@@ -1,0 +1,117 @@
+import job_store;
+import engine;
+
+struct JobClient { stream: IpcStream, input: Buffer, output: Buffer, job: JsonDoc, epoch: String }
+
+def job_client_error(code:i64)->Result<JobClient,i64> {
+    Result{is_ok:false,value:JobClient{stream:IpcStream{handle:0},input:Buffer{handle:0},output:Buffer{handle:0},job:JsonDoc{handle:0},epoch:String{handle:0}},error:code}
+}
+
+def job_client_send(client:&JobClient, document:&JsonDoc)->Result<bool,i64> {job_frame_append(&client.output,document)}
+
+def job_client_poll(client:&JobClient)->Result<JsonDoc,i64> {
+    job_stream_flush(&client.stream,&client.output)?;
+    job_stream_read(&client.stream,&client.input)?;
+    let document=job_frame_take(&client.input,2097151)?;
+    if not document.root().object_has("type") and client.stream.eof()? {return job_object_error(5);};
+    Result{is_ok:true,value:document,error:0}
+}
+
+def job_client_open(store:&JobStore,id:&str,role:&str,after:i64)->Result<JobClient,i64> {
+    let job=job_store_load(store,id)?;
+    let pid=cli_json_optional_i64(job.root(),"host_pid",0); let birth=cli_json_optional_i64(job.root(),"host_creation_identity",0);
+    if pid<=0 or birth<=0 or not process_identity_matches(pid,birth)? {return job_client_error(5);};
+    let endpoint=cli_json_string(job.root(),"endpoint")?;
+    let deadline=time_unix_ms();
+    let mut stream=IpcStream{handle:0};
+    while time_since_ms(deadline)<5000 {
+        let connected=ipc_connect(endpoint.as_str());
+        if connected.is_ok() {stream=connected.value;break;};
+        if connected.error!=5 and connected.error!=9 and connected.error!=11 and connected.error!=12 {return job_client_error(connected.error);};
+        time_sleep_ms(5);
+    };
+    if not stream.is_open(){return job_client_error(11);};
+    if stream.peer_pid()?!=pid or not process_identity_matches(pid,birth)?{return job_client_error(7);};
+    let generation=cli_json_string(job.root(),"generation")?;
+    let hello=job_message("hello",id,generation.as_str())?;cli_put_string(&hello,hello.root(),"role",role)?;cli_put_i64(&hello,hello.root(),"after",after)?;
+    let mut client=JobClient{stream:stream,input:cli_bytes(2097152),output:cli_bytes(2097152),job:job,epoch:string_new()};
+    job_client_send(&client,&hello)?;
+    let started=time_unix_ms();
+    while time_since_ms(started)<5000 {
+        let event=job_client_poll(&client)?;
+        if event.root().object_has("type") {
+            if cli_json_string(event.root(),"type")?.as_str()!="ready" {return job_client_error(7);};
+            if cli_json_string(event.root(),"generation")?.as_str()!=generation.as_str(){return job_client_error(7);};
+            client.epoch=cli_json_string(event.root(),"control_epoch")?;
+            client.job=event;
+            return Result{is_ok:true,value:client,error:0};
+        };
+        time_sleep_ms(2);
+    };
+    job_client_error(11)
+}
+
+def job_client_command(client:&JobClient,kind:&str)->Result<JsonDoc,i64> {
+    let command=job_message(kind,cli_json_string(client.job.root(),"job_id")?.as_str(),cli_json_string(client.job.root(),"generation")?.as_str())?;
+    if kind!="stop" and kind!="logs" {cli_put_string(&command,command.root(),"control_epoch",client.epoch.as_str())?; (); };
+    Result{is_ok:true,value:command,error:0}
+}
+
+// Caller supplies the installed executable. Production must pass its own image;
+// the isolated probe uses its own image as both supervisor and engine.
+def job_start(state:&CliState,cwd:&str,session:&str,submit:&JsonDoc,lifetime_ms:i64,image:&str)->Result<JsonDoc,i64> {
+    engine_submit_valid(submit)?;
+    if cli_json_optional_string(submit.root(),"goal").len()>0 {return job_object_error(7);};
+    if cli_json_optional_string(submit.root(),"permission_profile").as_str()=="backend" {return job_object_error(7);};
+    let metadata=cli_state_connection_metadata(state,cli_json_string(submit.root(),"connection")?.as_str())?;
+    if cli_json_string(metadata.root(),"engine")?.as_str()!="sengoo-native-api" {return job_object_error(8);};
+    let directory=canonical_path_string(cwd)?;
+    let store=job_store_open(state)?;
+    let job=job_store_create(&store,state,session,directory.as_str(),submit,lifetime_ms)?;
+    let id=cli_json_string(job.root(),"job_id")?;
+    let command=process_command(image)?;command.arg("--background-host")?;command.arg(id.as_str())?;command.arg("--database")?;command.arg(state.path.as_str())?;command.cwd(directory.as_str())?;
+    let launched=command.spawn_detached();
+    if not launched.is_ok(){job_store_status(&store,id.as_str(),cli_json_string(job.root(),"generation")?.as_str(),"failed","detached_launch_failed")?;return job_object_error(launched.error);};
+    job_store_receipt(&store,id.as_str(),&launched.value)?;
+    let client=job_client_open(&store,id.as_str(),"start",0)?;
+    // A Goal remains foreground-bound: callers must use job_prepare/job client
+    // API to retain control. The fire-and-return entry point refuses it.
+    let start=job_client_command(&client,"start")?;job_client_send(&client,&start)?;
+    let began=time_unix_ms();
+    while time_since_ms(began)<10000 {
+        let event=job_client_poll(&client)?;
+        let current=job_store_load(&store,id.as_str())?;
+        if current.root().object_get("admitted")?.bool_value()? {return Result{is_ok:true,value:current,error:0};};
+        time_sleep_ms(2);
+    };
+    job_object_error(11)
+}
+
+// Prepare supports an attached Goal: no request starts until control sends start.
+def job_prepare(state:&CliState,cwd:&str,session:&str,submit:&JsonDoc,lifetime_ms:i64,image:&str)->Result<JsonDoc,i64> {
+    engine_submit_valid(submit)?;
+    let metadata=cli_state_connection_metadata(state,cli_json_string(submit.root(),"connection")?.as_str())?;
+    if cli_json_string(metadata.root(),"engine")?.as_str()!="sengoo-native-api" or cli_json_optional_string(submit.root(),"permission_profile").as_str()=="backend" {return job_object_error(8);};
+    let directory=canonical_path_string(cwd)?;let store=job_store_open(state)?;
+    let job=job_store_create(&store,state,session,directory.as_str(),submit,lifetime_ms)?;let id=cli_json_string(job.root(),"job_id")?;
+    let command=process_command(image)?;command.arg("--background-host")?;command.arg(id.as_str())?;command.arg("--database")?;command.arg(state.path.as_str())?;command.cwd(directory.as_str())?;
+    let launched=command.spawn_detached();
+    if not launched.is_ok(){job_store_status(&store,id.as_str(),cli_json_string(job.root(),"generation")?.as_str(),"failed","detached_launch_failed")?;return job_object_error(launched.error);};
+    job_store_receipt(&store,id.as_str(),&launched.value)?;job_store_load(&store,id.as_str())
+}
+
+def job_stop(state:&CliState,id:&str)->Result<JsonDoc,i64> {
+    let store=job_store_open(state)?;let snapshot=job_snapshot(state,&store,id)?;
+    if job_terminal(cli_json_string(snapshot.root(),"state")?.as_str()){return Result{is_ok:true,value:snapshot,error:0};};
+    let client=job_client_open(&store,id,"stop",cli_json_optional_i64(snapshot.root(),"last_sequence",0))?;
+    let stop=job_client_command(&client,"stop")?;cli_put_string(&stop,stop.root(),"id","explicit-user-stop")?;job_client_send(&client,&stop)?;
+    let started=time_unix_ms();
+    while time_since_ms(started)<15000 {
+        let event=job_client_poll(&client);
+        let current=job_store_load(&store,id)?;
+        if job_terminal(cli_json_string(current.root(),"state")?.as_str()){return Result{is_ok:true,value:current,error:0};};
+        if not event.is_ok() and event.error!=5{return job_object_error(event.error);};
+        time_sleep_ms(2);
+    };
+    job_object_error(11)
+}

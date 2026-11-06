@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "protected-paths",
+  "version": "0.1.0",
+  "language": "sengoo",
+  "protocol": "sencode.native-worker/1",
+  "executable": "protected-paths.exe",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "timeout_ms": 5000,
+  "before_tool": ["write_file", "apply_patch"],
+  "after_tool": []
+}

@@ -1,0 +1,50 @@
+import frontend;
+import command_line;
+
+def pump_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return state_bool_error(99); }; tui_true() }
+
+def pump_fixture(mode: &str) -> Result<i64, i64> {
+    let output = string_new(); let mut index = 0;
+    while index < 96 {
+        output.push_str("{\"type\":\"text_delta\",\"request_id\":\"stream-probe\",\"text\":\"chunk-")?; output.push_i64(index)?; output.push_str("|\"}\n")?; index = index + 1;
+    };
+    if mode == "truncated" { output.push_str("{\"type\":\"result\"")?; (); } else { output.push_str("{\"type\":\"result\",\"request_id\":\"stream-probe\",\"success\":true,\"content\":\"\"}\n")?; (); };
+    io_stdout_write(output.as_str()); io_stdout_flush()?; cli_ok(0)
+}
+
+def pump_case(mode: &str) -> Result<bool, i64> {
+    let image = current_executable_string()?; let command = process_command(image.as_str())?; command.arg("fixture")?; command.arg(mode)?;
+    let process = command.spawn_piped()?;
+    let mut host = FrontHost { process: process, input: cli_bytes(524288), output: cli_bytes(2097152), errors: cli_bytes(65536), active: cli_text("stream-probe"), ready: true, exit_requested: true, stopped_at: 0, export_path: string_new(), export_text: string_new(), permission_profile: cli_text("strict"), agents: tui_agents_new(), checkpoint_id: string_new(), target_dirty: false, permissions_dirty: false, permission_retry_at: 0 };
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "probe"); tui_begin(&mut app)?;
+    let terminal = terminal_open()?; let deadline = time_unix_ms() + 10000;
+    while not host.process.try_wait()? and time_unix_ms() < deadline { time_sleep_ms(1); };
+    pump_assert(host.process.try_wait()?, "fixture process must exit before the first bounded pump")?;
+    let mut calls = 0; let mut failed = false; let mut failure = 0;
+    while host.stopped_at == 0 and time_unix_ms() < deadline {
+        let result = front_pump(&mut host, &mut app, &terminal); calls = calls + 1;
+        if not result.is_ok() { failed = true; failure = result.error; break; };
+        time_sleep_ms(1);
+    };
+    if mode == "truncated" {
+        pump_assert(failed and failure == 20 and calls > 1, "incomplete final NDJSON frame fails after draining buffered complete events")?;
+        pump_assert(str_contains(app.streaming.as_str(), "chunk-95|"), "truncated terminal frame retains all preceding streamed text")?;
+    } else {
+        pump_assert(not failed and calls > 1 and host.stopped_at > 0 and not app.busy, "more than 32 events drain before EOF completion")?;
+        pump_assert(app.messages.len() == 1 and str_contains(app.messages.get(0).text.as_str(), "chunk-0|") and str_contains(app.messages.get(0).text.as_str(), "chunk-95|"), "fast EOF retains first and last deltas through its terminal result")?;
+        let expected = string_new(); let mut index = 0; while index < 96 { expected.push_str("chunk-")?; expected.push_i64(index)?; expected.push_str("|")?; index = index + 1; };
+        pump_assert(app.messages.get(0).text.as_str() == expected.as_str(), "coalesced pump preserves all 96 deltas in exact order")?;
+        pump_assert(not front_pump(&mut host, &mut app, &terminal)?, "stopped idle pump reports no rendering work")?;
+    };
+    host.process.terminate_tree()?; pump_assert(host.process.tree_quiescent()?, "fixture process tree is quiescent")
+}
+
+def pump_tests() -> Result<i64, i64> {
+    pump_case("complete")?; pump_case("truncated")?; println("stream pump: 96-event fast EOF, ordered coalescing, terminal result and truncated-frame failure passed"); cli_ok(0)
+}
+
+def main() -> i64 {
+    let mode = cli_argument(0).unwrap_or(string_new());
+    let result = if mode.as_str() == "fixture" { let kind = cli_argument(1).unwrap_or(string_new()); pump_fixture(kind.as_str()) } else { pump_tests() };
+    if not result.is_ok() { println(result.error); return 1; }; result.value
+}

@@ -1,0 +1,55 @@
+import terminal;
+import contracts_app;
+
+def output_app_event(format: &str, event: &AppEvent) -> Result<bool, i64> {
+    if format == "text" {
+        if event.kind.as_str() == "text_delta" or event.kind.as_str() == "notice" { return ui_output(event.text.as_str()); };
+        return Result { is_ok: true, value: true, error: 0 };
+    };
+    if format != "stream-json" and format != "host-json" { return Result { is_ok: true, value: true, error: 0 }; };
+    let document = app_event_document(event)?;
+    output_document(&document)
+}
+
+def output_event(format: &str, session: &str, id: &str, kind: &str, text: &str) -> Result<bool, i64> {
+    if format == "text" {
+        if kind == "text_delta" or kind == "notice" { return ui_output(text); };
+        return Result { is_ok: true, value: true, error: 0 };
+    };
+    if format != "stream-json" and format != "host-json" { return Result { is_ok: true, value: true, error: 0 }; };
+    let event = json_doc_object()?;
+    cli_put_i64(&event, event.root(), "schema", 1)?;
+    cli_put_string(&event, event.root(), "type", kind)?;
+    cli_put_string(&event, event.root(), "id", id)?;
+    cli_put_string(&event, event.root(), "session_id", session)?;
+    cli_put_string(&event, event.root(), "text", text)?;
+    let encoded = event.serialize_string()?;
+    io_stdout_write(encoded.as_str())?;
+    io_stdout_write("\n")?;
+    io_stdout_flush()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def output_result(format: &str, session: &str, content: &str, code: i64) -> Result<bool, i64> {
+    if format == "text" { if code != 0 { cli_diagnostic(content); }; io_stdout_write("\n")?; return Result { is_ok: true, value: true, error: 0 }; };
+    let result = json_doc_object()?;
+    cli_put_i64(&result, result.root(), "schema", 1)?;
+    cli_put_string(&result, result.root(), "type", "result")?;
+    cli_put_string(&result, result.root(), "session_id", session)?;
+    cli_put_string(&result, result.root(), "content", content)?;
+    cli_put_i64(&result, result.root(), "code", code)?;
+    cli_put_bool(&result, result.root(), "success", code == 0)?;
+    let encoded = result.serialize_string()?;
+    io_stdout_write(encoded.as_str())?;
+    io_stdout_write("\n")?;
+    io_stdout_flush()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def output_document(document: &JsonDoc) -> Result<bool, i64> {
+    let encoded = document.serialize_string()?;
+    io_stdout_write(encoded.as_str())?;
+    io_stdout_write("\n")?;
+    io_stdout_flush()?;
+    Result { is_ok: true, value: true, error: 0 }
+}

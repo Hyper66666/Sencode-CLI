@@ -1,0 +1,116 @@
+import hook_store;
+import hook_client;
+import scheduler;
+import engine_control;
+import std::file_snapshot;
+
+def hook_host_status(status:&str,reason:&str,permission:bool,clean:bool)->Result<JsonDoc,i64>{
+    let document=json_doc_object()?;cli_put_string(&document,document.root(),"status",status)?;
+    cli_put_string(&document,document.root(),"reason",reason)?;cli_put_bool(&document,document.root(),"cleanup_confirmed",clean)?;
+    if permission{cli_put_bool(&document,document.root(),"permission_required",true)?; ();};Result{is_ok:true,value:document,error:0}
+}
+
+def hook_host_event(manifest:&HookManifest,execution:&CliExecution,id:&str,parent:&str,cwd:&str,phase:&str,tool:&str,args:&JsonDoc,result:&JsonDoc)->Result<JsonDoc,i64>{
+    let event=hook_frame("hook",id,manifest.id.as_str(),manifest.digest.as_str())?;
+    cli_put_string(&event,event.root(),"event",phase)?;cli_put_string(&event,event.root(),"session_id",execution.session.as_str())?;
+    cli_put_string(&event,event.root(),"execution_id",execution.id.as_str())?;cli_put_string(&event,event.root(),"parent_call_id",parent)?;
+    cli_put_string(&event,event.root(),"cwd",cwd)?;cli_put_string(&event,event.root(),"tool",tool)?;
+    event.root().object_set("input",event.copy(args.root())?)?;
+    if phase=="after_tool"{event.root().object_set("result",event.copy(result.root())?)?; ();};
+    if event.serialize_string()?.len()>131072{return hook_error(13);};Result{is_ok:true,value:event,error:0}
+}
+
+def hook_host_preview(manifest:&HookManifest,event:&JsonDoc)->Result<String,i64>{
+    let text=cli_text("Run an explicitly trusted native hook? This process has this Windows user's OS access; it is not sandboxed. This approval applies only to this invocation.\n");
+    let preview=json_doc_object()?;cli_put_string(&preview,preview.root(),"worker_id",manifest.id.as_str())?;
+    cli_put_string(&preview,preview.root(),"manifest",manifest.path.as_str())?;cli_put_string(&preview,preview.root(),"executable",manifest.executable.as_str())?;
+    cli_put_string(&preview,preview.root(),"manifest_sha256",manifest.digest.as_str())?;cli_put_string(&preview,preview.root(),"executable_sha256",manifest.executable_digest.as_str())?;
+    cli_put_i64(&preview,preview.root(),"timeout_ms",manifest.timeout_ms)?;preview.root().object_set("disclosed_event",preview.copy(event.root())?)?;
+    text.push_str(preview.serialize_string()?.as_str())?;Result{is_ok:true,value:text,error:0}
+}
+
+def hook_host_system_env(builder:&ProcessCommand,name:&str)->Result<bool,i64>{
+    if not env_has_var(name){return hook_true();};let bytes=ffi_buffer_new(32768)?;let count=env_var_copy(name,bytes)?;
+    let value=string_from_buffer(bytes,count)?;builder.env_set(name,value.as_str())
+}
+
+// No inherited environment, arbitrary command string, shell fallback or
+// provider credentials. DLL search still follows normal Windows process rules;
+// trust review authorizes this executable, not an OS sandbox.
+def hook_host_builder(path:&str,cwd:&str)->Result<ProcessCommand,i64>{
+    let builder=process_command(path)?;builder.cwd(cwd)?;builder.env_clear()?;
+    hook_host_system_env(&builder,"SystemRoot")?;hook_host_system_env(&builder,"WINDIR")?;
+    hook_host_system_env(&builder,"TEMP")?;hook_host_system_env(&builder,"TMP")?;
+    Result{is_ok:true,value:builder,error:0}
+}
+
+def hook_host_perform(store:&HookStore,state:&CliState,execution:&CliExecution,manifest:&HookManifest,parent:&str,cwd:&str,phase:&str,tool:&str,args:&JsonDoc,result:&JsonDoc,policy:&AgentPolicy,scheduler:&Scheduler,task:i64,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<JsonDoc,i64>{
+    let id=hook_invocation_id(execution.session.as_str(),parent,manifest.id.as_str(),phase)?;
+    let previous=hook_store_previous(store,state,execution,id.as_str())?;if previous.root().object_has("status"){return Result{is_ok:true,value:previous,error:0};};
+    if policy.plan or policy.depth>0{return hook_host_status("blocked","Executable hooks cannot run in Plan or inherited child contexts",false,true);};
+    if not policy.interactive or not engine_control_enabled(input) and not terminal.is_tty(){
+        let refused=hook_host_status("refused","This hook requires a fresh interactive controller approval",true,true)?;
+        hook_store_refused(store,state,execution,id.as_str(),parent,manifest,phase,&refused)?;return Result{is_ok:true,value:refused,error:0};
+    };
+    if not file_snapshot_available(){return hook_host_status("unsupported","This host lacks the pinned process-image guard required for executable hooks",false,true);};
+    let event=hook_host_event(manifest,execution,id.as_str(),parent,cwd,phase,tool,args,result)?;
+    let mut manifest_guard=file_snapshot_open(manifest.path.as_str(),65536)?;
+    let mut image_guard=file_snapshot_open(manifest.executable.as_str(),67108864)?;
+    if manifest_guard.sha256()?.as_str()!=manifest.digest.as_str() or image_guard.sha256()?.as_str()!=manifest.executable_digest.as_str(){return hook_host_status("failed","Worker bytes changed before approval; review and enable the new fingerprint",false,true);};
+    let preview=hook_host_preview(manifest,&event)?;
+    let approved=if engine_control_enabled(input){engine_control_confirm(terminal,input,"internal:extension_worker",preview.as_str())?}else{ui_confirm(terminal,preview.as_str())?};
+    if not approved{let refused=hook_host_status("refused","Native hook launch was declined; the parent tool was not executed",true,true)?;
+        hook_store_refused(store,state,execution,id.as_str(),parent,manifest,phase,&refused)?;return Result{is_ok:true,value:refused,error:0};};
+    state_exec_valid(state,execution)?;
+    let current=hook_store_manifest(store,manifest.id.as_str(),true)?;
+    if current.digest.as_str()!=manifest.digest.as_str() or current.executable_digest.as_str()!=manifest.executable_digest.as_str() or not manifest_guard.still_matches()? or not image_guard.still_matches()?{return hook_host_status("failed","Worker trust changed while approval was pending",false,true);};
+    // Caller must not already hold the task's write ticket. Waiting stays
+    // cancellable, and an abandoned ticket is explicitly released.
+    let mut acquired=false;let queued=time_unix_ms();
+    while not acquired{
+        if ui_poll_busy(terminal,input)?{scheduler_release_write(scheduler,task)?;return hook_host_status("cancelled","Hook cancelled before admission",false,true);};
+        if time_since_ms(queued)>30000{scheduler_release_write(scheduler,task)?;return hook_host_status("failed","Hook write queue timed out before admission",false,true);};
+        acquired=scheduler_acquire_write(scheduler,task)?;if not acquired{time_sleep_ms(1); ();};
+    };
+    let performed=hook_host_locked(store,state,execution,manifest,id.as_str(),parent,cwd,&event,terminal,input,&mut manifest_guard,&mut image_guard);
+    if performed.is_ok() and cli_json_optional_string(performed.value.root(),"status").as_str()=="cleanup_unknown"{return performed;};
+    scheduler_release_write(scheduler,task)?;performed
+}
+
+def hook_host_locked(store:&HookStore,state:&CliState,execution:&CliExecution,manifest:&HookManifest,id:&str,parent:&str,cwd:&str,event:&JsonDoc,terminal:&Terminal,input:&Vec<TerminalEvent>,manifest_guard:&mut FileSnapshot,image_guard:&mut FileSnapshot)->Result<JsonDoc,i64>{
+    let mut lock=cli_state_workspace_lock(state,cwd)?;let phase=cli_json_string(event.root(),"event")?;
+    let builder=hook_host_builder(image_guard.pinned_path()?.as_str(),cwd)?;
+    if not hook_store_claim(store,state,execution,id,parent,manifest,phase.as_str())?{return hook_host_status("interrupted","This invocation already has a durable admission; no automatic replay",false,false);};
+    // Mark uncertainty before process creation, so any later persistence error
+    // or host crash cannot accidentally certify cleanup during turn release.
+    hook_store_cleanup_unknown(state,execution)?;
+    let raw=hook_worker_run(&builder,manifest,id,event,terminal,input);
+    let result=if raw.is_ok(){raw.value}else{let failure=hook_host_status("cleanup_unknown","Worker outcome is unknown after admission",false,false)?;cli_put_i64(&failure,failure.root(),"error",raw.error)?;failure};
+    if not result.root().object_get("cleanup_confirmed")?.bool_value()?{
+        lock.handle=0;manifest_guard.handle=0;image_guard.handle=0;
+        cli_put_string(&result,result.root(),"status","cleanup_unknown")?;
+        return Result{is_ok:true,value:result,error:0};
+    };
+    cli_put_string(&result,result.root(),"worker_id",manifest.id.as_str())?;cli_put_string(&result,result.root(),"invocation_id",id)?;
+    cli_put_string(&result,result.root(),"phase",phase.as_str())?;cli_put_string(&result,result.root(),"parent_call_id",parent)?;
+    hook_store_finish(store,state,execution,id,&result)?;hook_store_cleanup_state(state,execution,false)?;Result{is_ok:true,value:result,error:0}
+}
+
+def hook_host_run(state:&CliState,execution:&CliExecution,parent:&str,cwd:&str,phase:&str,tool:&str,args:&JsonDoc,result:&JsonDoc,policy:&AgentPolicy,scheduler:&Scheduler,task:i64,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<JsonDoc,i64>{
+    if not hook_tool_supported(tool){return hook_host_status("continued","",false,true);};
+    let path=hook_store_path(state)?;if not file_exists(path.as_str()){return hook_host_status("continued","",false,true);};
+    let store=hook_store_open(state)?;let catalog=hook_store_list(&store)?;let items=catalog.root().object_get("workers")?;let mut index=0;
+    let summary=hook_host_status("continued","",false,true)?;let events=summary.new_array()?;summary.root().object_set("invocations",events)?;
+    while index<items.array_len()?{let item=items.array_get(index)?;
+        if item.object_get("enabled")?.bool_value()?{
+            let manifest=hook_store_manifest(&store,cli_json_string(item,"id")?.as_str(),true)?;
+            if hook_manifest_matches(&manifest,phase,tool)?{
+                let outcome=hook_host_perform(&store,state,execution,&manifest,parent,cwd,phase,tool,args,result,policy,scheduler,task,terminal,input)?;
+                events.array_push(summary.copy(outcome.root())?)?;
+                if cli_json_optional_string(outcome.root(),"status").as_str()!="continued"{
+                    outcome.root().object_set("invocations",outcome.copy(events)?)?;return Result{is_ok:true,value:outcome,error:0};
+                };
+            };
+        };index=index+1;
+    };Result{is_ok:true,value:summary,error:0}
+}

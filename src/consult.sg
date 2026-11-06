@@ -1,0 +1,243 @@
+import connection;
+import state;
+import transport;
+import scheduler;
+import terminal;
+import std::time;
+
+// Credentials are captured only in memory and never copied into reports.
+struct ConsultTarget { connection: ProviderConnection, credential: String }
+struct ConsultPending { task_id: i64, target_index: i64 }
+struct ConsultSlot { task_id: i64, target_index: i64, job: ProviderJob }
+struct ConsultBatch {
+    scheduler: Scheduler,
+    targets: Vec<ConsultTarget>,
+    pending: Vec<ConsultPending>,
+    active: Vec<ConsultSlot>,
+    history: JsonDoc,
+    tools: JsonDoc,
+    output: JsonDoc,
+    // canceled, bytes in completed reports
+    flags: Vec<i64>,
+}
+
+def consult_empty(targets: Vec<ConsultTarget>) -> ConsultBatch {
+    let pending: Vec<ConsultPending> = vec_new();
+    let active: Vec<ConsultSlot> = vec_new();
+    let flags: Vec<i64> = vec_new();
+    flags.push(0); flags.push(0);
+    ConsultBatch { scheduler: scheduler_new(), targets: targets, pending: pending, active: active, history: JsonDoc { handle: 0 }, tools: JsonDoc { handle: 0 }, output: JsonDoc { handle: 0 }, flags: flags }
+}
+
+def consult_history(question: &str) -> Result<JsonDoc, i64> {
+    let history = json_doc_object()?;
+    let messages = history.new_array()?;
+    history.root().object_set("messages", messages)?;
+    let instructions = history.new_object()?;
+    cli_put_string(&history, instructions, "role", "system")?;
+    cli_put_string(&history, instructions, "content", "You are a read-only technical consultant. Give an independent assessment of the supplied question and evidence. No tools are available. Do not request or claim to execute tools, change files, or acquire more authority. Keep the report concise and identify assumptions.")?;
+    messages.array_push(instructions)?;
+    let prompt = history.new_object()?;
+    cli_put_string(&history, prompt, "role", "user")?;
+    cli_put_string(&history, prompt, "content", question)?;
+    messages.array_push(prompt)?;
+    Result { is_ok: true, value: history, error: 0 }
+}
+
+def consult_batch(cwd: &str, question: &str, targets: Vec<ConsultTarget>) -> Result<ConsultBatch, i64> {
+    let mut batch = consult_empty(targets);
+    if batch.targets.len() == 0 or batch.targets.len() > 16 or question.len() == 0 or question.len() > 131072 { return Result { is_ok: false, value: batch, error: 2 }; };
+    batch.history = consult_history(question)?;
+    batch.tools = json_parse("{\"tools\":[]}")?;
+    batch.output = json_doc_object()?;
+    let reports = batch.output.new_array()?;
+    batch.output.root().object_set("reports", reports)?;
+    let mut index = 0;
+    while index < batch.targets.len() {
+        let target: &ConsultTarget = batch.targets.get(index);
+        if target.connection.model_id().len() == 0 or target.connection.model_id().len() > 256 or target.connection.protocol_id() < 0 or target.connection.protocol_id() > 2 { return Result { is_ok: false, value: batch, error: 2 }; };
+        // Verify endpoint policy before consuming any model budget.
+        http_endpoint(target.connection.base_url(), provider_route(target.connection.protocol_id()))?;
+        let id = scheduler_add(&batch.scheduler, 0, target.connection.connection_id(), cwd, false)?;
+        let pending = ConsultPending { task_id: id, target_index: index };
+        if not batch.pending.push(pending) { return Result { is_ok: false, value: batch, error: 8 }; };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: batch, error: 0 }
+}
+
+def consult_usage(input: i64, output: i64) -> i64 {
+    let safe_input = if input < 0 { 0 } else { input };
+    let safe_output = if output < 0 { 0 } else { output };
+    if safe_input > 9223372036854775807 - safe_output { return 9223372036854775807; };
+    safe_input + safe_output
+}
+
+// One immutable report per target. Aggregate content is bounded so the final
+// serialized copy fits the existing 1 MiB JSON parser, even after escaping.
+def consult_report(batch: &ConsultBatch, index: i64, task_id: i64, content: &str, code: i64, input: i64, output: i64, goal: &mut GoalState) -> Result<bool, i64> {
+    let target: &ConsultTarget = batch.targets.get(index);
+    let mut error = code;
+    let used = batch.flags.get(1).unwrap_or(0);
+    let keep_content = content.len() <= 65536 and used + content.len() <= 131072;
+    if not keep_content { error = 13; };
+    let report = batch.output.new_object()?;
+    cli_put_i64(&batch.output, report, "target_index", index)?;
+    cli_put_string(&batch.output, report, "connection_id", target.connection.connection_id())?;
+    cli_put_string(&batch.output, report, "model", target.connection.model_id())?;
+    cli_put_string(&batch.output, report, "content", if keep_content { content } else { "" })?;
+    cli_put_i64(&batch.output, report, "error", error)?;
+    cli_put_i64(&batch.output, report, "input_tokens", input)?;
+    cli_put_i64(&batch.output, report, "output_tokens", output)?;
+    batch.output.root().object_get("reports")?.array_push(report)?;
+    if keep_content { batch.flags.set(1, used + content.len()); (); };
+    scheduler_report_usage(&batch.scheduler, task_id, goal, consult_usage(input, output));
+    scheduler_finish(&batch.scheduler, task_id, error)?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def consult_done(batch: &ConsultBatch) -> bool {
+    batch.pending.len() == 0 and batch.active.len() == 0
+}
+
+// Progress every accepted stream once per tick. No network operation blocks
+// this coordinator; moving Vec entries transfers owned ProviderJob values.
+def consult_poll(batch: &ConsultBatch, goal: &mut GoalState) -> Result<bool, i64> {
+    let mut pending_index = 0;
+    while pending_index < batch.pending.len() {
+        let pending: &ConsultPending = batch.pending.get(pending_index);
+        let task_id = pending.task_id;
+        let target_index = pending.target_index;
+        if scheduler_is_cancelled(&batch.scheduler, task_id) {
+            consult_report(batch, target_index, task_id, "", 19, 0, 0, goal)?;
+            batch.pending.remove(pending_index);
+            ();
+        } else {
+            let acquired = scheduler_acquire_model(&batch.scheduler, task_id)?;
+            if acquired {
+                let reserved = scheduler_take_request(&batch.scheduler, task_id, goal);
+                if reserved {
+                    let target: &ConsultTarget = batch.targets.get(target_index);
+                    let start = provider_job_start_with_effort_scoped(target.connection.base_url(), target.connection.protocol_id(), target.connection.model_id(), target.connection.effort_id(), target.connection.connection_id(), target.credential.as_str(), &batch.history, &batch.tools);
+                    if start.is_ok() {
+                        let active = ConsultSlot { task_id: task_id, target_index: target_index, job: start.value };
+                        if not batch.active.push(active) { return Result { is_ok: false, value: false, error: 8 }; };
+                    } else {
+                        consult_report(batch, target_index, task_id, "", start.error, 0, 0, goal)?;
+                        ();
+                    };
+                } else {
+                    consult_report(batch, target_index, task_id, "", 13, 0, 0, goal)?;
+                    ();
+                };
+                batch.pending.remove(pending_index);
+                ();
+            } else { pending_index = pending_index + 1; };
+        };
+    };
+    let mut remaining = batch.active.len();
+    while remaining > 0 {
+        let removed = batch.active.remove(0);
+        if not removed.is_some { return Result { is_ok: false, value: false, error: 3 }; };
+        let mut slot = removed.value;
+        let mut error = 0;
+        if scheduler_is_cancelled(&batch.scheduler, slot.task_id) { slot.job.cancel(); error = 19; } else {
+            let delta = slot.job.poll();
+            if not delta.is_ok() { error = delta.error; };
+            if slot.job.turn.content.len() > 65536 { error = 13; };
+            ();
+        };
+        if slot.job.finished or error != 0 {
+            let input = slot.job.turn.input_tokens;
+            let output = slot.job.turn.output_tokens;
+            if error == 0 {
+                let completed = slot.job.result();
+                if not completed.is_ok() { error = completed.error; } else {
+                    if completed.value.root().object_get("tool_calls")?.array_len()? != 0 { error = 7; };
+                };
+            };
+            if error != 0 { slot.job.cancel(); };
+            consult_report(batch, slot.target_index, slot.task_id, slot.job.turn.content.as_str(), error, input, output, goal)?;
+            ();
+        } else {
+            if not batch.active.push(slot) { return Result { is_ok: false, value: false, error: 8 }; };
+        };
+        remaining = remaining - 1;
+    };
+    Result { is_ok: true, value: consult_done(batch), error: 0 }
+}
+
+// Explicit cancellation closes each real stream and accounts observed usage.
+// Queued targets receive a report without consuming a model request.
+def consult_cancel(batch: &ConsultBatch, goal: &mut GoalState) -> Result<bool, i64> {
+    batch.flags.set(0, 1);
+    scheduler_cancel_all(&batch.scheduler);
+    while batch.active.len() > 0 {
+        let removed = batch.active.remove(0);
+        if not removed.is_some { return Result { is_ok: false, value: false, error: 3 }; };
+        let mut slot = removed.value;
+        slot.job.cancel();
+        consult_report(batch, slot.target_index, slot.task_id, slot.job.turn.content.as_str(), 19, slot.job.turn.input_tokens, slot.job.turn.output_tokens, goal)?;
+        ();
+    };
+    while batch.pending.len() > 0 {
+        let removed = batch.pending.remove(0);
+        if not removed.is_some { return Result { is_ok: false, value: false, error: 3 }; };
+        let pending = removed.value;
+        consult_report(batch, pending.target_index, pending.task_id, "", 19, 0, 0, goal)?;
+        ();
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def consult_result(batch: &ConsultBatch) -> Result<JsonDoc, i64> {
+    if not consult_done(batch) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 6 }; };
+    let serialized = batch.output.serialize_string()?;
+    let result = json_parse(serialized.as_str())?;
+    cli_put_bool(&result, result.root(), "cancelled", batch.flags.get(0).unwrap_or(0) != 0)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+// Shared input belongs to the next composer. Never read and discard ordinary
+// keys while waiting for consultants, and never feed this queue into approval.
+def consult_await(batch: &ConsultBatch, goal: &mut GoalState, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let mut done = false;
+    while not done {
+        let progress = consult_poll(batch, goal);
+        if not progress.is_ok() { consult_cancel(batch, goal); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: progress.error }; };
+        done = progress.value;
+        if not done {
+            let input = ui_poll_busy(terminal, pending);
+            if not input.is_ok() { consult_cancel(batch, goal); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: input.error }; };
+            if input.value { consult_cancel(batch, goal)?; done = true; };
+        };
+        if not done { time_sleep_ms(1); (); };
+    };
+    consult_result(batch)
+}
+
+def consult_run(state: &CliState, cwd: &str, question: &str, connections: &JsonDoc, goal: &mut GoalState, terminal: &Terminal) -> Result<JsonDoc, i64> {
+    let pending: Vec<TerminalEvent> = vec_new();
+    consult_run_pending(state, cwd, question, connections, goal, terminal, &pending)
+}
+
+def consult_run_pending(state: &CliState, cwd: &str, question: &str, connections: &JsonDoc, goal: &mut GoalState, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let selected = connections.root().object_get("targets")?;
+    if selected.array_len()? == 0 or selected.array_len()? > 16 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let targets: Vec<ConsultTarget> = vec_new();
+    let mut index = 0;
+    while index < selected.array_len()? {
+        let item = selected.array_get(index)?;
+        let id = cli_json_string(item, "id")?;
+        let model = cli_json_optional_string(item, "model");
+        let effort = cli_json_optional_string(item, "effort");
+        let record = cli_state_connection(state, id.as_str())?;
+        let captured = connection_with_effort(&record, model.as_str(), effort.as_str())?;
+        let credential = cli_state_credential(id.as_str())?;
+        let target = ConsultTarget { connection: captured, credential: credential };
+        if not targets.push(target) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+        index = index + 1;
+    };
+    let batch = consult_batch(cwd, question, targets)?;
+    consult_await(&batch, goal, terminal, pending)
+}

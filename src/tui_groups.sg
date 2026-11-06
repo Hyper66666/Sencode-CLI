@@ -1,0 +1,85 @@
+import terminal;
+
+// The transcript projection and mouse/keyboard targets share the first stable
+// tool identity. Counts describe actual operations, never search result rows.
+def tui_explore_kind(name: &str) -> i64 {
+    if name == "read_file" { return 1; };
+    if name == "list_directory" { return 2; };
+    if name == "search" or name == "find_files" { return 3; }; 0
+}
+
+def tui_group_start(app: &UiApp, slot: i64) -> i64 {
+    let mut start = slot;
+    while start > 0 and tui_explore_kind(app.messages.get(start - 1).tool_name.as_str()) > 0 { start = start - 1; }; start
+}
+
+def tui_group_end(app: &UiApp, slot: i64) -> i64 {
+    let mut end = slot + 1;
+    while end < app.messages.len() and tui_explore_kind(app.messages.get(end).tool_name.as_str()) > 0 { end = end + 1; }; end
+}
+
+def tui_group_open(app: &UiApp, id: i64) -> bool {
+    let mut index = 0; while index < app.open_groups.len() { if app.open_groups.get(index).unwrap_or(0) == id { return true; }; index = index + 1; }; false
+}
+
+def tui_group_rows(rows: &Vec<UiLine>, app: &UiApp, start: i64, end: i64, width: i64) -> Result<bool, i64> {
+    let id = app.messages.get(start).id; let open = tui_group_open(app, id); let mut files = 0; let mut dirs = 0; let mut searches = 0; let mut pending = 0; let mut failed = 0;
+    let seen: Vec<InputHistory> = vec_new(); let mut index = start;
+    while index < end { let message: &UiMessage = app.messages.get(index); let kind = tui_explore_kind(message.tool_name.as_str());
+        if message.tool_status.as_str() == "running" { pending = pending + 1; } else { if message.tool_status.as_str() != "completed" { failed = failed + 1; } else {
+            let key = cli_text(message.tool_name.as_str()); key.push_str(":")?; key.push_str(str_to_ascii_lower(message.tool_detail.as_str())?.as_str())?;
+            let mut duplicate = false; let mut scan = 0; while scan < seen.len() { if seen.get(scan).text.as_str() == key.as_str() { duplicate = true; }; scan = scan + 1; };
+            if kind == 3 { searches = searches + 1; } else { if not duplicate { if kind == 1 { files = files + 1; } else { dirs = dirs + 1; }; seen.push(InputHistory { text: key }); (); }; };
+        }; }; index = index + 1;
+    };
+    md_row(rows, "", 0, id)?;
+    let title = cli_text(if open { "▾ " } else { "▸ " }); title.push_str(if pending > 0 { "Exploring " } else { "Explored " })?;
+    title.push_i64(files)?; title.push_str(if files == 1 { " file" } else { " files" })?;
+    if dirs > 0 { title.push_str(" · ")?; title.push_i64(dirs)?; title.push_str(if dirs == 1 { " directory" } else { " directories" })?; (); };
+    if searches > 0 { title.push_str(" · ")?; title.push_i64(searches)?; title.push_str(if searches == 1 { " search" } else { " searches" })?; (); };
+    if pending > 0 { title.push_str(" · ")?; title.push_i64(pending)?; title.push_str(" pending")?; (); };
+    if failed > 0 { title.push_str(" · ")?; title.push_i64(failed)?; title.push_str(" failed")?; (); };
+    let fitted = ui_fit(title.as_str(), width)?; let spans: Vec<UiSpan> = vec_new();
+    if failed > 0 { ui_span(&spans, 0, fitted.len(), 10); };
+    rows.push(UiLine { cells: ui_cells(fitted.as_str())?, text: fitted, style: 13, message_id: id, spans: spans });
+    index = start;
+    while index < end { let message: &UiMessage = app.messages.get(index);
+        if open or message.tool_status.as_str() == "failed" or message.tool_status.as_str() == "interrupted" { tui_stored_rows(rows, message, width)?; (); };
+        index = index + 1;
+    }; tui_true()
+}
+
+// Rebuild only the affected consecutive run. Earlier Markdown and file diffs
+// retain their cached rows even during bursts of read completions.
+def tui_group_refresh(app: &mut UiApp, slot: i64) -> Result<bool, i64> {
+    let start = tui_group_start(app, slot); let end = tui_group_end(app, slot);
+    let first_id = app.messages.get(start).id; let last_id = app.messages.get(end - 1).id;
+    let mut first = 0;
+    while first < app.transcript.len() and app.transcript.get(first).message_id < first_id { first = first + 1; };
+    while first < app.transcript.len() and app.transcript.get(first).message_id >= first_id and app.transcript.get(first).message_id <= last_id { app.transcript.remove(first); };
+    let rows: Vec<UiLine> = vec_new(); tui_group_rows(&rows, app, start, end, tui_content_width(app))?; let mut index = 0;
+    while index < rows.len() { let row: &UiLine = rows.get(index); app.transcript.insert(first + index, UiLine { text: row.text.clone()?, cells: row.cells, style: row.style, message_id: row.message_id, spans: ui_spans_copy(&row.spans, 0, row.text.len()) }); index = index + 1; };
+    tui_true()
+}
+
+def tui_group_toggle(app: &mut UiApp, selected: i64) -> Result<bool, i64> {
+    let mut slot = if selected > 0 { tui_tool_message(app, selected) } else { -1 };
+    if slot < 0 { slot = app.messages.len() - 1; while slot >= 0 and tui_explore_kind(app.messages.get(slot).tool_name.as_str()) == 0 { slot = slot - 1; }; };
+    if slot < 0 or tui_explore_kind(app.messages.get(slot).tool_name.as_str()) == 0 { return tui_true(); };
+    let start = tui_group_start(app, slot); let id = app.messages.get(start).id; app.group_focus = id;
+    let anchor = tui_read_anchor(app); let mut index = 0;
+    while index < app.open_groups.len() and app.open_groups.get(index).unwrap_or(0) != id { index = index + 1; };
+    if index < app.open_groups.len() { app.open_groups.remove(index); (); } else { app.open_groups.push(id); (); };
+    tui_group_refresh(app, start)?; tui_restore_read_anchor(app, anchor); tui_true()
+}
+
+// Read runs use their group toggle; other tool cards independently expand a
+// bounded diagnostic. Clicking either never submits or changes the draft.
+def tui_detail_toggle(app: &mut UiApp, id: i64) -> Result<bool, i64> {
+    let slot = tui_tool_message(app, id); if slot < 0 { return tui_true(); };
+    if tui_explore_kind(app.messages.get(slot).tool_name.as_str()) > 0 { return tui_group_toggle(app, id); };
+    let anchor = tui_read_anchor(app); let mut index = 0;
+    while index < app.open_groups.len() and app.open_groups.get(index).unwrap_or(0) != id { index = index + 1; };
+    if index < app.open_groups.len() { app.open_groups.remove(index); (); } else { app.open_groups.push(id); (); };
+    tui_reflow(app)?; tui_restore_read_anchor(app, anchor); tui_true()
+}

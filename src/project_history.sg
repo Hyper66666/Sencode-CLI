@@ -1,0 +1,377 @@
+import state;
+import workspace;
+import session_target;
+
+// A project carries its own conversation data. The existing shared database
+// still owns execution fences and desktop handoff; this connection mirrors
+// only this project's rows, inside the transaction that changes them.
+// WAL + ATTACH has ordinary rollback consistency, not atomic commit across
+// files after power loss. Per-row conflict checks preserve a newer mirror;
+// the shared catalog remains authoritative when its rows are newer. Timestamps
+// supplied by other writers are ordering evidence, not a cryptographic log.
+struct ProjectHistoryTable { name: String, keys: String, project: bool }
+
+def project_history_tables() -> Vec<ProjectHistoryTable> {
+    let items: Vec<ProjectHistoryTable> = vec_new();
+    items.push(ProjectHistoryTable { name: cli_text("projects"), keys: cli_text("id"), project: true });
+    items.push(ProjectHistoryTable { name: cli_text("sessions"), keys: cli_text("id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("messages"), keys: cli_text("id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("tool_calls"), keys: cli_text("id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("shared_history"), keys: cli_text("message_id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("shared_tool_ledger"), keys: cli_text("session_id,call_id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("shared_modes"), keys: cli_text("session_id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("shared_usage"), keys: cli_text("request_id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("session_usage"), keys: cli_text("session_id"), project: false });
+    items.push(ProjectHistoryTable { name: cli_text("shared_executions"), keys: cli_text("session_id"), project: false });
+    items
+}
+
+def project_history_scope(item: &ProjectHistoryTable) -> Result<String,i64> {
+    if item.project { return string_from_str("id=(SELECT project_id FROM project_history.ph_meta WHERE id=1)"); };
+    if item.name.as_str() == "sessions" { return string_from_str("project_id=(SELECT project_id FROM project_history.ph_meta WHERE id=1)"); };
+    string_from_str("session_id IN(SELECT id FROM main.sessions WHERE project_id=(SELECT project_id FROM project_history.ph_meta WHERE id=1))")
+}
+
+def project_history_existing(state: &CliState, directory: &str) -> Result<String,i64> {
+    let mut query = state.db.prepare("SELECT id FROM projects WHERE directory=?")?;
+    query.bind_text(1,directory)?;
+    if query.step()? { return query.text(0); };
+    Result { is_ok: true, value: string_new(), error: 0 }
+}
+
+def project_history_validate(state: &CliState, tables: &Vec<ProjectHistoryTable>) -> Result<bool,i64> {
+    // Local files are data, never a source of triggers, views or virtual tables.
+    let mut objects = state.db.prepare("SELECT type,name,COALESCE(sql,'') FROM project_history.sqlite_master WHERE name NOT LIKE 'sqlite_%'")?;
+    while objects.step()? {
+        let kind = objects.text(0)?; let name = objects.text(1)?; let sql = objects.text(2)?;
+        let mut valid = kind.as_str() == "table" and name.as_str() == "ph_meta";
+        let mut index = 0;
+        while index < tables.len() {
+            let item: &ProjectHistoryTable = tables.get(index);
+            let table = cli_join("ph_", item.name.as_str())?;
+            let key = cli_join("ph_key_", item.name.as_str())?;
+            if kind.as_str() == "table" and name.as_str() == table.as_str() and str_starts_with(sql.as_str(), "CREATE TABLE ") { valid = true; };
+            if kind.as_str() == "index" and name.as_str() == key.as_str() and str_starts_with(sql.as_str(), "CREATE UNIQUE INDEX ") { valid = true; };
+            index = index + 1;
+        };
+        if not valid { cli_diagnostic("Project history has an unsupported schema object; no records were imported."); return state_bool_error(8); };
+    };
+    let object_count={let mut query=state.db.prepare("SELECT count(*) FROM project_history.sqlite_master WHERE name NOT LIKE 'sqlite_%'")?;query.step()?;query.integer(0)?};
+    if object_count!=1+tables.len()*2{return state_bool_error(8);};
+    state.db.exec("CREATE TEMP TABLE ph_expected_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL,project_id TEXT NOT NULL,bound_directory TEXT NOT NULL,catalog_path TEXT NOT NULL,snapshot_updated_at INTEGER NOT NULL DEFAULT 0)")?;
+    project_history_shape(state,"ph_meta","ph_expected_meta",false)?;
+    state.db.exec("DROP TABLE temp.ph_expected_meta")?;
+    let mut meta=state.db.prepare("SELECT 1 FROM project_history.ph_meta WHERE id IS NOT 1 OR schema_version IS NOT 2 OR typeof(project_id)<>'text' OR length(project_id)=0 OR typeof(bound_directory)<>'text' OR typeof(catalog_path)<>'text' OR typeof(snapshot_updated_at)<>'integer' OR snapshot_updated_at<0 LIMIT 1")?;
+    if meta.step()?{return state_bool_error(8);};
+    let mut index = 0;
+    while index < tables.len() {
+        let item: &ProjectHistoryTable = tables.get(index);
+        let expected=cli_join("CREATE TEMP TABLE ph_expected AS SELECT * FROM main.",item.name.as_str())?;expected.push_str(" WHERE 0; CREATE UNIQUE INDEX temp.ph_expected_key ON ph_expected(")?;expected.push_str(item.keys.as_str())?;expected.push_str(")")?;state.db.exec(expected.as_str())?;
+        project_history_shape(state,cli_join("ph_",item.name.as_str())?.as_str(),"ph_expected",false)?;
+        project_history_shape(state,cli_join("ph_key_",item.name.as_str())?.as_str(),"ph_expected_key",true)?;
+        state.db.exec("DROP TABLE temp.ph_expected")?;
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+// Compare the exact generated definition suffix as well as visible/hidden
+// metadata. A matching name alone must not authorize generated columns,
+// constraints, expression/partial indexes or changed affinities.
+def project_history_shape(state:&CliState,actual:&str,expected:&str,index:bool)->Result<bool,i64>{
+    let left={let mut a=state.db.prepare("SELECT sql FROM project_history.sqlite_master WHERE name=?")?;a.bind_text(1,actual)?;if not a.step()?{return state_bool_error(8);};a.text(0)?};
+    let right={let mut b=state.db.prepare("SELECT sql FROM temp.sqlite_master WHERE name=?")?;b.bind_text(1,expected)?;if not b.step()?{return state_bool_error(8);};b.text(0)?};let l=str_index_of(left.as_str(),"(");let r=str_index_of(right.as_str(),"(");
+    if l<0 or r<0 or cli_byte_slice(left.as_str(),l,left.len())?.as_str()!=cli_byte_slice(right.as_str(),r,right.len())?.as_str(){return state_bool_error(8);};
+    let query=if index{"index_xinfo"}else{"table_xinfo"};
+    let x=cli_join("PRAGMA project_history.",query)?;x.push_str("('")?;x.push_str(actual)?;x.push_str("')")?;
+    let y=cli_join("PRAGMA temp.",query)?;y.push_str("('")?;y.push_str(expected)?;y.push_str("')")?;
+    let mut aa=state.db.prepare(x.as_str())?;let mut bb=state.db.prepare(y.as_str())?;let mut count=0;
+    loop{let ap=aa.step()?;let bp=bb.step()?;if ap!=bp{return state_bool_error(8);};if not ap{break;};let mut field=0;
+        while field<if index{6}else{7}{if aa.is_null(field)?!=bb.is_null(field)?{return state_bool_error(8);};if not aa.is_null(field)?{
+            let textual=if index{field==2 or field==4}else{field==1 or field==2 or field==4};
+            if textual{if aa.text(field)?.as_str()!=bb.text(field)?.as_str(){return state_bool_error(8);};}
+            else{if aa.integer(field)?!=bb.integer(field)?{return state_bool_error(8);};};
+        };field=field+1;};count=count+1;
+    };if count==0{return state_bool_error(8);};Result{is_ok:true,value:true,error:0}
+}
+
+def project_history_data_valid(tx:&SqliteTransaction,tables:&Vec<ProjectHistoryTable>)->Result<bool,i64>{
+    let mut check_index=0;
+    while check_index<tables.len(){let item:&ProjectHistoryTable=tables.get(check_index);let sql=cli_join("SELECT 1 FROM project_history.ph_",item.name.as_str())?;sql.push_str(" AS p WHERE ")?;
+        sql.push_str(if item.project{"p.id IS NOT (SELECT project_id FROM project_history.ph_meta WHERE id=1)"}else{if item.name.as_str()=="sessions"{"p.project_id IS NOT (SELECT project_id FROM project_history.ph_meta WHERE id=1)"}else{"p.session_id IS NULL OR NOT EXISTS(SELECT 1 FROM project_history.ph_sessions s WHERE s.id=p.session_id)"}})?;
+        let keytext=cli_text(item.keys.as_str());let keys=keytext.split(",");loop{let key=keys.next();if not key.is_some{break;};sql.push_str(" OR p.")?;sql.push_str(key.value.as_str())?;sql.push_str(" IS NULL")?;};keys.free();
+        let columns=cli_join("PRAGMA main.table_info('",item.name.as_str())?;columns.push_str("')")?;let mut column=tx.prepare(columns.as_str())?;
+        while column.step()?{
+            let name=column.text(1)?;if column.integer(3)?!=0{sql.push_str(" OR p.")?;sql.push_str(name.as_str())?;sql.push_str(" IS NULL")?; ();};
+            let affinity=column.text(2)?;let expected=if str_contains(affinity.as_str(),"INT"){cli_text("'integer'")}else{if str_contains(affinity.as_str(),"TEXT"){cli_text("'text'")}else{string_new()}};
+            if expected.len()>0{sql.push_str(" OR (p.")?;sql.push_str(name.as_str())?;sql.push_str(" IS NOT NULL AND typeof(p.")?;sql.push_str(name.as_str())?;sql.push_str(") NOT IN(")?;sql.push_str(expected.as_str())?;sql.push_str("))")?; ();};
+        };
+        sql.push_str(" LIMIT 1")?;let mut invalid=tx.prepare(sql.as_str())?;if invalid.step()?{return state_bool_error(8);};check_index=check_index+1;
+    };
+    let mut roles=tx.prepare("SELECT 1 FROM project_history.ph_messages WHERE role NOT IN('user','assistant','tool') UNION ALL SELECT 1 FROM project_history.ph_shared_history h JOIN project_history.ph_messages m ON m.id=h.message_id WHERE h.session_id IS NOT m.session_id OR NOT json_valid(h.message_json) OR json_type(h.message_json) IS NOT 'object' OR json_extract(h.message_json,'$.role') IS NOT m.role OR json_extract(h.message_json,'$.role') NOT IN('user','assistant','tool') LIMIT 1")?;
+    if roles.step()?{return state_bool_error(8);};
+    // SQLite reads the first duplicate JSON member, while the Sengoo DOM used
+    // by resumed context keeps the last. Validate with the consuming parser too.
+    let mut history=tx.prepare("SELECT h.message_json,m.role FROM project_history.ph_shared_history h JOIN project_history.ph_messages m ON m.id=h.message_id")?;
+    while history.step()?{let document=json_parse(history.text(0)?.as_str())?;let role=cli_json_string(document.root(),"role")?;
+        if role.as_str()!=history.text(1)?.as_str() or role.as_str()!="user" and role.as_str()!="assistant" and role.as_str()!="tool"{return state_bool_error(8);};
+    };Result{is_ok:true,value:true,error:0}
+}
+
+def project_history_create(state: &CliState, tables: &Vec<ProjectHistoryTable>) -> Result<bool,i64> {
+    let mut tx = state.db.transaction()?;
+    tx.exec("CREATE TABLE project_history.ph_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL,project_id TEXT NOT NULL,bound_directory TEXT NOT NULL,catalog_path TEXT NOT NULL,snapshot_updated_at INTEGER NOT NULL DEFAULT 0); PRAGMA project_history.user_version=2")?;
+    let mut index = 0;
+    while index < tables.len() {
+        let item: &ProjectHistoryTable = tables.get(index);
+        let sql = cli_join("CREATE TABLE project_history.ph_",item.name.as_str())?;
+        sql.push_str(" AS SELECT * FROM main.")?; sql.push_str(item.name.as_str())?; sql.push_str(" WHERE 0; CREATE UNIQUE INDEX project_history.ph_key_")?;
+        sql.push_str(item.name.as_str())?; sql.push_str(" ON ph_")?; sql.push_str(item.name.as_str())?; sql.push_str("(")?; sql.push_str(item.keys.as_str())?; sql.push_str(")")?;
+        tx.exec(sql.as_str())?; index = index + 1;
+    };
+    tx.commit()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def project_history_import(state: &CliState, tables: &Vec<ProjectHistoryTable>) -> Result<bool,i64> {
+    let mut tx=state.db.transaction()?;
+    project_history_data_valid(&tx,tables)?;
+    let mut project_row = tx.prepare("SELECT count(*) FROM project_history.ph_projects WHERE id IS (SELECT project_id FROM project_history.ph_meta WHERE id=1)")?;
+    project_row.step()?; if project_row.integer(0)? != 1 { return state_bool_error(8); };
+    let mut unsafe_owner = tx.prepare("SELECT 1 FROM project_history.ph_shared_executions WHERE active=1 OR cleanup_required=1 LIMIT 1")?;
+    if unsafe_owner.step()? { cli_diagnostic("Portable history has an unresolved execution. Restore its original catalog and confirm cleanup before importing it."); return state_bool_error(7); };
+    let mut roles=tx.prepare("SELECT 1 FROM project_history.ph_messages WHERE role NOT IN('user','assistant','tool') UNION ALL SELECT 1 FROM project_history.ph_shared_history h JOIN project_history.ph_messages m ON m.id=h.message_id WHERE h.session_id IS NOT m.session_id OR NOT json_valid(h.message_json) OR json_type(h.message_json) IS NOT 'object' OR json_extract(h.message_json,'$.role') IS NOT m.role OR json_extract(h.message_json,'$.role') NOT IN('user','assistant','tool') LIMIT 1")?;
+    if roles.step()?{cli_diagnostic("Portable history contains unsupported or privileged message roles; no records were imported.");return state_bool_error(8);};
+    let mut links=tx.prepare("SELECT 1 FROM project_history.ph_shared_history h WHERE NOT EXISTS(SELECT 1 FROM project_history.ph_messages m WHERE m.id=h.message_id AND m.session_id=h.session_id) UNION ALL SELECT 1 FROM project_history.ph_tool_calls t WHERE NOT EXISTS(SELECT 1 FROM project_history.ph_messages m WHERE m.id=t.message_id AND m.session_id=t.session_id) LIMIT 1")?;
+    if links.step()?{return state_bool_error(8);};
+    let mut index = 0;
+    while index < tables.len() {
+        let item: &ProjectHistoryTable = tables.get(index);
+        if item.name.as_str()=="shared_modes"{
+            let mut modes=tx.prepare("SELECT session_id,mode_json,updated_at FROM project_history.ph_shared_modes")?;
+            while modes.step()?{
+                let identity=modes.text(0)?;let raw=modes.text(1)?;
+                // Both storage readers must classify the same provenance. A
+                // duplicate member is ambiguous across SQLite and the DOM.
+                let safe=project_history_import_modes(raw.as_str())?;
+                let mut duplicate=tx.prepare("WITH tree AS(SELECT id,parent,key FROM json_tree(?)),origins AS(SELECT id FROM tree WHERE parent=0 AND key='session_origin') SELECT 1 FROM tree WHERE (parent=0 AND key='session_origin') OR (parent IN(SELECT id FROM origins) AND key IN('version','kind','parent_session_id','source_session_id')) GROUP BY parent,key HAVING count(*)>1 LIMIT 1")?;
+                duplicate.bind_text(1,raw.as_str())?;if duplicate.step()?{return state_bool_error(8);};
+                if safe.root().object_has("session_origin") {
+                    let origin=safe.root().object_get("session_origin")?;
+                    if cli_json_optional_string(origin,"parent_session_id").as_str()==identity.as_str() or cli_json_optional_string(origin,"source_session_id").as_str()==identity.as_str(){return state_bool_error(8);};
+                };
+                let mut save=tx.prepare("INSERT INTO main.shared_modes VALUES(?,?,?)")?;save.bind_text(1,identity.as_str())?;save.bind_text(2,safe.serialize_string()?.as_str())?;save.bind_i64(3,modes.integer(2)?)?;save.step()?;
+            };
+        }else{
+            let sql = cli_join("INSERT INTO main.",item.name.as_str())?;
+            sql.push_str(" SELECT * FROM project_history.ph_")?; sql.push_str(item.name.as_str())?;
+            // IDs conflict rather than overwrite another catalog's conversation.
+            tx.exec(sql.as_str())?; ();
+        };index = index + 1;
+    };
+    // Imported conversations never resume an old process or Goal themselves.
+    tx.exec("UPDATE shared_executions SET active=0,cleanup_required=CASE WHEN cleanup_required=1 OR EXISTS(SELECT 1 FROM shared_tool_ledger t WHERE t.session_id=shared_executions.session_id AND t.state='running') THEN 1 ELSE 0 END WHERE session_id IN(SELECT id FROM project_history.ph_sessions); UPDATE sessions SET run_state='idle' WHERE id IN(SELECT id FROM project_history.ph_sessions)")?;
+    tx.commit()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def project_history_import_modes(raw:&str)->Result<JsonDoc,i64>{
+    let source=json_parse(raw)?;if source.root().kind()?!=JSON_KIND_OBJECT(){return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};
+    // Cached model context, Plan paths, checkpoints, extension state and pending
+    // tools and cli_permissions are executable recovery inputs, not portable
+    // public history. Imported metadata cannot authorize local tool execution.
+    let safe=json_doc_object()?;
+    if source.root().object_has("cli_target") {
+        let target=session_target_sanitize(source.root().object_get("cli_target")?)?;
+        safe.root().object_set("cli_target",safe.copy(target.root())?)?; ();
+    };
+    if source.root().object_has("session_origin") {
+        let origin=session_origin_sanitize(source.root().object_get("session_origin")?)?;
+        safe.root().object_set("session_origin",safe.copy(origin.root())?)?; ();
+    };
+    if source.root().object_has("goal"){
+        let value=source.root().object_get("goal")?;if value.kind()?!=JSON_KIND_OBJECT(){return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};
+        let goal=safe.new_object()?;
+        let fields=cli_text("requests,tokens,max_requests,token_budget,same_failure_count");let list=fields.split(",");
+        loop{let field=list.next();if not field.is_some{break;};if value.object_has(field.value.as_str()){let number=value.object_get(field.value.as_str())?.number_i64()?;if number<0{list.free();return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};cli_put_i64(&safe,goal,field.value.as_str(),number)?; ();};};list.free();
+        if value.object_has("requests_used"){let used=value.object_get("requests_used")?.number_i64()?;if used<0{return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};let current=cli_json_optional_i64(value,"requests",0);cli_put_i64(&safe,goal,"requests",if used>current{used}else{current})?;cli_put_i64(&safe,goal,"requests_used",used)?; ();};
+        cli_put_string(&safe,goal,"objective",cli_json_optional_string(value,"objective").as_str())?;
+        cli_put_string(&safe,goal,"last_failure","Imported Goal is paused; review acceptance commands before explicit recovery")?;
+        cli_put_i64(&safe,goal,"status",2)?;goal.object_set("checks",safe.new_array()?)?;safe.root().object_set("goal",goal)?; ();
+    };Result{is_ok:true,value:safe,error:0}
+}
+
+def project_history_snapshot(tx: &SqliteTransaction, tables: &Vec<ProjectHistoryTable>) -> Result<bool,i64> {
+    let mut index = 0;
+    while index < tables.len() {
+        let item: &ProjectHistoryTable = tables.get(index); let sql = cli_join("DELETE FROM project_history.ph_",item.name.as_str())?;
+        sql.push_str("; INSERT INTO project_history.ph_")?; sql.push_str(item.name.as_str())?; sql.push_str(" SELECT * FROM main.")?; sql.push_str(item.name.as_str())?;
+        sql.push_str(" WHERE ")?; sql.push_str(project_history_scope(item)?.as_str())?; tx.exec(sql.as_str())?;
+        index = index + 1;
+    };
+    tx.exec("UPDATE project_history.ph_meta SET snapshot_updated_at=COALESCE((SELECT MAX(updated_at) FROM main.sessions WHERE project_id=(SELECT project_id FROM project_history.ph_meta WHERE id=1)),0) WHERE id=1")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+// Per-row ordering detects restored/stale catalogs without treating an ordinary
+// desktop edit as a conflict. The coarse metadata timestamp is advisory only.
+// Missing archived rows require inspection unless an authoritative catalog
+// session deletion/move explains their removal.
+def project_history_newer(name:&str)->&str{
+    if name=="sessions" or name=="tool_calls" or name=="shared_tool_ledger" or name=="shared_modes"{return if name=="tool_calls"{"COALESCE(p.completed_at,p.started_at)>COALESCE(m.completed_at,m.started_at)"}else{"p.updated_at>m.updated_at"};};
+    if name=="messages"{return "p.revision>m.revision OR (p.revision=m.revision AND COALESCE(p.completed_at,p.created_at)>COALESCE(m.completed_at,m.created_at))";};
+    if name=="shared_history"{return "EXISTS(SELECT 1 FROM project_history.ph_messages pm JOIN main.messages mm ON mm.id=pm.id WHERE pm.id=p.message_id AND (pm.revision>mm.revision OR (pm.revision=mm.revision AND COALESCE(pm.completed_at,pm.created_at)>COALESCE(mm.completed_at,mm.created_at))))";};
+    if name=="shared_usage"{return "p.created_at>m.created_at OR p.input_tokens>m.input_tokens OR p.output_tokens>m.output_tokens";};
+    if name=="session_usage"{return "p.input_tokens>m.input_tokens OR p.output_tokens>m.output_tokens OR p.terminal_events>m.terminal_events";};
+    if name=="shared_executions"{return "p.fence>m.fence OR (p.fence=m.fence AND p.updated_at>m.updated_at)";};"0"
+}
+
+def project_history_conflicts(tx:&SqliteTransaction,tables:&Vec<ProjectHistoryTable>)->Result<bool,i64>{
+    let mut index=1;
+    while index<tables.len(){let item:&ProjectHistoryTable=tables.get(index);let sql=cli_join("SELECT 1 FROM project_history.ph_",item.name.as_str())?;
+        sql.push_str(" p LEFT JOIN main.")?;sql.push_str(item.name.as_str())?;sql.push_str(" m ON ")?;
+        let keytext=cli_text(item.keys.as_str());let keys=keytext.split(",");let mut first=string_new();let mut count=0;
+        loop{let key=keys.next();if not key.is_some{break;};if count==0{first=key.value.clone()?;}else{sql.push_str(" AND ")?; ();};sql.push_str("m.")?;sql.push_str(key.value.as_str())?;sql.push_str(" IS p.")?;sql.push_str(key.value.as_str())?;count=count+1;};keys.free();
+        sql.push_str(" WHERE (m.")?;sql.push_str(first.as_str())?;sql.push_str(" IS NULL OR (")?;sql.push_str(project_history_newer(item.name.as_str()))?;sql.push_str("))")?;
+        let session=if item.name.as_str()=="sessions"{"p.id"}else{"p.session_id"};
+        sql.push_str(" AND NOT EXISTS(SELECT 1 FROM main.sessions s WHERE s.id=")?;sql.push_str(session)?;sql.push_str(" AND s.project_id IS NOT (SELECT project_id FROM project_history.ph_meta WHERE id=1))")?;
+        sql.push_str(" AND NOT EXISTS(SELECT 1 FROM main.shared_changes d JOIN project_history.ph_sessions ps ON ps.id=d.entity_id WHERE d.entity='sessions' AND d.operation='delete' AND d.entity_id=")?;sql.push_str(session)?;sql.push_str(" AND d.changed_at>=ps.updated_at)")?;
+        sql.push_str(" LIMIT 1")?;let mut conflict=tx.prepare(sql.as_str())?;
+        if conflict.step()?{cli_diagnostic("Project history has rows newer than or missing from this catalog. The local archive was preserved; inspect the restored catalog before continuing.");return state_bool_error(8);};index=index+1;
+    };Result{is_ok:true,value:true,error:0}
+}
+
+def project_history_triggers(state: &CliState, tables: &Vec<ProjectHistoryTable>) -> Result<bool,i64> {
+    let mut index = 0;
+    while index < tables.len() {
+        let item: &ProjectHistoryTable = tables.get(index);
+        let mut mode = 0;
+        while mode < 3 {
+            let event = if mode == 0 { "INSERT" } else { if mode == 1 { "UPDATE" } else { "DELETE" } };
+            let sql = cli_join("CREATE TEMP TRIGGER ph_capture_",item.name.as_str())?; sql.push_i64(mode)?;
+            sql.push_str(" AFTER ")?; sql.push_str(event)?; sql.push_str(" ON main.")?; sql.push_str(item.name.as_str())?; sql.push_str(" BEGIN ")?;
+            if item.name.as_str() == "sessions" and mode != 0 {
+                let mut child_index = 2;
+                while child_index < tables.len() {
+                    let child: &ProjectHistoryTable = tables.get(child_index);
+                    sql.push_str("DELETE FROM ph_")?; sql.push_str(child.name.as_str())?; sql.push_str(" WHERE session_id=OLD.id")?;
+                    if mode == 1 { sql.push_str(" AND OLD.project_id IS NOT NEW.project_id")?; (); };
+                    sql.push_str("; ")?; child_index = child_index + 1;
+                };
+                ();
+            };
+            if mode != 0 {
+                sql.push_str("DELETE FROM ph_")?; sql.push_str(item.name.as_str())?; sql.push_str(" WHERE ")?;
+                sql.push_str(project_history_key_predicate(item.keys.as_str(),"OLD")?.as_str())?;
+                sql.push_str("; ")?; ();
+            };
+            if mode != 2 {
+                sql.push_str("INSERT OR REPLACE INTO ph_")?; sql.push_str(item.name.as_str())?; sql.push_str(" SELECT * FROM main.")?; sql.push_str(item.name.as_str())?; sql.push_str(" WHERE ")?;
+                sql.push_str(project_history_key_predicate(item.keys.as_str(),"NEW")?.as_str())?;
+                sql.push_str(" AND ")?; sql.push_str(project_history_scope(item)?.as_str())?; sql.push_str("; ")?; ();
+                if item.name.as_str() == "sessions" {
+                    let mut child_index = 2;
+                    while child_index < tables.len() {
+                        let child: &ProjectHistoryTable = tables.get(child_index);
+                        sql.push_str("INSERT OR REPLACE INTO ph_")?; sql.push_str(child.name.as_str())?; sql.push_str(" SELECT * FROM main.")?; sql.push_str(child.name.as_str())?; sql.push_str(" WHERE session_id=NEW.id AND NEW.project_id=(SELECT project_id FROM project_history.ph_meta WHERE id=1)")?;
+                        if mode==1{sql.push_str(" AND OLD.project_id IS NOT NEW.project_id")?; ();};sql.push_str("; ")?;
+                        child_index = child_index + 1;
+                    };
+                };
+            };
+            sql.push_str("UPDATE ph_meta SET snapshot_updated_at=COALESCE((SELECT MAX(updated_at) FROM main.sessions WHERE project_id=(SELECT project_id FROM project_history.ph_meta WHERE id=1)),0) WHERE id=1; ")?;
+            sql.push_str("END")?; state.db.exec(sql.as_str())?; mode = mode + 1;
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def project_history_key_predicate(keys: &str, row: &str) -> Result<String,i64> {
+    let text = cli_text(keys); let parts = text.split(","); let result = string_new();
+    loop { let part = parts.next(); if not part.is_some { break; }; if result.len() > 0 { result.push_str(" AND ")?; (); }; result.push_str(part.value.as_str())?; result.push_str("=")?; result.push_str(row)?; result.push_str(".")?; result.push_str(part.value.as_str())?; };
+    parts.free(); Result { is_ok: true, value: result, error: 0 }
+}
+
+def project_history_open(state: &CliState, cwd: &str, allow_import: bool) -> Result<bool,i64> {
+    let canonical = canonical_path_string(cwd)?;
+    let directory = path_join_string(canonical.as_str(), ".sencode")?;
+    dir_create_all(directory.as_str())?;
+    if file_kind(directory.as_str())? != PATH_KIND_DIR() { return state_bool_error(7); };
+    let path = path_join_string(directory.as_str(), "history.sqlite3")?;
+    if path_normalize_string(path.as_str())?.as_str() == path_normalize_string(state.path.as_str())?.as_str() { return state_bool_error(7); };
+    if file_exists(path.as_str()) { if file_kind(path.as_str())? != PATH_KIND_FILE() or file_len(path.as_str())? > 268435456 { return state_bool_error(7); }; };
+    let lock_path = path_join_string(directory.as_str(), "history-migration.lock")?;
+    let lock = file_lock(lock_path.as_str())?;
+    let mut attach = state.db.prepare("ATTACH DATABASE ? AS project_history")?;
+    attach.bind_text(1,path.as_str())?; attach.step()?;
+    let tables = project_history_tables();
+    let version = { let mut row = state.db.prepare("PRAGMA project_history.user_version")?; row.step()?; row.integer(0)? };
+    if version == 0 {
+        let mut existing = state.db.prepare("SELECT 1 FROM project_history.sqlite_master LIMIT 1")?;
+        if existing.step()? { return state_bool_error(8); };
+        project_history_create(state,&tables)?; ();
+    } else { if version != 2 { return state_bool_error(8); }; };
+    project_history_validate(state,&tables)?;
+    if version!=0{let count={let mut row=state.db.prepare("SELECT count(*) FROM project_history.ph_meta")?;row.step()?;row.integer(0)?};if count!=1{return state_bool_error(8);};};
+    let mut project = string_new();
+    {
+        let mut row = state.db.prepare("SELECT project_id,schema_version,bound_directory,catalog_path,snapshot_updated_at FROM project_history.ph_meta WHERE id=1")?;
+        if row.step()? {
+            if row.integer(1)? != 2 { return state_bool_error(8); }; project = row.text(0)?;
+            let bound = row.text(2)?; let catalog = row.text(3)?;
+            if bound.as_str() != canonical.as_str() and dir_exists(bound.as_str()) { cli_diagnostic("The original project folder still exists. Copied histories require an explicit fork; no sessions were merged."); return state_bool_error(8); };
+            if catalog.as_str() != state.path.as_str() and file_exists(catalog.as_str()) { cli_diagnostic("Project history is bound to another existing shared catalog. Reuse that database; concurrent independent execution authorities are not allowed."); return state_bool_error(7); };
+        };
+    };
+    if project.len() == 0 {
+        project = project_history_existing(state,canonical.as_str())?;
+        if project.len() == 0 { project = state_id("project-")?; };
+        let mut meta = state.db.prepare("INSERT INTO project_history.ph_meta VALUES(1,2,?,?,?,0)")?;
+        meta.bind_text(1,project.as_str())?; meta.bind_text(2,canonical.as_str())?; meta.bind_text(3,state.path.as_str())?; meta.step()?; ();
+    };
+    let collision = project_history_existing(state,canonical.as_str())?;
+    if collision.len() > 0 and collision.as_str() != project.as_str() { cli_diagnostic("This directory already belongs to a different project history; no sessions were merged."); return state_bool_error(8); };
+    let mut old_directory = string_new();
+    { let mut row = state.db.prepare("SELECT directory FROM projects WHERE id=?")?; row.bind_text(1,project.as_str())?; if row.step()? { old_directory = row.text(0)?; }; };
+    if old_directory.len() == 0 {
+        let archived = { let mut row = state.db.prepare("SELECT 1 FROM project_history.ph_projects WHERE id=?")?; row.bind_text(1,project.as_str())?; row.step()? };
+        if archived { if not allow_import { cli_diagnostic("This project carries a conversation archive for a missing catalog. Re-run with --import-history after reviewing it."); return state_bool_error(7); }; project_history_import(state,&tables)?; (); } else {
+            let mut row = state.db.prepare("INSERT INTO projects(id,directory,display_name,created_at,updated_at) VALUES(?,?,?,?,?)")?;
+            row.bind_text(1,project.as_str())?; row.bind_text(2,canonical.as_str())?; row.bind_text(3,canonical.as_str())?; row.bind_i64(4,time_unix_ms())?; row.bind_i64(5,time_unix_ms())?; row.step()?; ();
+        };
+    } else {
+        if old_directory.as_str() != canonical.as_str() and dir_exists(old_directory.as_str()) { cli_diagnostic("Another existing folder has this project identity. Use the original folder; copied histories are not silently merged."); return state_bool_error(8); };
+    };
+    let moving = old_directory.len() > 0 and old_directory.as_str() != canonical.as_str();
+    if moving {
+        let mut active = state.db.prepare("SELECT 1 FROM shared_executions e JOIN sessions s ON s.id=e.session_id WHERE s.project_id=? AND (e.active=1 OR e.cleanup_required=1) LIMIT 1")?;
+        active.bind_text(1,project.as_str())?;
+        if active.step()? { cli_diagnostic("Project relocation is paused until the prior execution and tool processes are confirmed stopped."); return state_bool_error(7); };
+    };
+    let mut tx = state.db.transaction()?;
+    // Reserve the catalog writer before the final ownership check. BEGIN alone
+    // is deferred; a check outside this reservation races another executor.
+    let mut reserve = tx.prepare("UPDATE projects SET updated_at=updated_at WHERE id=?")?;
+    reserve.bind_text(1,project.as_str())?; reserve.step()?;
+    if moving {
+        let mut active = tx.prepare("SELECT 1 FROM shared_executions e JOIN sessions s ON s.id=e.session_id WHERE s.project_id=? AND (e.active=1 OR e.cleanup_required=1) LIMIT 1")?;
+        active.bind_text(1,project.as_str())?; if active.step()? { return state_bool_error(7); };
+    };
+    project_history_data_valid(&tx,&tables)?;project_history_conflicts(&tx,&tables)?;
+    let mut update = tx.prepare("UPDATE projects SET display_name=CASE WHEN display_name=directory THEN ? ELSE display_name END,directory=?,updated_at=CASE WHEN directory IS NOT ? THEN ? ELSE updated_at END WHERE id=?")?;
+    update.bind_text(1,canonical.as_str())?; update.bind_text(2,canonical.as_str())?;update.bind_text(3,canonical.as_str())?; update.bind_i64(4,time_unix_ms())?; update.bind_text(5,project.as_str())?; update.step()?;
+    let mut meta = tx.prepare("UPDATE project_history.ph_meta SET bound_directory=?,catalog_path=? WHERE id=1")?; meta.bind_text(1,canonical.as_str())?; meta.bind_text(2,state.path.as_str())?; meta.step()?;
+    project_history_snapshot(&tx,&tables)?;
+    tx.commit()?;
+    project_history_ignore(directory.as_str())?;
+    project_history_triggers(state,&tables)
+}
+
+def project_history_ignore(directory:&str)->Result<bool,i64>{
+    let ignore=path_join_string(directory,".gitignore")?;
+    if file_exists(ignore.as_str()) and file_kind(ignore.as_str())?!=PATH_KIND_FILE(){return state_bool_error(7);};
+    let owned="\n# Sencode portable history (private)\n/.gitignore\n/history.sqlite3*\n/history-migration.lock\n";
+    let existing=if file_exists(ignore.as_str()){workspace_read(ignore.as_str(),65536)?}else{string_new()};
+    if not str_contains(existing.as_str(),owned){file_append_str(ignore.as_str(),owned)?; ();};Result{is_ok:true,value:true,error:0}
+}

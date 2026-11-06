@@ -1,0 +1,33 @@
+import tui;
+
+// Rendering-only resize/stream fixture. It owns no state, provider or tools.
+def resize_console_fixture() -> Result<i64, i64> {
+    let terminal = terminal_open()?; terminal.enter_fullscreen()?;
+    let mut app = tui_new("D:/isolated-resize/中文", "fixture", "fixture", "resize");
+    tui_resize(&mut app, terminal.width(), terminal.height())?;
+    let mut index = 0; let mut selected = 0;
+    while index < 30 {
+        let text = cli_text("A paragraph whose words wrap into different line counts as the terminal width changes. 中文 Each entry has its own stable identity and an explicit end marker. END-"); text.push_i64(index)?;
+        tui_message(&mut app, "assistant", text.as_str())?;
+        if index == 12 { selected = app.messages.get(index).id; };
+        index = index + 1;
+    };
+    index = 0; let mut bottom = 0;
+    while index < app.transcript.len() { if app.transcript.get(index).message_id == selected { bottom = index + 1; }; index = index + 1; };
+    app.scroll = app.transcript.len() - bottom; tui_set_draft(&mut app, "preserved 中文 draft")?; tui_read(&mut app)?;
+    tui_begin(&mut app)?; let mut counter = 0; let mut last = time_unix_ms();
+    loop {
+        tui_paint(&terminal, &mut app)?;
+        let action = tui_poll(&terminal, &mut app, 10)?;
+        if action.kind == 3 { break; };
+        if action.kind == 2 { tui_finish(&mut app, false)?; (); };
+        if action.kind == 1 and (action.text.as_str() == "/quit" or action.text.as_str() == "/exit") { break; };
+        if app.busy and time_unix_ms() - last >= 20 {
+            let text = cli_text("newer stream row "); text.push_i64(counter)?; text.push_str(" 中文\n")?;
+            tui_delta(&mut app, text.as_str())?; counter = counter + 1; last = time_unix_ms(); ();
+        };
+    };
+    terminal.leave_fullscreen()?; cli_ok(0)
+}
+
+def main() -> i64 { let result = resize_console_fixture(); if not result.is_ok { return result.error; }; result.value }

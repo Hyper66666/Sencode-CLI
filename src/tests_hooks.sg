@@ -1,0 +1,25 @@
+import hook_store;
+import command_line;
+import scheduler;
+
+def hooks_expect(value:bool,label:&str)->Result<bool,i64>{if not value{cli_diagnostic(label);return Result{is_ok:false,value:false,error:99};};hook_true()}
+def hooks_tests(database:&str,cwd:&str)->Result<bool,i64>{
+    hooks_expect(hook_identifier("guard-2") and not hook_identifier("-x") and not hook_identifier("../shell") and not hook_identifier("中文"),"identifier validation")?;
+    hooks_expect(hook_tool_supported("read_file") and not hook_tool_supported("run_command") and not hook_tool_supported("write_plan"),"tool subset is explicit")?;
+    let queue=cli_bytes(524288);queue.append_str("{\"type\":\"part")?;hooks_expect(not hook_frame_take(&queue)?.root().object_has("type"),"partial frame")?;
+    queue.append_str("\",\"text\":\"中文😀\"}\n")?;let frame=hook_frame_take(&queue)?;hooks_expect(cli_json_string(frame.root(),"text")?.as_str()=="中文😀" and queue.used_len()==0,"Unicode frame")?;
+    hooks_expect(not hook_keys(&frame,"|type|").is_ok(),"unknown keys reject")?;queue.append_str("[]\n")?;hooks_expect(not hook_frame_take(&queue).is_ok(),"array frame rejects")?;
+    hooks_expect(hook_unique_keys("{\"a\":1,\"nested\":{\"a\":2}}").is_ok(),"nested names are independent")?;
+    hooks_expect(not hook_unique_keys("{\"schema\":1,\"\\u0073chema\":1}").is_ok(),"escaped duplicate names reject")?;
+    let id=hook_invocation_id("s","call","guard","before_tool")?;hooks_expect(id.as_str()==hook_invocation_id("s","call","guard","before_tool")?.as_str() and id.as_str()!=hook_invocation_id("s","call","guard","after_tool")?.as_str(),"stable phase scoped id")?;
+    let state=cli_state_open(database)?;let store=hook_store_open(&state)?;
+    let listed=hook_store_list(&store)?;hooks_expect(listed.root().object_get("workers")?.array_len()?==0,"isolated registry starts empty")?;
+    let scheduler=scheduler_new();let task=scheduler_add(&scheduler,0,"fixture",cwd,true)?;let task2=scheduler_add(&scheduler,0,"fixture",path_join_string(cwd,".")?.as_str(),true)?;
+    hooks_expect(scheduler_acquire_write(&scheduler,task)? and not scheduler_acquire_write(&scheduler,task2)?,"single canonical cwd writer")?;scheduler_release_write(&scheduler,task)?;hooks_expect(scheduler_acquire_write(&scheduler,task2)?,"queued FIFO resumes")?;scheduler_release_write(&scheduler,task2)?;
+    let mut authority=state.db.prepare("SELECT COUNT(*) FROM shared_executions")?;authority.step()?;hooks_expect(authority.integer(0)?==0,"registry never grants execution authority")?;
+    let session=cli_state_create_session(&state,cwd)?;let mut execution=cli_state_begin(&state,session.as_str(),"fixture","fixture")?;
+    hook_store_cleanup_unknown(&state,&execution)?;cli_state_finish(&state,&mut execution,"error")?;
+    let resumed=cli_state_begin(&state,session.as_str(),"fixture","fixture");
+    hooks_expect(not resumed.is_ok() and resumed.error==7,"uncertified cleanup blocks takeover after turn release")?;hook_true()
+}
+def main()->i64{let args=cli_arguments();if not args.is_ok(){return 2;};let database=cli_option(&args.value,"database","");if not database.is_ok(){return 2;};let result=hooks_tests(database.value.as_str(),cli_current_directory().unwrap_or(string_new()).as_str());if not result.is_ok(){println(result.error);return 1;};println("hook contracts, registry authority and FIFO passed");0}

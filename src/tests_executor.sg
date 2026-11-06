@@ -1,0 +1,54 @@
+import executor;
+import command_line;
+
+extern "C" {
+    fn sengoo_process_live_resource_count() -> i64;
+    fn sengoo_process_live_handle_count() -> i64;
+}
+
+def executor_tests() -> Result<i64, i64> {
+    let terminal = terminal_open()?;
+    let cwd = cli_current_directory()?;
+    let result = executor_command(cwd.as_str(), "exit 0", 10000, &terminal)?;
+    let text = result.serialize_string()?;
+    println(text.as_str());
+    let mut failures = 0;
+    let failed = executor_command(cwd.as_str(), "[Console]::Out.Write('output'); [Console]::Error.Write('error'); exit 7", 10000, &terminal)?;
+    let details = json_parse(cli_json_string(failed.root(), "content")?.as_str())?;
+    if not failed.root().object_get("is_error")?.bool_value()? or cli_json_optional_i64(details.root(), "exit_code", 0) != 7 { failures = failures + 1; };
+    if cli_json_string(details.root(), "stdout")?.as_str() != "output" or cli_json_string(details.root(), "stderr")?.as_str() != "error" { failures = failures + 1; };
+    let pending: Vec<TerminalEvent> = vec_new();
+    let bash = executor_command_shell_pending(cwd.as_str(), "[[ 2 -eq 2 ]] && printf 'bash-世界'; printf 'bash-error' >&2; exit 3", "bash", 10000, &terminal, &pending)?;
+    let bash_details = json_parse(cli_json_string(bash.root(), "content")?.as_str())?;
+    if cli_json_optional_i64(bash_details.root(), "exit_code", 0) != 3 or cli_json_string(bash_details.root(), "stdout")?.as_str() != "bash-世界" or cli_json_string(bash_details.root(), "stderr")?.as_str() != "bash-error" { failures = failures + 1; };
+    if cli_json_string(bash.root(), "shell")?.as_str() != "bash" { failures = failures + 1; };
+    let default_args = json_parse("{\"command\":\"printf 'default-bash'\"}")?;
+    let default_result = executor_tool(cwd.as_str(), "run_command", &default_args, &terminal, &pending)?;
+    let default_details = json_parse(cli_json_string(default_result.root(), "content")?.as_str())?;
+    if cli_json_string(default_details.root(), "stdout")?.as_str() != "default-bash" or cli_json_string(default_result.root(), "shell")?.as_str() != "bash" { failures = failures + 1; };
+    let unicode = executor_command(cwd.as_str(), "[Console]::Out.Write('中文😀'); [Console]::Error.Write('错误中文😀'); exit 2", 10000, &terminal)?;
+    let unicode_details = json_parse(cli_json_string(unicode.root(), "content")?.as_str())?;
+    if cli_json_string(unicode_details.root(), "stdout")?.as_str() != "中文😀" or cli_json_string(unicode_details.root(), "stderr")?.as_str() != "错误中文😀" or cli_json_optional_i64(unicode_details.root(), "exit_code", 0) != 2 { failures = failures + 1; };
+    if unicode_details.root().object_get("stdout_lossy")?.bool_value()? or unicode_details.root().object_get("stderr_lossy")?.bool_value()? { failures = failures + 1; };
+    let binary = executor_command_shell_pending(cwd.as_str(), "printf 'valid\\377tail'; printf 'diagnostic\\342\\202(end' >&2; exit 2", "bash", 10000, &terminal, &pending)?;
+    let binary_details = json_parse(cli_json_string(binary.root(), "content")?.as_str())?;
+    if cli_json_string(binary_details.root(), "stdout")?.as_str() != "valid�tail" or cli_json_string(binary_details.root(), "stderr")?.as_str() != "diagnostic�(end" { failures = failures + 1; };
+    if not binary_details.root().object_get("stdout_lossy")?.bool_value()? or not binary_details.root().object_get("stderr_lossy")?.bool_value()? or cli_json_optional_i64(binary_details.root(), "exit_code", 0) != 2 { failures = failures + 1; };
+    let nul = executor_command_shell_pending(cwd.as_str(), "printf 'before\\000after'; printf 'diagnostic\\000tail' >&2", "bash", 10000, &terminal, &pending)?;
+    let nul_details = json_parse(cli_json_string(nul.root(), "content")?.as_str())?;
+    if cli_json_string(nul_details.root(), "stdout")?.as_str() != "before\\0after" or cli_json_string(nul_details.root(), "stderr")?.as_str() != "diagnostic\\0tail" or cli_json_optional_i64(nul_details.root(), "stdout_bytes", 0) != 12 { failures = failures + 1; };
+    if not nul_details.root().object_get("stdout_nul_escaped")?.bool_value()? or not nul_details.root().object_get("stderr_nul_escaped")?.bool_value()? or nul_details.root().object_get("stdout_lossy")?.bool_value()? { failures = failures + 1; };
+    let missing = executor_command_shell_pending(cwd.as_str(), "sencode_fixture_command_that_does_not_exist", "bash", 10000, &terminal, &pending)?;
+    let missing_details = json_parse(cli_json_string(missing.root(), "content")?.as_str())?;
+    if cli_json_optional_i64(missing_details.root(), "exit_code", 0) != 127 or not str_contains(cli_json_string(missing_details.root(), "stderr")?.as_str(), "sencode_fixture_command_that_does_not_exist") { failures = failures + 1; };
+    let rejected = executor_command_shell_pending(cwd.as_str(), "unused", "not-a-shell", 10000, &terminal, &pending)?;
+    if not rejected.root().object_get("launch_failed")?.bool_value()? or not rejected.root().object_get("no_side_effects")?.bool_value()? or rejected.root().object_get("outcome_unknown")?.bool_value()? { failures = failures + 1; };
+    cli_ok(failures)
+}
+
+def main() -> i64 {
+    let result = executor_tests();
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_process_live_resource_count() != 0 or sengoo_process_live_handle_count() != 0 { cli_diagnostic("Executor leaked native process resources"); return 1; };
+    result.value
+}

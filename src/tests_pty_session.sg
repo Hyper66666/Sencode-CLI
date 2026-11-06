@@ -1,0 +1,145 @@
+import pty_session;
+import command_line;
+
+def pts_expect(condition: bool, label: &str) -> Result<bool, i64> {
+    if not condition { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+def pts_spec(cwd: &str, script: &str) -> Result<PtySessionSpec, i64> {
+    let spec = pty_session_spec("powershell.exe", cwd)?;
+    if not spec.args.push(cli_text("-NoLogo")) or not spec.args.push(cli_text("-NoProfile")) or not spec.args.push(cli_text("-Command")) or not spec.args.push(cli_text(script)) { return Result { is_ok: false, value: spec, error: 13 }; };
+    Result { is_ok: true, value: spec, error: 0 }
+}
+def pts_until(session: &mut PtySession, expected: &str, wait_exit: bool) -> Result<bool, i64> {
+    let mut bytes = ffi_buffer_new(4096)?;
+    let started = time_unix_ms();
+    loop {
+        pty_session_read(session, &mut bytes)?;
+        if session.display.is_utf8() {
+            let output = cli_bytes_text(&session.display, 0, session.display.used_len())?;
+            if str_contains(output.as_str(), expected) and (not wait_exit or session.exited and session.quiescent) { return Result { is_ok: true, value: true, error: 0 }; };
+            ();
+        };
+        if time_since_ms(started) > 15000 { return state_bool_error(11); };
+        pty_session_poll(session, 1, 10)?;
+    };
+    state_bool_error(11)
+}
+def pts_drop_scope(state: &CliState, workspace: &str) -> Result<bool, i64> {
+    let spec = pts_spec(workspace, "Write-Host 'DROP_READY'; Start-Sleep -Seconds 60")?;
+    let key = pty_session_approval_key(workspace, &spec)?;
+    let policy = policy_default();
+    let mut session = pty_session_start(state, workspace, &policy, spec, true, key.as_str())?;
+    pts_until(&mut session, "DROP_READY", false)?;
+    pts_expect(not cli_state_workspace_lock(state, workspace).is_ok(), "live Drop fixture holds workspace lock")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+def pts_unknown_scope(state: &CliState, workspace: &str) -> Result<bool, i64> {
+    let spec = pts_spec(workspace, "Write-Host 'UNKNOWN_READY'; Start-Sleep -Seconds 60")?;
+    let key = pty_session_approval_key(workspace, &spec)?;
+    let policy = policy_default();
+    let mut session = pty_session_start(state, workspace, &policy, spec, true, key.as_str())?;
+    pts_until(&mut session, "UNKNOWN_READY", false)?;
+    // Deliberate test-only stale owner simulates an unprovable cleanup result.
+    // The native job and lock remain owned by this process until OS exit.
+    session.process.handle = 1;
+    Result { is_ok: true, value: true, error: 0 }
+}
+def pts_tests(state: &CliState, workspace: &str, junction: &str, outside: &str) -> Result<bool, i64> {
+    let mut policy = policy_default();
+    let spec = pts_spec(workspace, "exit 0")?;
+    let key = pty_session_approval_key(workspace, &spec)?;
+    pts_expect(not pty_session_start(state, workspace, &policy, spec, false, key.as_str()).is_ok(), "terminal creation requires explicit approval")?;
+    let plan_spec = pts_spec(workspace, "exit 0")?;
+    policy.plan = true;
+    pts_expect(not pty_session_start(state, workspace, &policy, plan_spec, true, "").is_ok(), "Plan rejects terminal creation")?;
+    policy.plan = false;
+    let stale_spec = pts_spec(workspace, "exit 0")?;
+    let stale_key = pty_session_approval_key(workspace, &stale_spec)?;
+    stale_spec.args.push(cli_text("changed"));
+    pts_expect(not pty_session_start(state, workspace, &policy, stale_spec, true, stale_key.as_str()).is_ok(), "changed argv invalidates approval snapshot")?;
+    pts_expect(not pty_session_guard(workspace, outside).is_ok(), "outside cwd is rejected")?;
+    pts_expect(not pty_session_guard(workspace, junction).is_ok(), "junction cwd is rejected before canonicalization")?;
+    let mut inherited = pts_spec(workspace, "exit 0")?; inherited.inherit_env = true;
+    pts_expect(not pty_session_spec_valid(&inherited).is_ok(), "arbitrary parent environment inheritance is rejected")?;
+    {
+        let lock = cli_state_workspace_lock(state, workspace)?;
+        let busy = pts_spec(workspace, "exit 0")?;
+        let busy_key = pty_session_approval_key(workspace, &busy)?;
+        pts_expect(not pty_session_start(state, workspace, &policy, busy, true, busy_key.as_str()).is_ok(), "active model/tool lock blocks terminal creation")?;
+    };
+    let script = "if ($env:OPENAI_API_KEY -or $env:ANTHROPIC_API_KEY -or $env:CODEX_API_KEY -or $env:SENCODE_FIXTURE_PROVIDER_SECRET) { exit 41 }; if (!$env:SystemRoot -or $env:PTY_USER -ne '用户值') { exit 42 }; Write-Host 'READY-中文😀'; $line=Read-Host; Write-Host ('ECHO-'+$line); exit 7";
+    let echo_spec = pts_spec(workspace, script)?;
+    cli_put_string(&echo_spec.env, echo_spec.env.root(), "PTY_USER", "用户值")?;
+    let echo_key = pty_session_approval_key(workspace, &echo_spec)?;
+    let mut session = pty_session_start(state, workspace, &policy, echo_spec, true, echo_key.as_str())?;
+    pts_until(&mut session, "READY-中文😀", false)?;
+    pts_expect(not cli_state_workspace_lock(state, workspace).is_ok(), "terminal blocks a second writer")?;
+    let input = ffi_buffer_from_bytes("你好😀\r")?;
+    policy.plan = true;
+    pts_expect(not pty_session_write(&session, &policy, &input, input.used_len()).is_ok(), "current Plan rejects terminal input")?;
+    policy.plan = false;
+    pts_expect(pty_session_write(&session, &policy, &input, input.used_len())? == input.used_len(), "approved user input is accepted")?;
+    pts_until(&mut session, "ECHO-你好😀", true)?;
+    pts_expect(session.exit_code == 7 and not session.lock_held, "natural quiescent exit releases workspace lock")?;
+    { let lock = cli_state_workspace_lock(state, workspace)?; };
+    pty_session_close(&mut session)?;
+    pty_session_close(&mut session)?;
+
+    let tree_script = "$p=New-Object System.Diagnostics.ProcessStartInfo; $p.FileName=$env:ComSpec; $p.Arguments='/d /c ping 127.0.0.1 -n 60 >NUL'; $p.UseShellExecute=$false; $p.CreateNoWindow=$true; $child=[System.Diagnostics.Process]::Start($p); Write-Host 'TREE_READY'; exit 0";
+    let tree_spec = pts_spec(workspace, tree_script)?;
+    let tree_key = pty_session_approval_key(workspace, &tree_spec)?;
+    let mut tree = pty_session_start(state, workspace, &policy, tree_spec, true, tree_key.as_str())?;
+    pts_until(&mut tree, "TREE_READY", false)?;
+    let started = time_unix_ms();
+    while not tree.exited { pty_session_poll(&mut tree, 4, 10)?; if time_since_ms(started) > 5000 { return state_bool_error(11); }; };
+    pts_expect(not tree.quiescent and tree.lock_held, "direct shell exit retains lock while descendant survives")?;
+    pts_expect(not cli_state_workspace_lock(state, workspace).is_ok(), "surviving descendant blocks another writer")?;
+    pty_session_close(&mut tree)?;
+    { let lock = cli_state_workspace_lock(state, workspace)?; };
+
+    let flood_spec = pts_spec(workspace, "for ($i=0; $i -lt 300; $i++) { [Console]::Write(('x'*2048)) }; Start-Sleep -Seconds 60")?;
+    let flood_key = pty_session_approval_key(workspace, &flood_spec)?;
+    let mut flood = pty_session_start(state, workspace, &policy, flood_spec, true, flood_key.as_str())?;
+    let mut output = ffi_buffer_new(65536)?;
+    let flood_start = time_unix_ms();
+    while flood.bytes_seen < 500000 {
+        pty_session_read(&mut flood, &mut output)?;
+        if time_since_ms(flood_start) > 15000 { return state_bool_error(11); };
+        pty_session_poll(&mut flood, 1, 10)?;
+    };
+    pts_expect(flood.display.used_len() <= 262144 and flood.dropped_bytes > 0 and flood.bytes_seen == flood.display.used_len() + flood.dropped_bytes, "VT retention is bounded with absolute dropped-byte accounting")?;
+    pty_session_close(&mut flood)?;
+    pts_drop_scope(state, workspace)?;
+    { let lock = cli_state_workspace_lock(state, workspace)?; };
+    pts_expect(sengoo_pty_live_handle_count() == 0 and sengoo_file_lock_live_count() == 0, "normal terminal lifecycle frees all owners")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+def main() -> i64 {
+    if args_len() < 4 { return 2; };
+    let database = cli_argument(0).unwrap_or(string_new());
+    let workspace = cli_argument(1).unwrap_or(string_new());
+    let junction = cli_argument(2).unwrap_or(string_new());
+    let outside = cli_argument(3).unwrap_or(string_new());
+    let state = cli_state_open(database.as_str());
+    if not state.is_ok() { println(state.error); return 1; };
+    if args_len() > 4 {
+        let mode = cli_argument(4).unwrap_or(string_new());
+        if mode.as_str() == "probe-lock" {
+            let lock = cli_state_workspace_lock(&state.value, workspace.as_str());
+            return if lock.is_ok() { 0 } else { 23 };
+        };
+        if mode.as_str() == "unknown" {
+            let unknown = pts_unknown_scope(&state.value, workspace.as_str());
+            if not unknown.is_ok() { println(unknown.error); return 1; };
+            if cli_state_workspace_lock(&state.value, workspace.as_str()).is_ok() { return 24; };
+            let marker = path_join_string(workspace.as_str(), "unknown-ready").unwrap_or(string_new());
+            let written = file_write_str(marker.as_str(), "retained native lock");
+            if not written.is_ok() { return 25; };
+            time_sleep_ms(60000); return 0;
+        };
+    };
+    let result = pts_tests(&state.value, workspace.as_str(), junction.as_str(), outside.as_str());
+    if not result.is_ok() { println(result.error); return 1; };
+    println("terminal jobs: approval/Plan, guarded cwd, env isolation, Unicode, bounded VT, descendant/cancel/Drop locks passed"); 0
+}

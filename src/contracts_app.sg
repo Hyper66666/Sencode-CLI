@@ -1,0 +1,32 @@
+import common;
+
+struct AppEvent {
+    kind: String,
+    id: String,
+    request_id: String,
+    session_id: String,
+    execution_id: String,
+    fence: i64,
+    connection_id: String,
+    model: String,
+    text: String,
+}
+
+def app_event(kind: &str, id: &str, request: &str, session: &str, execution: &str, fence: i64, connection: &str, model: &str, text: &str) -> AppEvent {
+    AppEvent { kind: cli_text(kind), id: cli_text(id), request_id: cli_text(request), session_id: cli_text(session), execution_id: cli_text(execution), fence: fence, connection_id: cli_text(connection), model: cli_text(model), text: cli_text(text) }
+}
+
+def app_event_document(event: &AppEvent) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    cli_put_i64(&document, document.root(), "schema", 1)?;
+    cli_put_string(&document, document.root(), "type", event.kind.as_str())?;
+    cli_put_string(&document, document.root(), "id", event.id.as_str())?;
+    cli_put_string(&document, document.root(), "request_id", event.request_id.as_str())?;
+    cli_put_string(&document, document.root(), "session_id", event.session_id.as_str())?;
+    cli_put_string(&document, document.root(), "execution_id", event.execution_id.as_str())?;
+    cli_put_i64(&document, document.root(), "fence", event.fence)?;
+    cli_put_string(&document, document.root(), "connection_id", event.connection_id.as_str())?;
+    cli_put_string(&document, document.root(), "model", event.model.as_str())?;
+    cli_put_string(&document, document.root(), "text", event.text.as_str())?;
+    Result { is_ok: true, value: document, error: 0 }
+}

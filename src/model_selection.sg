@@ -1,0 +1,170 @@
+import common;
+import connection;
+
+// Model picker contract shared by the fullscreen UI and non-interactive
+// clients. The input is the public connection snapshot (never credentials).
+// A connection owns its enabled model directory; the broad discovered catalog
+// is intentionally ignored here.
+
+def model_selection_effort_count() -> i64 { 5 }
+
+def model_selection_effort_at(index: i64) -> &str {
+    if index == 0 { return "low"; };
+    if index == 1 { return "medium"; };
+    if index == 2 { return "high"; };
+    if index == 3 { return "xhigh"; };
+    "max"
+}
+
+def model_selection_effort_valid(effort: &str) -> bool {
+    connection_effort_valid(effort)
+}
+
+def model_selection_copy_efforts(document: &JsonDoc, source: JsonValue, output: JsonValue) -> Result<bool, i64> {
+    connection_efforts_copy(document, source, output)
+}
+
+def model_selection_all_efforts(document: &JsonDoc) -> Result<JsonValue, i64> {
+    let output = document.new_array()?;
+    let mut index = 0;
+    while index < model_selection_effort_count() { output.array_push(document.new_string(model_selection_effort_at(index))?)?; index = index + 1; };
+    Result { is_ok: true, value: output, error: 0 }
+}
+
+def model_selection_efforts(document: &JsonDoc, connection: JsonValue, model: JsonValue) -> Result<JsonValue, i64> {
+    connection_efforts(document, connection, model)
+}
+
+def model_selection_status(connection: JsonValue) -> String {
+    let status = cli_json_optional_string(connection, "status");
+    if status.len() == 0 { return cli_text("ready"); };
+    status
+}
+
+def model_selection_ready(status: &str) -> bool { status == "ready" }
+
+def model_selection_connection_label(connection: JsonValue, fallback: &str) -> String {
+    let name = cli_json_optional_string(connection, "name"); if name.len() > 0 { return name; };
+    let display = cli_json_optional_string(connection, "displayName"); if display.len() > 0 { return display; };
+    let label = cli_json_optional_string(connection, "label"); if label.len() > 0 { return label; };
+    cli_text(fallback)
+}
+
+def model_selection_models(connection: JsonValue) -> Result<JsonValue, i64> {
+    let source = if connection.object_has("enabled_models") and connection.object_get("enabled_models")?.kind()? == JSON_KIND_ARRAY() {
+        connection.object_get("enabled_models")?
+    } else {
+        if connection.object_has("enabledModels") and connection.object_get("enabledModels")?.kind()? == JSON_KIND_ARRAY() { connection.object_get("enabledModels")? } else { JsonValue { doc_handle: 0, node_id: 0 } }
+    };
+    Result { is_ok: true, value: source, error: 0 }
+}
+
+// Produce a stable two-level catalog. `connections` retains connection status
+// and capability metadata; each entry under `models` is an enabled model only.
+def model_selection_snapshot(snapshot: &JsonDoc, selected_connection: &str, selected_model: &str, selected_effort: &str) -> Result<JsonDoc, i64> {
+    if snapshot.root().kind()? != JSON_KIND_OBJECT() or not snapshot.root().object_has("connections") { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    if not connection_effort_valid(selected_effort) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let output = json_doc_object()?;
+    let rows = output.new_array()?; output.root().object_set("connections", rows)?;
+    let source = snapshot.root().object_get("connections")?;
+    let mut index = 0;
+    while index < source.array_len()? {
+        let connection = source.array_get(index)?;
+        let id = cli_json_optional_string(connection, "id");
+        if id.len() == 0 { index = index + 1; continue; };
+        let item = output.new_object()?;
+        cli_put_string(&output, item, "id", id.as_str())?;
+        cli_put_string(&output, item, "label", model_selection_connection_label(connection, id.as_str()).as_str())?;
+        cli_put_string(&output, item, "kind", cli_json_optional_string(connection, "kind").as_str())?;
+        cli_put_string(&output, item, "protocol", cli_json_optional_string(connection, "protocol").as_str())?;
+        let status = model_selection_status(connection);
+        cli_put_string(&output, item, "status", status.as_str())?;
+        let ready = model_selection_ready(status.as_str()); cli_put_bool(&output, item, "selectable", ready)?;
+        if connection.object_has("capabilities") { item.object_set("capabilities", output.copy(connection.object_get("capabilities")?)?)?; (); } else { item.object_set("capabilities", output.new_object()?)?; (); };
+        let models = output.new_array()?; item.object_set("models", models)?; item.object_set("enabled_models", models)?;
+        let source_models = model_selection_models(connection)?;
+        if source_models.doc_handle != 0 {
+            let mut mi = 0;
+            while mi < source_models.array_len()? and mi < 256 {
+                let model = source_models.array_get(mi)?;
+                let model_id = cli_json_optional_string(model, "id");
+                if model_id.len() > 0 {
+                    let row = output.new_object()?;
+                    cli_put_string(&output, row, "id", model_id.as_str())?;
+                    let label = cli_json_optional_string(model, "label"); cli_put_string(&output, row, "label", if label.len() > 0 { label.as_str() } else { model_id.as_str() })?;
+                    cli_put_bool(&output, row, "enabled", true)?;
+                    cli_put_bool(&output, row, "selected", id.as_str() == selected_connection and model_id.as_str() == selected_model)?;
+                    if model.object_has("capabilities") { row.object_set("capabilities", output.copy(model.object_get("capabilities")?)?)?; (); } else { row.object_set("capabilities", output.new_object()?)?; (); };
+                    row.object_set("efforts", model_selection_efforts(&output, connection, model)?)?;
+                    models.array_push(row)?; ();
+                };
+                mi = mi + 1;
+            };
+        };
+        rows.array_push(item)?; index = index + 1;
+    };
+    let target = output.new_object()?;
+    cli_put_string(&output, target, "connection", selected_connection)?;
+    cli_put_string(&output, target, "model", selected_model)?;
+    let mut effective = string_new();
+    let mut effort_available = false;
+    if selected_connection.len() > 0 and selected_model.len() > 0 {
+        let resolved = model_selection_target(snapshot, selected_connection, selected_model, selected_effort);
+        if resolved.is_ok() { effective = cli_json_string(resolved.value.root(), "effort")?; effort_available = effective.len() > 0; } else {
+            // A manually entered model is not added to the enabled picker.
+            // Its current header still uses the same connection-level encoder
+            // capability as the request boundary, without borrowing another
+            // model's capability or preserving an unsupported requested value.
+            if resolved.error == 5 {
+                let mut ci = 0;
+                while ci < source.array_len()? {
+                    let connection = source.array_get(ci)?;
+                    if cli_json_optional_string(connection, "id").as_str() == selected_connection and model_selection_ready(model_selection_status(connection).as_str()) {
+                        let fallback = connection_effective_effort(connection, selected_model, selected_effort);
+                        if fallback.is_ok() { effective = fallback.value; effort_available = effective.len() > 0; }; break;
+                    };
+                    ci = ci + 1;
+                }; ();
+            }; ();
+        };
+    };
+    cli_put_string(&output, target, "effort", effective.as_str())?;
+    cli_put_bool(&output, target, "effort_available", effort_available)?;
+    output.root().object_set("selected", target)?;
+    Result { is_ok: true, value: output, error: 0 }
+}
+
+// Validate a complete target against the enabled catalog. The returned object
+// is the immutable request snapshot consumed by a turn.
+def model_selection_target(snapshot: &JsonDoc, connection_id: &str, model_id: &str, effort: &str) -> Result<JsonDoc, i64> {
+    if connection_id.len() == 0 or model_id.len() == 0 or not connection_effort_valid(effort) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let source = snapshot.root().object_get("connections")?; let mut index = 0;
+    while index < source.array_len()? {
+        let connection = source.array_get(index)?;
+        if cli_json_optional_string(connection, "id").as_str() == connection_id {
+            let status = model_selection_status(connection);
+            if not model_selection_ready(status.as_str()) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            let models = model_selection_models(connection)?;
+            if models.doc_handle == 0 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }; };
+            let mut mi = 0;
+            while mi < models.array_len()? {
+                let model = models.array_get(mi)?;
+                if cli_json_optional_string(model, "id").as_str() == model_id {
+                    let efforts = model_selection_efforts(snapshot, connection, model)?;
+                    let effective = connection_effort_from_options(efforts, effort)?;
+                    let result = json_doc_object()?; let root = result.root();
+                    cli_put_string(&result, root, "connection", connection_id)?; cli_put_string(&result, root, "connection_id", connection_id)?; cli_put_string(&result, root, "model", model_id)?; cli_put_string(&result, root, "effort", effective.as_str())?;
+                    cli_put_string(&result, root, "status", status.as_str())?;
+                    cli_put_string(&result, root, "connection_label", model_selection_connection_label(connection, connection_id).as_str())?;
+                    let label = cli_json_optional_string(model, "label"); cli_put_string(&result, root, "model_label", if label.len() > 0 { label.as_str() } else { model_id })?;
+                    if connection.object_has("capabilities") { root.object_set("capabilities", result.copy(connection.object_get("capabilities")?)?)?; (); };
+                    return Result { is_ok: true, value: result, error: 0 };
+                };
+                mi = mi + 1;
+            };
+            return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 };
+        };
+        index = index + 1;
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }
+}

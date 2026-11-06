@@ -1,0 +1,143 @@
+import provider;
+import std::path;
+import std::file_snapshot;
+import std::media;
+import std::encoding;
+import std::system;
+
+def image_paths_valid(images: JsonValue) -> bool {
+    let kind = images.kind(); if not kind.is_ok() or kind.value != JSON_KIND_ARRAY() { return false; };
+    let count = images.array_len(); if not count.is_ok() or count.value > 8 { return false; };
+    let mut index = 0;
+    while index < count.value {
+        let item = images.array_get(index); if not item.is_ok() { return false; };
+        let parsed = item.value.string_value(); if not parsed.is_ok() { return false; };
+        let path = parsed.value;
+        if path.len() == 0 or path.len() > 32768 or path.len() != path.as_str().len() or not path_is_absolute(path.as_str()) { return false; };
+        index = index + 1;
+    };
+    true
+}
+
+def image_request_inspect(snapshot: &FileSnapshot, bytes: &mut Buffer) -> Result<MediaInspection, i64> {
+    let size = snapshot.len()?;
+    if size < 1 or size > 8388608 { return Result { is_ok: false, value: media_info(0,0), error: 13 }; };
+    if snapshot.copy_bytes(bytes)? != size { return Result { is_ok: false, value: media_info(0,0), error: 10 }; };
+    let info = media_inspect_with_limits(bytes, 1048576, 4096, 32768, 100000000)?;
+    if not info.header_recognized() or info.kind != MEDIA_KIND_PNG() and info.kind != MEDIA_KIND_JPEG() { return Result { is_ok: false, value: info, error: 8 }; };
+    Result { is_ok: true, value: info, error: 0 }
+}
+
+// Called only for explicit user-submitted image paths. The reference records
+// immutable byte identity; no source image is copied into the project or DB.
+def image_request_capture(images: JsonValue) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    if not image_paths_valid(images) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let refs = document.new_array()?; document.root().object_set("image_refs", refs)?;
+    let mut index = 0; let mut total = 0;
+    while index < images.array_len()? {
+        let original = images.array_get(index)?.string_value()?;
+        let path = canonical_path_string(original.as_str())?;
+        let snapshot = file_snapshot_open(path.as_str(), 8388608)?;
+        let size = snapshot.len()?; total = total + size;
+        if total > 8388608 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        let mut bytes = ffi_buffer_new(size)?;
+        let info = image_request_inspect(&snapshot, &mut bytes)?;
+        let item = document.new_object()?;
+        cli_put_string(&document, item, "path", path.as_str())?;
+        cli_put_string(&document, item, "mime", info.mime_type())?;
+        cli_put_i64(&document, item, "byte_length", size)?;
+        cli_put_string(&document, item, "sha256", snapshot.sha256()?.as_str())?;
+        refs.array_push(item)?; index = index + 1;
+    };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def image_ref_equal(left: JsonValue, right: JsonValue) -> Result<bool, i64> {
+    let same = cli_json_string(left, "path")?.as_str() == cli_json_string(right, "path")?.as_str() and cli_json_string(left, "sha256")?.as_str() == cli_json_string(right, "sha256")?.as_str() and left.object_get("byte_length")?.number_i64()? == right.object_get("byte_length")?.number_i64()?;
+    Result { is_ok: true, value: same, error: 0 }
+}
+
+def image_ref_granted(grants: &JsonDoc, reference: JsonValue) -> Result<bool, i64> {
+    if not grants.root().object_has("image_grants") { return Result { is_ok: true, value: false, error: 0 }; };
+    let source = grants.root().object_get("image_grants")?;
+    if source.array_len()? > 64 { return Result { is_ok: false, value: false, error: 13 }; };
+    let mut index = 0;
+    while index < source.array_len()? { if image_ref_equal(source.array_get(index)?, reference)? { return Result { is_ok: true, value: true, error: 0 }; }; index = index + 1; };
+    Result { is_ok: true, value: false, error: 0 }
+}
+
+// Grants live only in the authority catalog's session mode. Portable history
+// imports and branches do not inherit file-read authority from these refs.
+def image_request_merge_grants(previous: &JsonDoc, captured: &JsonDoc) -> Result<JsonDoc, i64> {
+    let result = json_doc_object()?; let target = result.new_array()?;
+    result.root().object_set("image_grants", target)?;
+    if previous.root().object_has("image_grants") {
+        let source = previous.root().object_get("image_grants")?;
+        if source.array_len()? > 64 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        let mut index = 0; while index < source.array_len()? { target.array_push(result.copy(source.array_get(index)?)?)?; index = index + 1; };
+    };
+    let source = captured.root().object_get("image_refs")?; let mut index = 0;
+    while index < source.array_len()? {
+        let item = source.array_get(index)?;
+        if not image_ref_granted(&result, item)? {
+            if target.array_len()? >= 64 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+            target.array_push(result.copy(item)?)?; ();
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def image_request_has_media(history: &JsonDoc) -> Result<bool, i64> {
+    let messages = history.root().object_get("messages")?; let mut index = 0;
+    while index < messages.array_len()? { let item = messages.array_get(index)?; if item.object_has("image_refs") or item.object_has("content_parts") { return Result { is_ok: true, value: true, error: 0 }; }; index = index + 1; };
+    Result { is_ok: true, value: false, error: 0 }
+}
+
+// Hydration is ephemeral and bounded. Validate capability and durable grants
+// before reading any path from history; verify the byte hash before encoding.
+// Result drops only its active arm: Err placeholders must never own a document.
+// Leave the local result owned here so every rejected conversion releases it.
+def image_request_history(history: &JsonDoc, allowed: bool, grants: &JsonDoc) -> Result<JsonDoc, i64> {
+    let result = json_doc_object_bounded(16777216)?;
+    if not allowed { cli_diagnostic("This model has no explicit visionSupported capability; image history was not sent. Select a vision-enabled model."); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 7 }; };
+    let target = result.new_array()?; result.root().object_set("messages", target)?;
+    let source = history.root().object_get("messages")?; let mut index = 0; let mut total = 0; let mut count = 0;
+    while index < source.array_len()? {
+        let original = source.array_get(index)?;
+        if not original.object_has("image_refs") { target.array_push(result.copy(original)?)?; (); } else {
+            let role = cli_json_string(original, "role")?;
+            if role.as_str() != "user" or original.object_has("content_parts") { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+            let refs = original.object_get("image_refs")?;
+            if refs.array_len()? < 1 or refs.array_len()? > 8 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+            let message = result.new_object()?; cli_put_string(&result, message, "role", "user")?; cli_put_string(&result, message, "content", "")?;
+            let parts = result.new_array()?; message.object_set("content_parts", parts)?;
+            let text = result.new_object()?; cli_put_string(&result, text, "type", "text")?; cli_put_string(&result, text, "text", cli_json_optional_string(original, "content").as_str())?; parts.array_push(text)?;
+            let mut image_index = 0;
+            while image_index < refs.array_len()? {
+                let reference = refs.array_get(image_index)?;
+                provider_media_fields(reference, "|path||mime||byte_length||sha256|")?;
+                if not image_ref_granted(grants, reference)? { cli_diagnostic("Image history has no explicit grant in this session catalog. Reattach the original image before continuing."); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 7 }; };
+                let path = cli_json_string(reference, "path")?; let mime = cli_json_string(reference, "mime")?; let digest = cli_json_string(reference, "sha256")?;
+                provider_owned_text_valid(&path)?; provider_owned_text_valid(&mime)?; provider_owned_text_valid(&digest)?;
+                let size = reference.object_get("byte_length")?.number_i64()?;
+                if not path_is_absolute(path.as_str()) or size < 1 or size > 8388608 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+                total = total + size; count = count + 1;
+                if total > 8388608 or count > 64 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+                let snapshot = file_snapshot_open(path.as_str(), 8388608)?;
+                if snapshot.len()? != size or snapshot.sha256()?.as_str() != digest.as_str() { cli_diagnostic("An image in the active history changed on disk. Restore its original bytes or start a new session with the current image; old bytes were not substituted."); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 12 }; };
+                let mut bytes = ffi_buffer_new(size)?; let info = image_request_inspect(&snapshot, &mut bytes)?;
+                if info.mime_type() != mime.as_str() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 12 }; };
+                let mut encoded = ffi_buffer_new(((size + 2) / 3) * 4 + 1)?;
+                let length = encoding_base64_encode_buffer_bounded(&bytes, size, 8388608, &mut encoded)?;
+                let data = string_from_buffer(encoded, length)?;
+                let part = result.new_object()?; cli_put_string(&result, part, "type", "image")?; cli_put_string(&result, part, "mime", mime.as_str())?; cli_put_string(&result, part, "data", data.as_str())?; cli_put_i64(&result, part, "byte_length", size)?;
+                parts.array_push(part)?; image_index = image_index + 1;
+            };
+            target.array_push(message)?; ();
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: result, error: 0 }
+}

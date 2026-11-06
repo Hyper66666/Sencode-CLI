@@ -1,0 +1,204 @@
+import common;
+
+struct HttpEndpoint {
+    host: String,
+    port: i64,
+    tls: bool,
+    path: String,
+}
+
+def http_endpoint(base: &str, route: &str) -> Result<HttpEndpoint, i64> {
+    let mut failed = HttpEndpoint { host: string_new(), port: 0, tls: false, path: string_new() };
+    let tls = str_starts_with(base, "https://");
+    if not tls and not str_starts_with(base, "http://") { return Result { is_ok: false, value: failed, error: 2 }; };
+    if str_contains(base, "\r") or str_contains(base, "\n") or str_contains(base, "#") or str_contains(base, "@") or str_contains(base, "?") { return Result { is_ok: false, value: failed, error: 2 }; };
+    let offset = if tls { 8 } else { 7 };
+    let remainder = cli_byte_slice(base, offset, base.len())?;
+    let slash = str_index_of(remainder.as_str(), "/");
+    let authority = if slash < 0 { remainder.clone()? } else { cli_byte_slice(remainder.as_str(), 0, slash)? };
+    let mut host = authority.clone()?;
+    let mut port = if tls { 443 } else { 80 };
+    if str_starts_with(authority.as_str(), "[") {
+        let closing = str_index_of(authority.as_str(), "]");
+        if closing < 0 { return Result { is_ok: false, value: failed, error: 2 }; };
+        host = cli_byte_slice(authority.as_str(), 1, closing)?;
+        if closing + 1 < authority.len() {
+            let tail = cli_byte_slice(authority.as_str(), closing + 1, authority.len())?;
+            if not str_starts_with(tail.as_str(), ":") { return Result { is_ok: false, value: failed, error: 2 }; };
+            port = cli_parse_unsigned(cli_byte_slice(tail.as_str(), 1, tail.len())?.as_str(), 10)?;
+        };
+    } else {
+        let colon = str_index_of(authority.as_str(), ":");
+        if colon >= 0 {
+            host = cli_byte_slice(authority.as_str(), 0, colon)?;
+            port = cli_parse_unsigned(cli_byte_slice(authority.as_str(), colon + 1, authority.len())?.as_str(), 10)?;
+        };
+    };
+    if host.len() == 0 or port < 1 or port > 65535 { return Result { is_ok: false, value: failed, error: 2 }; };
+    if not tls and host.as_str() != "localhost" and host.as_str() != "127.0.0.1" and host.as_str() != "::1" { return Result { is_ok: false, value: failed, error: 7 }; };
+    let mut path = if slash < 0 { string_new() } else { cli_byte_slice(remainder.as_str(), slash, remainder.len())? };
+    while str_ends_with(path.as_str(), "/") { path = cli_byte_slice(path.as_str(), 0, path.len() - 1)?; };
+    if not str_ends_with(path.as_str(), route) { path.push_str(route)?; (); };
+    Result { is_ok: true, value: HttpEndpoint { host: host, port: port, tls: tls, path: path }, error: 0 }
+}
+
+def http_request(endpoint: &HttpEndpoint, protocol: i64, credential: &str, body: &str) -> Result<String, i64> {
+    if str_contains(credential, "\r") or str_contains(credential, "\n") { return string_result_err(2); };
+    let request = cli_text("POST ");
+    request.push_str(endpoint.path.as_str())?;
+    request.push_str(" HTTP/1.1\r\nHost: ")?;
+    if str_contains(endpoint.host.as_str(), ":") { request.push_str("[")?; request.push_str(endpoint.host.as_str())?; request.push_str("]")?; (); } else { request.push_str(endpoint.host.as_str())?; (); };
+    request.push_str(":")?;
+    request.push_i64(endpoint.port)?;
+    request.push_str("\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nAccept-Encoding: identity\r\nConnection: close\r\nUser-Agent: sencode-sg/0.1\r\n")?;
+    if protocol == 2 { request.push_str("anthropic-version: 2023-06-01\r\nx-api-key: ")?; (); } else { request.push_str("Authorization: Bearer ")?; (); };
+    request.push_str(credential)?;
+    request.push_str("\r\nContent-Length: ")?;
+    request.push_i64(body.len())?;
+    request.push_str("\r\n\r\n")?;
+    request.push_str(body)?;
+    Result { is_ok: true, value: request, error: 0 }
+}
+
+// Size includes headers, credentials and JSON. This never starts a connection.
+def http_request_bounded(endpoint: &HttpEndpoint, protocol: i64, credential: &str, body: &str, request_limit: i64) -> Result<String, i64> {
+    if request_limit < 1 or request_limit > 16777216 { return string_result_err(2); };
+    if body.len() > request_limit { return string_result_err(13); };
+    let request = http_request(endpoint, protocol, credential, body)?;
+    if request.len() > request_limit { cli_diagnostic("The complete HTTP request exceeds the local byte limit; nothing was sent."); return string_result_err(13); };
+    Result { is_ok: true, value: request, error: 0 }
+}
+
+struct HttpDecoder {
+    pending: Buffer,
+    headers_ready: bool,
+    status: i64,
+    retry_after: String,
+    body_mode: i64,
+    remaining: i64,
+    chunk_remaining: i64,
+    chunk_state: i64,
+    complete: bool,
+}
+
+def http_decoder() -> HttpDecoder {
+    HttpDecoder { pending: cli_bytes(2097152), headers_ready: false, status: 0, retry_after: string_new(), body_mode: 0, remaining: 0, chunk_remaining: 0, chunk_state: 0, complete: false }
+}
+
+impl HttpDecoder {
+    def consume(&mut self, count: i64) -> Result<bool, i64> {
+        self.pending.consume(count)?;
+        Result { is_ok: true, value: true, error: 0 }
+    }
+
+    def feed(&mut self, bytes: &str) -> Result<Buffer, i64> {
+        let input = ffi_buffer_from_bytes(bytes)?;
+        self.feed_bytes(&input, 0, input.used_len())
+    }
+
+    def feed_bytes(&mut self, bytes: &Buffer, start: i64, count: i64) -> Result<Buffer, i64> {
+        let output = ffi_buffer_new(self.pending.used_len() + count)?;
+        if self.complete and count != 0 { return cli_bytes_error(10); };
+        if self.pending.used_len() + count > 2097152 { return cli_bytes_error(13); };
+        cli_bytes_append(&self.pending, bytes, start, count)?;
+        if not self.headers_ready {
+            let end = cli_bytes_index(&self.pending, "\r\n\r\n")?;
+            if end < 0 {
+                if self.pending.used_len() > 65536 { return cli_bytes_error(13); };
+                return Result { is_ok: true, value: output, error: 0 };
+            };
+            if end > 65536 { return cli_bytes_error(13); };
+            let header = cli_bytes_text(&self.pending, 0, end)?;
+            let lines = header.split("\r\n");
+            let status_line = lines.next();
+            if not status_line.is_some or not str_starts_with(status_line.value.as_str(), "HTTP/1.") or status_line.value.len() < 12 { return cli_bytes_error(10); };
+            self.status = cli_parse_unsigned(cli_byte_slice(status_line.value.as_str(), 9, 12)?.as_str(), 10)?;
+            let mut content_length = -1;
+            let mut chunked = false;
+            loop {
+                let line = lines.next();
+                if not line.is_some { break; };
+                let lower = str_to_ascii_lower(line.value.as_str())?;
+                if str_starts_with(lower.as_str(), "retry-after:") {
+                    if self.retry_after.len() > 0 { return cli_bytes_error(10); };
+                    let raw = cli_byte_slice(line.value.as_str(), 12, line.value.len())?;
+                    self.retry_after = str_trim(raw.as_str())?;
+                    if self.retry_after.len() < 1 or self.retry_after.len() > 128 { return cli_bytes_error(10); };
+                };
+                if str_starts_with(lower.as_str(), "content-length:") {
+                    let raw = cli_byte_slice(lower.as_str(), 15, lower.len())?;
+                    let length = cli_parse_unsigned(str_trim(raw.as_str())?.as_str(), 10)?;
+                    if content_length != -1 and content_length != length { return cli_bytes_error(10); };
+                    content_length = length;
+                };
+                if str_starts_with(lower.as_str(), "transfer-encoding:") {
+                    let raw = cli_byte_slice(lower.as_str(), 18, lower.len())?;
+                    let coding = str_trim(raw.as_str())?;
+                    if coding.as_str() != "chunked" { return cli_bytes_error(10); };
+                    chunked = true;
+                };
+                if str_starts_with(lower.as_str(), "content-encoding:") {
+                    let raw = cli_byte_slice(lower.as_str(), 17, lower.len())?;
+                    let coding = str_trim(raw.as_str())?;
+                    if coding.as_str() != "identity" { return cli_bytes_error(10); };
+                };
+            };
+            if chunked and content_length >= 0 { return cli_bytes_error(10); };
+            self.body_mode = if chunked { 2 } else { if content_length >= 0 { 1 } else { 3 } };
+            self.remaining = content_length;
+            self.headers_ready = true;
+            self.consume(end + 4)?;
+        };
+        if self.body_mode == 3 { cli_bytes_append(&output, &self.pending, 0, self.pending.used_len())?; self.pending.clear(); return Result { is_ok: true, value: output, error: 0 }; };
+        if self.body_mode == 1 {
+            if self.pending.used_len() > self.remaining { return cli_bytes_error(10); };
+            self.remaining = self.remaining - self.pending.used_len();
+            cli_bytes_append(&output, &self.pending, 0, self.pending.used_len())?;
+            self.pending.clear();
+            self.complete = self.remaining == 0;
+            return Result { is_ok: true, value: output, error: 0 };
+        };
+        loop {
+            if self.chunk_state == 0 {
+                let end = cli_bytes_index(&self.pending, "\r\n")?;
+                if end < 0 { if self.pending.used_len() > 8192 { return cli_bytes_error(13); }; break; };
+                let line = cli_bytes_text(&self.pending, 0, end)?;
+                let extension = str_index_of(line.as_str(), ";");
+                let size = if extension < 0 { line.clone()? } else { cli_byte_slice(line.as_str(), 0, extension)? };
+                self.chunk_remaining = cli_parse_unsigned(size.as_str(), 16)?;
+                if self.chunk_remaining > 1048576 { return cli_bytes_error(13); };
+                self.consume(end + 2)?;
+                self.chunk_state = if self.chunk_remaining == 0 { 3 } else { 1 };
+            };
+            if self.chunk_state == 1 {
+                let count = if self.pending.used_len() < self.chunk_remaining { self.pending.used_len() } else { self.chunk_remaining };
+                if count == 0 { break; };
+                cli_bytes_append(&output, &self.pending, 0, count)?;
+                self.consume(count)?;
+                self.chunk_remaining = self.chunk_remaining - count;
+                if self.chunk_remaining != 0 { break; };
+                self.chunk_state = 2;
+            };
+            if self.chunk_state == 2 {
+                if self.pending.used_len() < 2 { break; };
+                if cli_bytes_index(&self.pending, "\r\n")? != 0 { return cli_bytes_error(10); };
+                self.consume(2)?;
+                self.chunk_state = 0;
+            };
+            if self.chunk_state == 3 {
+                let end = cli_bytes_index(&self.pending, "\r\n")?;
+                if end < 0 { break; };
+                if end == 0 { self.consume(2)?; self.complete = true; self.chunk_state = 4; break; };
+                self.consume(end + 2)?;
+            };
+            if self.chunk_state == 4 { break; };
+        };
+        Result { is_ok: true, value: output, error: 0 }
+    }
+
+    def finish(&mut self) -> Result<bool, i64> {
+        if not self.headers_ready { return Result { is_ok: false, value: false, error: 10 }; };
+        if self.body_mode == 3 { self.complete = true; };
+        Result { is_ok: self.complete and self.pending.used_len() == 0, value: self.complete, error: if self.complete and self.pending.used_len() == 0 { 0 } else { 10 } }
+    }
+}

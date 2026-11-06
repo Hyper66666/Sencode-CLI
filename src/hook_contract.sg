@@ -1,0 +1,89 @@
+import common;
+import workspace;
+import std::hash;
+import std::system;
+
+struct HookManifest { document: JsonDoc, id: String, path: String, executable: String, digest: String, executable_digest: String, timeout_ms: i64 }
+struct HookScope { text:String }
+
+def hook_error(code:i64)->Result<JsonDoc,i64>{Result{is_ok:false,value:JsonDoc{handle:0},error:code}}
+def hook_true()->Result<bool,i64>{Result{is_ok:true,value:true,error:0}}
+def hook_keys(document:&JsonDoc,allowed:&str)->Result<bool,i64>{
+    if document.root().kind()?!=JSON_KIND_OBJECT(){return Result{is_ok:false,value:false,error:2};};
+    let keys=document.root().object_keys()?;let mut index=0;
+    while index<keys.root().array_len()?{let key=keys.root().array_get(index)?.string_value()?;let marker=cli_join("|",key.as_str())?;marker.push_str("|")?;if not str_contains(allowed,marker.as_str()){return Result{is_ok:false,value:false,error:2};};index=index+1;};hook_true()
+}
+def hook_identifier(value:&str)->bool{
+    if value.len()<1 or value.len()>64 or str_starts_with(value,"-") or str_ends_with(value,"-"){return false;};
+    let text=cli_text(value);let bytes=text.bytes();let mut valid=true;
+    loop{let byte=bytes.next();if not byte.is_some{break;};if not(byte.value>=97 and byte.value<=122 or byte.value>=48 and byte.value<=57 or byte.value==45){valid=false;};};bytes.free();valid
+}
+def hook_hex(value:&str)->bool{
+    if value.len()!=64{return false;};let text=cli_text(value);let bytes=text.bytes();let mut valid=true;
+    loop{let byte=bytes.next();if not byte.is_some{break;};if not(byte.value>=48 and byte.value<=57 or byte.value>=97 and byte.value<=102){valid=false;};};bytes.free();valid
+}
+
+// The general JSON DOM keeps the last member. Security-sensitive manifests and
+// worker frames reject duplicate names before inspecting the normalized DOM.
+// Decode quoted names so escaped equivalents cannot bypass this rule.
+def hook_unique_keys(raw:&str)->Result<bool,i64>{
+    let source=cli_text(raw);let chars=source.chars();let scopes:Vec<HookScope> = vec_new();
+    let mut quoted=false;let mut escaped=false;let mut candidate=false;let mut start=0;let mut end=0;let mut offset=0;
+    loop{let next=chars.next();if not next.is_some{break;};let cp=char_codepoint(next.value)?;let at=offset;offset=offset+if cp<128{1}else{if cp<2048{2}else{if cp<65536{3}else{4}}};
+        if quoted{if escaped{escaped=false;}else{if cp==92{escaped=true;}else{if cp==34{quoted=false;candidate=true;end=offset;};};};}
+        else{if cp==34{quoted=true;escaped=false;candidate=false;start=at;}else{
+            if cp==123{if scopes.len()>=128{chars.free();return Result{is_ok:false,value:false,error:13};};scopes.push(HookScope{text:string_new()});candidate=false;}
+            else{if cp==125{scopes.pop();candidate=false;}
+            else{if cp==58 and candidate{if scopes.len()==0{chars.free();return Result{is_ok:false,value:false,error:10};};
+                let name=json_parse(cli_byte_slice(raw,start,end)?.as_str())?.serialize_string()?;
+                let marker=cli_join("\n",name.as_str())?;marker.push_str("\n")?;
+                let seen:&HookScope=scopes.get(scopes.len()-1);
+                if str_contains(seen.text.as_str(),marker.as_str()){chars.free();return Result{is_ok:false,value:false,error:10};};seen.text.push_str(marker.as_str())?;candidate=false;
+            }else{if cp!=32 and cp!=9 and cp!=10 and cp!=13{candidate=false;};};};};
+        };};
+    };chars.free();hook_true()
+}
+// v1 deliberately has no coordinator, shell, MCP or Plan-file subscriptions.
+def hook_tool_supported(name:&str)->bool{name=="read_file" or name=="list_directory" or name=="search" or name=="find_files" or name=="write_file" or name=="apply_patch"}
+def hook_manifest_error(code:i64)->Result<HookManifest,i64>{Result{is_ok:false,value:HookManifest{document:JsonDoc{handle:0},id:string_new(),path:string_new(),executable:string_new(),digest:string_new(),executable_digest:string_new(),timeout_ms:0},error:code}}
+def hook_manifest_load(path:&str)->Result<HookManifest,i64>{
+    if not path_is_absolute(path) or file_kind(path)?!=PATH_KIND_FILE(){return hook_manifest_error(7);};
+    let canonical=canonical_path_string(path)?;let text=workspace_read(canonical.as_str(),65536)?;let document=json_parse(text.as_str())?;hook_unique_keys(text.as_str())?;
+    hook_keys(&document,"|schema|id|version|language|protocol|executable|sha256|timeout_ms|before_tool|after_tool|")?;
+    let id=cli_json_string(document.root(),"id")?;let version=cli_json_string(document.root(),"version")?;
+    if not hook_identifier(id.as_str()) or version.len()<1 or version.len()>64 or cli_json_optional_i64(document.root(),"schema",0)!=1 or cli_json_string(document.root(),"language")?.as_str()!="sengoo" or cli_json_string(document.root(),"protocol")?.as_str()!="sencode.native-worker/1"{return hook_manifest_error(8);};
+    let relative=cli_json_string(document.root(),"executable")?;
+    if relative.len()<1 or relative.len()>255 or str_contains(relative.as_str(),"/") or str_contains(relative.as_str(),"\\") or str_contains(relative.as_str(),":") or str_contains(relative.as_str()," ") or not str_ends_with(relative.as_str(),".exe"){return hook_manifest_error(7);};
+    let executable=workspace_path(path_parent_string(canonical.as_str())?.as_str(),relative.as_str())?;
+    if file_kind(executable.as_str())?!=PATH_KIND_FILE(){return hook_manifest_error(7);};
+    let expected=cli_json_string(document.root(),"sha256")?;if not hook_hex(expected.as_str()){return hook_manifest_error(8);};
+    let actual=hash_sha256_file(executable.as_str(),67108864)?;if expected.as_str()!=actual.as_str(){return hook_manifest_error(8);};
+    let timeout=cli_json_optional_i64(document.root(),"timeout_ms",5000);if timeout<100 or timeout>30000{return hook_manifest_error(2);};
+    let mut phase=0;let mut count=0;
+    while phase<2{let subscriptions=document.root().object_get(if phase==0{"before_tool"}else{"after_tool"})?;if subscriptions.array_len()?>6{return hook_manifest_error(13);};let mut index=0;
+        while index<subscriptions.array_len()?{let name=subscriptions.array_get(index)?.string_value()?;if not hook_tool_supported(name.as_str()){return hook_manifest_error(8);};let mut previous=0;while previous<index{if subscriptions.array_get(previous)?.string_value()?.as_str()==name.as_str(){return hook_manifest_error(2);};previous=previous+1;};count=count+1;index=index+1;};phase=phase+1;};
+    if count==0{return hook_manifest_error(2);};
+    // Hash the exact parsed bytes, not a second racy path read. The host later
+    // requires its pinned manifest snapshot to have this same fingerprint.
+    let digest_buffer=ffi_buffer_new(64)?;hash_sha256_str(text.as_str(),digest_buffer)?;let digest=string_from_buffer(digest_buffer,64)?;
+    Result{is_ok:true,value:HookManifest{document:document,id:id,path:canonical,executable:executable,digest:digest,executable_digest:actual,timeout_ms:timeout},error:0}
+}
+def hook_manifest_matches(manifest:&HookManifest,phase:&str,tool:&str)->Result<bool,i64>{
+    if phase!="before_tool" and phase!="after_tool"{return Result{is_ok:false,value:false,error:2};};
+    let items=manifest.document.root().object_get(phase)?;let mut index=0;while index<items.array_len()?{if items.array_get(index)?.string_value()?.as_str()==tool{return Result{is_ok:true,value:true,error:0};};index=index+1;};Result{is_ok:true,value:false,error:0}
+}
+def hook_frame(kind:&str,id:&str,worker:&str,digest:&str)->Result<JsonDoc,i64>{
+    let document=json_doc_object()?;cli_put_i64(&document,document.root(),"schema",1)?;cli_put_string(&document,document.root(),"protocol","sencode.native-worker/1")?;cli_put_string(&document,document.root(),"type",kind)?;cli_put_string(&document,document.root(),"id",id)?;cli_put_string(&document,document.root(),"worker_id",worker)?;cli_put_string(&document,document.root(),"manifest_sha256",digest)?;Result{is_ok:true,value:document,error:0}
+}
+def hook_frame_identity(document:&JsonDoc,kind:&str,id:&str,worker:&str,digest:&str)->Result<bool,i64>{
+    if cli_json_optional_i64(document.root(),"schema",0)!=1 or cli_json_string(document.root(),"protocol")?.as_str()!="sencode.native-worker/1" or cli_json_string(document.root(),"type")?.as_str()!=kind or cli_json_string(document.root(),"id")?.as_str()!=id or cli_json_string(document.root(),"worker_id")?.as_str()!=worker or cli_json_string(document.root(),"manifest_sha256")?.as_str()!=digest{return Result{is_ok:false,value:false,error:10};};hook_true()
+}
+def hook_frame_take(queue:&Buffer)->Result<JsonDoc,i64>{
+    let newline=cli_bytes_index(queue,"\n")?;if newline<0{if queue.used_len()>262144{return hook_error(13);};return json_doc_object();};if newline>262144{return hook_error(13);};
+    let raw=cli_bytes_text(queue,0,newline)?;queue.consume(newline+1)?;let bytes=ffi_buffer_from_bytes(raw.as_str())?;if not bytes.is_utf8(){return hook_error(20);};let document=json_parse(raw.as_str())?;hook_unique_keys(raw.as_str())?;if document.root().kind()?!=JSON_KIND_OBJECT(){return hook_error(10);};Result{is_ok:true,value:document,error:0}
+}
+def hook_frame_result(document:&JsonDoc,id:&str,worker:&str,digest:&str,phase:&str)->Result<bool,i64>{
+    hook_keys(document,"|schema|protocol|type|id|worker_id|manifest_sha256|event|decision|reason|notice|")?;hook_frame_identity(document,"result",id,worker,digest)?;
+    let event=cli_json_string(document.root(),"event")?;let decision=cli_json_string(document.root(),"decision")?;
+    if event.as_str()!=phase or decision.as_str()!="continue" and decision.as_str()!="block" or phase=="after_tool" and decision.as_str()=="block" or cli_json_string(document.root(),"reason")?.len()>4096 or cli_json_string(document.root(),"notice")?.len()>4096{return Result{is_ok:false,value:false,error:10};};hook_true()
+}

@@ -1,0 +1,108 @@
+import worktree;
+import command_line;
+
+def wtt_error(code: i64, message: &str) -> Result<JsonDoc,i64> {
+    let report = json_doc_object()?;
+    cli_put_string(&report,report.root(),"status","refused")?;
+    cli_put_i64(&report,report.root(),"code",code)?;
+    cli_put_string(&report,report.root(),"message",message)?;
+    Result { is_ok: true, value: report, error: 0 }
+}
+
+def wtt_complete(state: &CliState, policy: &mut AgentPolicy, job: &mut WorktreeJob, mode: &str) -> Result<JsonDoc,i64> {
+    let mut signalled = false;
+    while not job.done {
+        if mode == "cancel" or mode == "cancel-delayed" and time_since_ms(job.started_at) > 200 { worktree_cancel(job); };
+        if mode == "timeout" { job.command_timeout_ms = 1; time_sleep_ms(2); (); };
+        if mode == "plan-late" and job.step >= 5 { policy.plan = true; };
+        if mode == "reserve" and job.transaction.handle != 0 and not signalled {
+            io_stdout_write("RESERVED\n"); io_stdout_flush()?; signalled = true; time_sleep_ms(750); ();
+        };
+        worktree_poll(state,policy,job)?;
+        if not job.done { time_sleep_ms(1); (); };
+    };
+    worktree_result(job)
+}
+
+def wtt_inspect(state: &CliState, cwd: &str) -> Result<JsonDoc,i64> {
+    let mut policy = policy_default(); let mut job = worktree_inspect_start(cwd)?;
+    wtt_complete(state,&mut policy,&mut job,"")
+}
+
+def wtt_parse_tests() -> Result<JsonDoc,i64> {
+    let bytes = ffi_buffer_new(1024)?;
+    bytes.append_str("worktree C:/用户 空格/😀")?; bytes.push_u8(0)?;
+    bytes.append_str("HEAD 0000000000000000000000000000000000000000")?; bytes.push_u8(0)?;
+    bytes.append_str("detached")?; bytes.push_u8(0)?; bytes.push_u8(0)?;
+    let parsed = worktree_parse_entries(&bytes)?;
+    let entry = parsed.root().object_get("worktrees")?.array_get(0)?;
+    if cli_json_string(entry,"path")?.as_str() != "C:/用户 空格/😀" { return wtt_error(99,"NUL-framed Unicode path failed"); };
+    let malformed = ffi_buffer_from_bytes("worktree C:/incomplete")?;
+    if worktree_parse_entries(&malformed).is_ok() { return wtt_error(99,"Incomplete framing was accepted"); };
+    let invalid = ffi_buffer_new(4)?; invalid.push_u8(255)?; invalid.push_u8(0)?;
+    if worktree_parse_entries(&invalid).is_ok() { return wtt_error(99,"Invalid UTF-8 was accepted"); };
+    let result = json_doc_object()?; cli_put_string(&result,result.root(),"status","complete")?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def wtt_operation(state: &CliState, cwd: &str, mode: &str, target: &str, extra: &str) -> Result<JsonDoc,i64> {
+    if mode == "parse" { return wtt_parse_tests(); };
+    if mode == "session" {
+        let id = cli_state_create_session(state,cwd)?; let report = json_doc_object()?;
+        cli_put_string(&report,report.root(),"session",id.as_str())?;
+        Result { is_ok: true, value: report, error: 0 }
+    } else {
+        let mut policy = policy_default();
+        if mode == "inspect" or mode == "cancel" or mode == "cancel-delayed" or mode == "timeout" {
+            let mut job = worktree_inspect_start(cwd)?;
+            return wtt_complete(state,&mut policy,&mut job,mode);
+        };
+        let snapshot = wtt_inspect(state,cwd)?;
+        if cli_json_optional_string(snapshot.root(),"capability").as_str() != "ready" { return Result { is_ok: true, value: snapshot, error: 0 }; };
+        let operation = if mode == "create" or mode == "unapproved" or mode == "stale" or mode == "plan" or mode == "child" or mode == "plan-late" or mode == "lock-source" or mode == "lock-repo" { "create" } else { "remove" };
+        let branch = if mode == "create" { extra } else { "" };
+        if mode == "stale" { cli_put_string(&snapshot,snapshot.root(),"head","0000000000000000000000000000000000000000")?; (); };
+        let spec = worktree_mutation_spec(&snapshot,operation,target,branch);
+        if not spec.is_ok() { return wtt_error(spec.error,"Mutation specification refused"); };
+        let key = worktree_approval_key(&spec.value)?;
+        if mode == "plan" { policy.plan = true; };
+        if mode == "child" { policy.depth = 1; };
+        let mut held = FileLock { handle: 0 };
+        if mode == "lock-source" { held = cli_state_workspace_lock(state,cwd)?; };
+        if mode == "lock-target" { held = cli_state_workspace_lock(state,target)?; };
+        if mode == "lock-nested" { held = cli_state_workspace_lock(state,extra)?; };
+        if mode == "lock-repo" {
+            let common = cli_json_string(snapshot.root(),"common_dir")?;
+            let path = state_lock_path(state.path.as_str(),"git-worktrees",worktree_path_key(common.as_str())?.as_str())?;
+            held = file_lock(path.as_str())?;
+        };
+        if mode == "lock-session" {
+            let path = state_lock_path(state.path.as_str(),"session",extra)?; held = file_lock(path.as_str())?;
+        };
+        let started = worktree_start(state,&policy,spec.value,mode != "unapproved",key.as_str());
+        if not started.is_ok() { return wtt_error(started.error,"Start refused"); };
+        let mut job = started.value;
+        let result = wtt_complete(state,&mut policy,&mut job,mode)?;
+        worktree_close(&mut job)?;
+        Result { is_ok: true, value: result, error: 0 }
+    }
+}
+
+def main() -> i64 {
+    if args_len() < 3 { return 2; };
+    let database = cli_argument(0).unwrap_or(string_new());
+    let cwd = cli_argument(1).unwrap_or(string_new());
+    let mode = cli_argument(2).unwrap_or(string_new());
+    let target = cli_argument(3).unwrap_or(string_new());
+    let extra = cli_argument(4).unwrap_or(string_new());
+    let state = cli_state_open(database.as_str());
+    if not state.is_ok() { println(state.error); return 1; };
+    let result = wtt_operation(&state.value,cwd.as_str(),mode.as_str(),target.as_str(),extra.as_str());
+    if not result.is_ok() { println(result.error); return 1; };
+    let text = result.value.serialize_string();
+    if not text.is_ok() { return 1; };
+    println(text.value.as_str());
+    if sengoo_process_live_handle_count() != 0 { return 91; };
+    if sengoo_file_lock_live_count() != 0 { return 92; };
+    0
+}

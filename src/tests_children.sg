@@ -1,0 +1,156 @@
+import children;
+import std::args;
+
+def expect_child(value: bool, message: &str) -> i64 {
+    if value { return 0; };
+    cli_diagnostic(message);
+    1
+}
+
+def child_fixture(base: &str, connection: &str, model: &str, role: &str, cwd: &str) -> ChildOptions {
+    let key = cli_text("fixture-key-"); key.push_str(connection);
+    ChildOptions { cwd: cli_text(cwd), session: cli_text(model), connection: ProviderConnection { id: cli_text(connection), base: cli_text(base), model: cli_text(model), effort: string_new(), protocol: 0, images: false }, credential: key, role: cli_text(role), system: cli_text("Synthetic fixture. Report observed evidence."), prompt: cli_text("Read the assigned fixture and report.") }
+}
+
+def child_pump(manager: &Children, scheduler: &Scheduler, parent: i64, goal: &mut GoalState) -> Result<bool, i64> {
+    children_wait(manager, scheduler, parent, goal, 0)?;
+    let mut index = 0;
+    while index < manager.tasks.len() {
+        let task: &ChildTask = manager.tasks.get(index);
+        let claimed = children_next_tool(manager, task.id, scheduler)?;
+        if claimed.root().object_get("available")?.bool_value()? {
+            let call = claimed.root().object_get("call")?;
+            let name = cli_json_string(call, "name")?;
+            let args = json_parse(cli_json_string(call, "arguments")?.as_str())?;
+            let output = workspace_file_tool(task.options.cwd.as_str(), name.as_str(), &args)?;
+            children_complete_tool(manager, task.id, cli_json_string(call, "id")?.as_str(), &output, scheduler)?;
+            ();
+        };
+        index = index + 1;
+    };
+    children_take_events(manager)?;
+    Result { is_ok: true, value: children_done(manager, parent), error: 0 }
+}
+
+def child_await(manager: &Children, scheduler: &Scheduler, parent: i64, goal: &mut GoalState) -> Result<bool, i64> {
+    let started = time_unix_ms();
+    while not children_done(manager, parent) {
+        child_pump(manager, scheduler, parent, goal)?;
+        if time_since_ms(started) > 15000 { children_cancel_all(manager, scheduler, goal)?; return Result { is_ok: false, value: false, error: 11 }; };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def verify_children(base: &str) -> Result<i64, i64> {
+    println("children: start five");
+    let mut failures = 0;
+    let policy = policy_default();
+    let scheduler = scheduler_new();
+    let parent = scheduler_add(&scheduler, 0, "parent", ".", true)?;
+    scheduler_acquire_model(&scheduler, parent)?;
+    scheduler_acquire_write(&scheduler, parent)?;
+    let manager = children_new();
+    let one = children_start(&manager, &scheduler, parent, &policy, child_fixture(base, "a", "child-one", "explore", "."))?;
+    println("children: first queued");
+    let two = children_start(&manager, &scheduler, parent, &policy, child_fixture(base, "a", "child-two", "plan", "."))?;
+    let three = children_start(&manager, &scheduler, parent, &policy, child_fixture(base, "a", "child-three", "explore", "."))?;
+    children_start(&manager, &scheduler, parent, &policy, child_fixture(base, "b", "child-four", "explore", "."))?;
+    children_start(&manager, &scheduler, parent, &policy, child_fixture(base, "c", "child-five", "explore", "."))?;
+    let listed = children_list(&manager)?;
+    let mut goal = goal_new(50, 0);
+    failures = failures + expect_child(listed.root().object_get("children")?.array_len()? == 5 and manager.active.len() == 0 and goal.requests == 0, "Start returns stable child ids before any request or blocking wait");
+    println("children: initial parallel streams");
+    child_await(&manager, &scheduler, parent, &mut goal)?;
+    failures = failures + expect_child(goal.requests == 5 and goal.tokens == 125 and scheduler_model_count(&scheduler, "") == 0, "Parallel children share the exact root request and usage budgets");
+    let reports = children_list(&manager)?;
+    let items = reports.root().object_get("children")?;
+    let mut index = 0;
+    while index < items.array_len()? {
+        let report = items.array_get(index)?;
+        failures = failures + expect_child(report.object_get("done")?.bool_value()? and cli_json_optional_i64(report, "error", -1) == 0 and cli_json_string(report, "content")?.as_str() == "子任务😀", "Each independent child retains its own successful Unicode report");
+        failures = failures + expect_child(cli_json_string(report, "session_id")?.len() > 0 and cli_json_string(report, "connection_id")?.len() > 0 and cli_json_string(report, "model")?.len() > 0, "Child report retains captured provider/model/session attribution");
+        index = index + 1;
+    };
+    failures = failures + expect_child(not str_contains(reports.serialize_string()?.as_str(), "fixture-key-"), "Child list and reports exclude credentials");
+    let nested = children_start(&manager, &scheduler, one, &policy, child_fixture(base, "b", "nested", "general", "."));
+    failures = failures + expect_child(not nested.is_ok(), "Children cannot create a second level");
+    failures = failures + expect_child(not scheduler_acquire_write(&scheduler, two).is_ok(), "Read-only child never acquires a write permit");
+
+    let tools = children_new();
+    println("children: read-only tools");
+    let reader = children_start(&tools, &scheduler, parent, &policy, child_fixture(base, "a", "read-file", "explore", "."))?;
+    let readonly = children_start(&tools, &scheduler, parent, &policy, child_fixture(base, "b", "deny-write", "explore", "."))?;
+    let mut tools_goal = goal_new(50, 0);
+    child_await(&tools, &scheduler, parent, &mut tools_goal)?;
+    let read_report = children_result(&tools, reader)?;
+    let denied_report = children_result(&tools, readonly)?;
+    failures = failures + expect_child(cli_json_string(read_report.root(), "content")?.as_str() == "observed fixture text" and tools_goal.requests == 4 and tools_goal.tokens == 100, "Read-only child reads real files and continues with tool-result context");
+    failures = failures + expect_child(cli_json_string(denied_report.root(), "content")?.as_str() == "denials observed" and not file_exists("forbidden.txt"), "Child cannot write, spawn, or alter the parent plan even when a provider requests it");
+
+    let writers = children_new();
+    println("children: writers");
+    let writer_one = children_start(&writers, &scheduler, parent, &policy, child_fixture(base, "a", "write-one", "general", "."))?;
+    let writer_two = children_start(&writers, &scheduler, parent, &policy, child_fixture(base, "b", "write-two", "general", "."))?;
+    let mut write_goal = goal_new(50, 0);
+    let started = time_unix_ms();
+    while children_flag(writers.tasks.get(0), 0) != 2 or children_flag(writers.tasks.get(1), 0) != 2 {
+        children_wait(&writers, &scheduler, parent, &mut write_goal, 0)?;
+        children_take_events(&writers)?;
+        if time_since_ms(started) > 15000 { return Result { is_ok: false, value: failures, error: 11 }; };
+        time_sleep_ms(1);
+    };
+    let first_tool = children_next_tool(&writers, writer_two, &scheduler)?;
+    let queued_tool = children_next_tool(&writers, writer_one, &scheduler)?;
+    failures = failures + expect_child(first_tool.root().object_get("available")?.bool_value()? and not queued_tool.root().object_get("available")?.bool_value()?, "Cwd writer queue follows tool-arrival order independently of child id");
+    let first_call = first_tool.root().object_get("call")?;
+    let first_args = json_parse(cli_json_string(first_call, "arguments")?.as_str())?;
+    let directory = canonical_path_string(".")?;
+    let first_result = workspace_file_tool(directory.as_str(), "write_file", &first_args)?;
+    let wrong = children_complete_tool(&writers, writer_two, "wrong-call-id", &first_result, &scheduler);
+    failures = failures + expect_child(not wrong.is_ok() and wrong.error == 2, "Completion is bound to the claimed call id");
+    children_complete_tool(&writers, writer_two, cli_json_string(first_call, "id")?.as_str(), &first_result, &scheduler)?;
+    let duplicate = children_complete_tool(&writers, writer_two, cli_json_string(first_call, "id")?.as_str(), &first_result, &scheduler);
+    failures = failures + expect_child(not duplicate.is_ok(), "Tool completion cannot replay a claim");
+    child_await(&writers, &scheduler, parent, &mut write_goal)?;
+    failures = failures + expect_child(file_exists("write-one.txt") and file_exists("write-two.txt") and write_goal.requests == 4, "Two approved writers execute after separate cwd permits and continue independently");
+
+    let slow = children_new();
+    println("children: cancellation");
+    let slow_one = children_start(&slow, &scheduler, parent, &policy, child_fixture(base, "a", "slow-one", "explore", "."))?;
+    children_start(&slow, &scheduler, parent, &policy, child_fixture(base, "b", "slow-two", "explore", "."))?;
+    let mut cancel_goal = goal_new(50, 0);
+    children_wait(&slow, &scheduler, parent, &mut cancel_goal, 50)?;
+    children_cancel(&slow, slow_one, &scheduler, &mut cancel_goal)?;
+    scheduler_cancel_tree(&scheduler, parent);
+    children_poll(&slow, &scheduler, &mut cancel_goal)?;
+    failures = failures + expect_child(children_done(&slow, parent) and cli_json_optional_i64(children_result(&slow, slow_one)?.root(), "error", 0) == 19, "Cancel one child or its parent closes real streams and returns stable status");
+
+    let limited_scheduler = scheduler_new();
+    println("children: budget");
+    let limited_parent = scheduler_add(&limited_scheduler, 0, "parent", ".", true)?;
+    let limited = children_new();
+    children_start(&limited, &limited_scheduler, limited_parent, &policy, child_fixture(base, "a", "budget-one", "explore", "."))?;
+    children_start(&limited, &limited_scheduler, limited_parent, &policy, child_fixture(base, "b", "budget-two", "explore", "."))?;
+    let mut limited_goal = goal_new(1, 0);
+    child_await(&limited, &limited_scheduler, limited_parent, &mut limited_goal)?;
+    failures = failures + expect_child(limited_goal.status == 3 and limited_goal.requests == 1 and children_done(&limited, limited_parent), "Child requests cannot escape the root budget");
+    let until = time_unix_ms() + 3000;
+    while sengoo_net_stream_live_workers() != 0 and time_unix_ms() < until { time_sleep_ms(2); };
+    failures = failures + expect_child(sengoo_net_stream_live_handles() == 0 and sengoo_net_stream_live_workers() == 0, "All child stream handles and workers are cleaned");
+    cli_ok(failures)
+}
+
+def children_entry() -> Result<i64, i64> {
+    let buffer = ffi_buffer_new(32768)?;
+    let count = arg_copy(0, buffer)?;
+    let base = string_from_buffer(buffer, count)?;
+    verify_children(base.as_str())
+}
+
+def main() -> i64 {
+    let verified = children_entry();
+    if not verified.is_ok() { println(verified.error); return 1; };
+    if verified.value == 0 { println("asynchronous children acceptance passed"); };
+    verified.value
+}

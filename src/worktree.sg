@@ -1,0 +1,566 @@
+import state;
+import executor;
+import policy;
+
+// Explicit user operations only; deliberately absent from all model tool lists.
+struct WorktreeSpec { snapshot: JsonDoc, operation: String, target: String, branch: String }
+struct WorktreeSessionLease { lease: FileLock }
+struct WorktreeJob {
+    spec: WorktreeSpec,
+    report: JsonDoc,
+    executable: String,
+    cwd: String,
+    filters: Vec<String>,
+    process: ProcessHandle,
+    stdout: Buffer,
+    stderr: Buffer,
+    chunk: Buffer,
+    repository_lease: FileLock,
+    source_lease: FileLock,
+    target_lease: FileLock,
+    session_leases: Vec<WorktreeSessionLease>,
+    guard_db: SqliteDb,
+    transaction: SqliteTransaction,
+    step: i64,
+    started_at: i64,
+    command_started_at: i64,
+    command_timeout_ms: i64,
+    overall_timeout_ms: i64,
+    running: bool,
+    done: bool,
+    cancelled: bool,
+    mutation_started: bool,
+    cleanup_unknown: bool,
+}
+impl !Send for WorktreeJob {}
+impl !Sync for WorktreeJob {}
+
+def worktree_text_valid(text: &str, maximum: i64, empty: bool) -> bool {
+    if text.len() > maximum or not empty and text.len() == 0 { return false; };
+    let owned = cli_text(text); let bytes = owned.bytes();
+    loop { let byte = bytes.next(); if not byte.is_some { break; }; if byte.value == 0 { return false; }; };
+    true
+}
+
+def worktree_document_copy(value: &JsonDoc) -> Result<JsonDoc, i64> {
+    let text = value.serialize_string()?; json_parse(text.as_str())
+}
+
+def worktree_path_key(path: &str) -> Result<String, i64> {
+    let normalized = path_normalize_string(path)?;
+    if env_is_windows() { str_to_ascii_lower(normalized.as_str()) } else { Result { is_ok: true, value: normalized, error: 0 } }
+}
+
+def worktree_contains(parent: &str, candidate: &str) -> Result<bool, i64> {
+    let root = worktree_path_key(parent)?; let target = worktree_path_key(candidate)?;
+    let separator = if env_is_windows() { "\\" } else { "/" };
+    let prefix = if str_ends_with(root.as_str(), separator) { root.clone()? } else { cli_join(root.as_str(), separator)? };
+    Result { is_ok: true, value: root.as_str() == target.as_str() or str_starts_with(target.as_str(), prefix.as_str()), error: 0 }
+}
+
+def worktree_local_directory(path: &str) -> Result<String, i64> {
+    if not worktree_text_valid(path, 32768, false) or not path_is_absolute(path) or str_starts_with(path,"\\\\") or str_starts_with(path,"//") { return string_result_err(7); };
+    let mut current = path_normalize_string(path)?;
+    let mut depth = 0;
+    loop {
+        if file_kind(current.as_str())? != PATH_KIND_DIR() { return string_result_err(7); };
+        if env_is_windows() and current.len() == 3 and str_contains(current.as_str(), ":") { break; };
+        let parent = path_parent_string(current.as_str())?;
+        if parent.len() == 0 or parent.as_str() == current.as_str() { break; };
+        current = parent; depth = depth + 1;
+        if depth > 128 { return string_result_err(13); };
+    };
+    canonical_path_string(path)
+}
+
+def worktree_target_path(cwd: &str, target: &str, create: bool) -> Result<String, i64> {
+    if not worktree_text_valid(target, 32768, false) { return string_result_err(2); };
+    let absolute = if path_is_absolute(target) { path_normalize_string(target)? } else { path_normalize_string(path_join_string(cwd,target)?.as_str())? };
+    if str_starts_with(absolute.as_str(),"\\\\") or str_starts_with(absolute.as_str(),"//") or absolute.len() <= 3 { return string_result_err(7); };
+    if not create { return worktree_local_directory(absolute.as_str()); };
+    let kind = file_kind(absolute.as_str());
+    if kind.is_ok() or kind.error != 5 { return string_result_err(7); };
+    let parent = worktree_local_directory(path_parent_string(absolute.as_str())?.as_str())?;
+    let name = path_file_name_string(absolute.as_str())?;
+    if name.len() == 0 or name.as_str() == "." or name.as_str() == ".." { return string_result_err(7); };
+    path_join_string(parent.as_str(),name.as_str())
+}
+
+def worktree_empty_spec() -> WorktreeSpec {
+    WorktreeSpec { snapshot: JsonDoc { handle: 0 }, operation: String { handle: 0 }, target: String { handle: 0 }, branch: String { handle: 0 } }
+}
+
+def worktree_spec_error(code: i64) -> Result<WorktreeSpec,i64> {
+    Result { is_ok: false, value: worktree_empty_spec(), error: code }
+}
+
+def worktree_find_entry(report: &JsonDoc, target: &str) -> Result<i64,i64> {
+    let entries = report.root().object_get("worktrees")?;
+    let mut index = 0;
+    let key = worktree_path_key(target)?;
+    while index < entries.array_len()? {
+        let path = cli_json_string(entries.array_get(index)?,"path")?;
+        if worktree_path_key(path.as_str())?.as_str() == key.as_str() { return cli_ok(index); };
+        index = index + 1;
+    };
+    cli_fail(5)
+}
+
+def worktree_mutation_spec(report: &JsonDoc, operation: &str, target: &str, branch: &str) -> Result<WorktreeSpec,i64> {
+    if cli_json_optional_string(report.root(),"capability").as_str() != "ready" or operation != "create" and operation != "remove" or not worktree_text_valid(branch,1024,true) or operation == "remove" and branch.len() > 0 { return worktree_spec_error(2); };
+    let cwd = cli_json_string(report.root(),"cwd")?;
+    let destination = worktree_target_path(cwd.as_str(),target,operation == "create")?;
+    let common = cli_json_string(report.root(),"common_dir")?;
+    if worktree_contains(common.as_str(),destination.as_str())? { return worktree_spec_error(7); };
+    if operation == "remove" {
+        let index = worktree_find_entry(report,destination.as_str())?;
+        if index == 0 or worktree_contains(destination.as_str(),cwd.as_str())? { return worktree_spec_error(7); };
+        let item = report.root().object_get("worktrees")?.array_get(index)?;
+        if cli_json_optional_i64(item,"locked",0) == 1 or cli_json_optional_i64(item,"prunable",0) == 1 or cli_json_optional_i64(item,"bare",0) == 1 { return worktree_spec_error(7); };
+    };
+    Result { is_ok: true, value: WorktreeSpec { snapshot: worktree_document_copy(report)?, operation: cli_text(operation), target: destination, branch: cli_text(branch) }, error: 0 }
+}
+
+def worktree_preview(spec: &WorktreeSpec) -> Result<String,i64> {
+    if spec.operation.as_str() != "create" and spec.operation.as_str() != "remove" { return string_result_err(2); };
+    let document = json_doc_object()?;
+    cli_put_i64(&document,document.root(),"schema",1)?;
+    cli_put_string(&document,document.root(),"operation",spec.operation.as_str())?;
+    cli_put_string(&document,document.root(),"target",spec.target.as_str())?;
+    cli_put_string(&document,document.root(),"branch",spec.branch.as_str())?;
+    let source = document.new_object()?; document.root().object_set("source",source)?;
+    let keys = json_parse("[\"executable\",\"cwd\",\"checkout\",\"common_dir\",\"head\"]")?;
+    let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        let value = cli_json_string(spec.snapshot.root(),key.as_str())?;
+        cli_put_string(&document,source,key.as_str(),value.as_str())?; index = index + 1;
+    };
+    if spec.operation.as_str() == "remove" {
+        let selected = worktree_find_entry(&spec.snapshot,spec.target.as_str())?;
+        document.root().object_set("target_entry",document.copy(spec.snapshot.root().object_get("worktrees")?.array_get(selected)?)?)?;
+        ();
+    };
+    cli_put_string(&document,document.root(),"environment_policy","system-allowlist-no-provider-credentials")?;
+    let output = document.serialize_string()?;
+    if output.len() > 262144 { return string_result_err(13); };
+    Result { is_ok: true, value: output, error: 0 }
+}
+
+def worktree_approval_key(spec: &WorktreeSpec) -> Result<String,i64> {
+    let preview = worktree_preview(spec)?; state_digest(preview.as_str())
+}
+
+def worktree_job_empty() -> WorktreeJob {
+    let filters: Vec<String> = vec_new(); let leases: Vec<WorktreeSessionLease> = vec_new();
+    WorktreeJob { spec: worktree_empty_spec(), report: JsonDoc { handle: 0 }, executable: String { handle: 0 }, cwd: String { handle: 0 }, filters: filters, process: ProcessHandle { handle: 0 }, stdout: Buffer { handle: 0 }, stderr: Buffer { handle: 0 }, chunk: Buffer { handle: 0 }, repository_lease: FileLock { handle: 0 }, source_lease: FileLock { handle: 0 }, target_lease: FileLock { handle: 0 }, session_leases: leases, guard_db: SqliteDb { handle: 0 }, transaction: SqliteTransaction { handle: 0 }, step: 0, started_at: 0, command_started_at: 0, command_timeout_ms: 30000, overall_timeout_ms: 120000, running: false, done: true, cancelled: false, mutation_started: false, cleanup_unknown: false }
+}
+
+def worktree_job_error(code: i64) -> Result<WorktreeJob,i64> {
+    Result { is_ok: false, value: worktree_job_empty(), error: code }
+}
+
+def worktree_system_env(command: &ProcessCommand, name: &str) -> Result<bool,i64> {
+    if not env_has_var(name) { return Result { is_ok: true, value: true, error: 0 }; };
+    let buffer = ffi_buffer_new(32768)?; let count = env_var_copy(name,buffer)?;
+    command.env_set(name,string_from_buffer(buffer,count)?.as_str())
+}
+
+def worktree_git_builder(job: &WorktreeJob, cwd: &str, filters: bool) -> Result<ProcessCommand,i64> {
+    let command = executor_git_builder(job.executable.as_str(),cwd)?;
+    command.env_clear()?;
+    worktree_system_env(&command,"SystemRoot")?; worktree_system_env(&command,"WINDIR")?;
+    worktree_system_env(&command,"PATH")?; worktree_system_env(&command,"PATHEXT")?;
+    worktree_system_env(&command,"ComSpec")?; worktree_system_env(&command,"TEMP")?; worktree_system_env(&command,"TMP")?;
+    worktree_system_env(&command,"USERPROFILE")?; worktree_system_env(&command,"HOMEDRIVE")?; worktree_system_env(&command,"HOMEPATH")?;
+    command.env_set("GIT_TERMINAL_PROMPT","0")?; command.env_set("GIT_NO_LAZY_FETCH","1")?;
+    command.env_set("GIT_CONFIG_NOSYSTEM","1")?; command.env_set("GIT_CONFIG_GLOBAL",if env_is_windows() { "NUL" } else { "/dev/null" })?;
+    command.env_set("GIT_PAGER","cat")?;
+    command.arg("-c")?; command.arg(if env_is_windows() { "core.hooksPath=NUL" } else { "core.hooksPath=/dev/null" })?;
+    command.arg("-c")?; command.arg("core.fsmonitor=false")?;
+    command.arg("-c")?; command.arg("core.pager=false")?;
+    command.arg("-c")?; command.arg("core.autocrlf=false")?;
+    command.arg("-c")?; command.arg("protocol.allow=never")?;
+    command.arg("-c")?; command.arg("protocol.file.allow=never")?;
+    command.arg("-c")?; command.arg("diff.external=")?;
+    if filters {
+        let mut index = 0;
+        while index < job.filters.len() {
+            let key = job.filters.get(index)?;
+            let value = cli_join(key.as_str(),if str_ends_with(key.as_str(),".required") { "=false" } else { "=" })?;
+            command.arg("-c")?; command.arg(value.as_str())?; index = index + 1;
+        };
+    };
+    Result { is_ok: true, value: command, error: 0 }
+}
+
+def worktree_launch(job: &mut WorktreeJob, step: i64) -> Result<bool,i64> {
+    let cwd = if step == 7 { job.spec.target.clone()? } else { job.cwd.clone()? };
+    let command = worktree_git_builder(job,cwd.as_str(),step >= 6)?;
+    if step == 0 { command.arg("rev-parse")?; command.arg("--is-bare-repository")?; }
+    else if step == 1 { command.arg("rev-parse")?; command.arg("--path-format=absolute")?; command.arg("--show-toplevel")?; }
+    else if step == 2 { command.arg("rev-parse")?; command.arg("--path-format=absolute")?; command.arg("--git-common-dir")?; }
+    else if step == 3 { command.arg("rev-parse")?; command.arg("--verify")?; command.arg("HEAD")?; }
+    else if step == 4 or step == 9 { command.arg("worktree")?; command.arg("list")?; command.arg("--porcelain")?; command.arg("-z")?; }
+    else if step == 5 { command.arg("config")?; command.arg("--null")?; command.arg("--name-only")?; command.arg("--get-regexp")?; command.arg("^filter\\..*\\.(clean|smudge|process|required)$")?; }
+    else if step == 6 { command.arg("check-ref-format")?; let reference = cli_join("refs/heads/",job.spec.branch.as_str())?; command.arg(reference.as_str())?; }
+    else if step == 7 { command.arg("status")?; command.arg("--porcelain=v1")?; command.arg("-z")?; command.arg("--untracked-files=all")?; command.arg("--ignored=matching")?; command.arg("--ignore-submodules=all")?; }
+    else if step == 8 {
+        command.arg("worktree")?;
+        if job.spec.operation.as_str() == "create" {
+            command.arg("add")?;
+            if job.spec.branch.len() == 0 { command.arg("--detach")?; (); } else { command.arg("-b")?; command.arg(job.spec.branch.as_str())?; (); };
+            command.arg("--")?; command.arg(job.spec.target.as_str())?;
+            command.arg(cli_json_string(job.spec.snapshot.root(),"head")?.as_str())?;
+        } else { command.arg("remove")?; command.arg("--")?; command.arg(job.spec.target.as_str())?; };
+    } else { return state_bool_error(2); };
+    job.stdout.clear(); job.stderr.clear();
+    job.process = command.spawn_piped()?; job.process.close_stdin()?;
+    job.step = step; job.running = true; job.command_started_at = time_unix_ms();
+    if step == 8 { job.mutation_started = true; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def worktree_release(job: &mut WorktreeJob) -> bool {
+    let mut clean = true;
+    if job.process.handle != 0 {
+        let finished = job.process.try_wait();
+        let quiet = job.process.tree_quiescent();
+        if not finished.is_ok() or not finished.value or not quiet.is_ok() or not quiet.value {
+            let killed = job.process.terminate_tree(); let reaped = job.process.reap(5000);
+            if not killed.is_ok() or not reaped.is_ok() { clean = false; };
+            let started = time_unix_ms(); let mut stopped = job.process.tree_quiescent();
+            while stopped.is_ok() and not stopped.value and time_since_ms(started) < 5000 { time_sleep_ms(1); stopped = job.process.tree_quiescent(); };
+            if not stopped.is_ok() or not stopped.value { clean = false; };
+        };
+        if clean {
+            let token = job.process.handle; job.process.handle = 0;
+            if sengoo_process_handle_close(token) != 0 { clean = false; };
+        } else { job.process.handle = 0; };
+    };
+    job.running = false;
+    if job.transaction.handle != 0 {
+        job.transaction.rollback(); let token = job.transaction.handle; job.transaction.handle = 0; sgsqlite_tx_close(token); ();
+    };
+    if job.guard_db.handle != 0 { let token = job.guard_db.handle; job.guard_db.handle = 0; sgsqlite_db_close(token); (); };
+    loop {
+        let next = job.session_leases.pop(); if not next.is_some { break; };
+        let mut held = next.value;
+        if clean { held.lease.close(); (); } else { held.lease.handle = 0; };
+    };
+    if clean {
+        if job.target_lease.handle != 0 { job.target_lease.close(); (); };
+        if job.source_lease.handle != 0 { job.source_lease.close(); (); };
+        if job.repository_lease.handle != 0 { job.repository_lease.close(); (); };
+    } else {
+        // Keep native lock owners until process exit if child cleanup is unknown.
+        job.target_lease.handle = 0; job.source_lease.handle = 0; job.repository_lease.handle = 0; job.cleanup_unknown = true;
+    };
+    clean
+}
+
+def worktree_finish(job: &mut WorktreeJob, status: &str, code: i64, message: &str) -> Result<bool,i64> {
+    let clean = worktree_release(job); job.done = true;
+    cli_put_string(&job.report,job.report.root(),"status",if clean { status } else { "cleanup_unknown" })?;
+    cli_put_i64(&job.report,job.report.root(),"code",if clean { code } else { 7 })?;
+    cli_put_string(&job.report,job.report.root(),"message",if clean { message } else { "Git process cleanup is unknown; workspace locks remain until this CLI exits" })?;
+    cli_put_bool(&job.report,job.report.root(),"mutation_started",job.mutation_started)?;
+    cli_put_bool(&job.report,job.report.root(),"refresh_required",job.mutation_started)?;
+    if job.stderr.used_len() > 0 {
+        let mut count = if job.stderr.used_len() > 65536 { 65536 } else { job.stderr.used_len() };
+        let mut attempts = 0; let mut inserted = false;
+        while attempts < 4 and count > 0 {
+            let copy = cli_bytes_text(&job.stderr,0,count)?;
+            let valid = ffi_buffer_from_bytes(copy.as_str())?;
+            if valid.is_utf8() { cli_put_string(&job.report,job.report.root(),"git_stderr",copy.as_str())?; inserted = true; break; };
+            count = count - 1; attempts = attempts + 1;
+        };
+        if not inserted { cli_put_string(&job.report,job.report.root(),"git_stderr","[Git stderr contains non-UTF-8 bytes]")?; (); };
+        cli_put_bool(&job.report,job.report.root(),"git_stderr_truncated",job.stderr.used_len() > count)?;
+        ();
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def worktree_inspect_start(cwd: &str) -> Result<WorktreeJob,i64> {
+    let directory = worktree_local_directory(cwd)?;
+    let mut job = worktree_job_empty();
+    job.report = json_doc_object()?; job.cwd = directory;
+    job.stdout = ffi_buffer_new(1048576)?; job.stderr = ffi_buffer_new(1048576)?; job.chunk = ffi_buffer_new(8192)?;
+    job.spec.operation = cli_text("inspect"); job.done = false; job.started_at = time_unix_ms();
+    cli_put_i64(&job.report,job.report.root(),"schema",1)?;
+    cli_put_string(&job.report,job.report.root(),"operation","inspect")?;
+    cli_put_string(&job.report,job.report.root(),"cwd",job.cwd.as_str())?;
+    cli_put_string(&job.report,job.report.root(),"status","running")?;
+    let executable = executor_git_executable(job.cwd.as_str());
+    if not executable.is_ok() {
+        cli_put_string(&job.report,job.report.root(),"capability","missing_git")?;
+        worktree_finish(&mut job,"unsupported",5,"Git was not found in an absolute PATH entry outside this workspace")?;
+        return Result { is_ok: true, value: job, error: 0 };
+    };
+    job.executable = executable.value;
+    cli_put_string(&job.report,job.report.root(),"executable",job.executable.as_str())?;
+    worktree_launch(&mut job,0)?;
+    Result { is_ok: true, value: job, error: 0 }
+}
+
+def worktree_start(state: &CliState, policy: &AgentPolicy, spec: WorktreeSpec, approved: bool, approval_key: &str) -> Result<WorktreeJob,i64> {
+    if policy.plan or policy.depth != 0 or not policy.interactive or not approved { return worktree_job_error(7); };
+    if approval_key.len() != 64 or worktree_approval_key(&spec)?.as_str() != approval_key { return worktree_job_error(7); };
+    let cwd = cli_json_string(spec.snapshot.root(),"cwd")?;
+    let revalidated = worktree_mutation_spec(&spec.snapshot,spec.operation.as_str(),spec.target.as_str(),spec.branch.as_str())?;
+    if worktree_approval_key(&revalidated)?.as_str() != approval_key { return worktree_job_error(7); };
+    let mut job = worktree_inspect_start(cwd.as_str())?;
+    if job.done { return Result { is_ok: true, value: job, error: 0 }; };
+    job.spec = spec;
+    cli_put_string(&job.report,job.report.root(),"operation",job.spec.operation.as_str())?;
+    cli_put_string(&job.report,job.report.root(),"target",job.spec.target.as_str())?;
+    Result { is_ok: true, value: job, error: 0 }
+}
+
+def worktree_line(buffer: &Buffer) -> Result<String,i64> {
+    let mut count = buffer.used_len();
+    if count == 0 { return string_result_err(2); };
+    if buffer.get_u8(count - 1)? == 10 { count = count - 1; if count > 0 and buffer.get_u8(count - 1)? == 13 { count = count - 1; }; };
+    let text = cli_bytes_text(buffer,0,count)?;
+    if not worktree_text_valid(text.as_str(),32768,false) { return string_result_err(2); };
+    let bytes = ffi_buffer_from_bytes(text.as_str())?;
+    if not bytes.is_utf8() { return string_result_err(20); };
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def worktree_parse_entries(buffer: &Buffer) -> Result<JsonDoc,i64> {
+    let document = json_doc_object()?; let entries = document.new_array()?;
+    document.root().object_set("worktrees",entries)?;
+    let mut current = document.new_object()?; let mut in_entry = false;
+    let mut offset = 0;
+    while offset < buffer.used_len() {
+        let mut end = offset;
+        while end < buffer.used_len() and buffer.get_u8(end)? != 0 { end = end + 1; };
+        if end == buffer.used_len() { return Result { is_ok: false, value: document, error: 2 }; };
+        let field = cli_bytes_text(buffer,offset,end - offset)?;
+        let valid = ffi_buffer_from_bytes(field.as_str())?;
+        if not valid.is_utf8() { return Result { is_ok: false, value: document, error: 20 }; };
+        if field.len() == 0 {
+            if in_entry { entries.array_push(current)?; current = document.new_object()?; in_entry = false; };
+        } else if str_starts_with(field.as_str(),"worktree ") {
+            if in_entry { return Result { is_ok: false, value: document, error: 2 }; };
+            if entries.array_len()? >= 1024 { return Result { is_ok: false, value: document, error: 13 }; };
+            let path = cli_byte_slice(field.as_str(),9,field.len())?;
+            cli_put_string(&document,current,"path",path.as_str())?;
+            cli_put_i64(&document,current,"locked",0)?; cli_put_i64(&document,current,"prunable",0)?; cli_put_i64(&document,current,"bare",0)?;
+            in_entry = true;
+        } else if not in_entry { return Result { is_ok: false, value: document, error: 2 }; }
+        else if str_starts_with(field.as_str(),"HEAD ") { cli_put_string(&document,current,"head",cli_byte_slice(field.as_str(),5,field.len())?.as_str())?; (); }
+        else if str_starts_with(field.as_str(),"branch ") { cli_put_string(&document,current,"branch",cli_byte_slice(field.as_str(),7,field.len())?.as_str())?; (); }
+        else if field.as_str() == "detached" { cli_put_string(&document,current,"branch","")?; (); }
+        else if field.as_str() == "bare" { cli_put_i64(&document,current,"bare",1)?; (); }
+        else if field.as_str() == "locked" or str_starts_with(field.as_str(),"locked ") { cli_put_i64(&document,current,"locked",1)?; (); }
+        else if field.as_str() == "prunable" or str_starts_with(field.as_str(),"prunable ") { cli_put_i64(&document,current,"prunable",1)?; (); }
+        else { return Result { is_ok: false, value: document, error: 2 }; };
+        offset = end + 1;
+    };
+    if in_entry { return Result { is_ok: false, value: document, error: 2 }; };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def worktree_parse_filters(job: &mut WorktreeJob) -> Result<bool,i64> {
+    let mut offset = 0;
+    while offset < job.stdout.used_len() {
+        let mut end = offset;
+        while end < job.stdout.used_len() and job.stdout.get_u8(end)? != 0 { end = end + 1; };
+        if end == job.stdout.used_len() or job.filters.len() >= 256 { return state_bool_error(13); };
+        let key = cli_bytes_text(&job.stdout,offset,end - offset)?;
+        let valid = ffi_buffer_from_bytes(key.as_str())?;
+        if not valid.is_utf8() or not worktree_text_valid(key.as_str(),8192,false) or str_contains(key.as_str(),"=") or not str_starts_with(key.as_str(),"filter.") { return state_bool_error(7); };
+        if not (str_ends_with(key.as_str(),".clean") or str_ends_with(key.as_str(),".smudge") or str_ends_with(key.as_str(),".process") or str_ends_with(key.as_str(),".required")) { return state_bool_error(7); };
+        if not job.filters.push(key) { return state_bool_error(13); };
+        offset = end + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def worktree_source_matches(job: &WorktreeJob) -> Result<bool,i64> {
+    let keys = json_parse("[\"executable\",\"cwd\",\"checkout\",\"common_dir\",\"head\"]")?;
+    let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        let expected = cli_json_string(job.spec.snapshot.root(),key.as_str())?;
+        let actual = cli_json_string(job.report.root(),key.as_str())?;
+        if expected.as_str() != actual.as_str() { return state_bool_error(7); };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def worktree_session_guard(state: &CliState, job: &mut WorktreeJob) -> Result<bool,i64> {
+    // Reserve the writer before reading sessions. Zero rows change, no triggers
+    // run, and new session/execution writers cannot race the final Git command.
+    job.guard_db = sqlite_open(state.path.as_str())?;
+    job.guard_db.set_context("instance_id",state.instance.as_str())?;
+    job.guard_db.busy_timeout(0)?;
+    let begun = job.guard_db.transaction();
+    if not begun.is_ok() { return state_bool_error(begun.error); };
+    job.transaction = begun.value;
+    job.transaction.exec("UPDATE shared_executions SET active=active WHERE 0")?;
+    let mut sessions = job.transaction.prepare("SELECT s.id,p.directory,COALESCE(w.checkout_path,'') FROM sessions s JOIN projects p ON p.id=s.project_id LEFT JOIN task_workspaces w ON w.session_id=s.id ORDER BY s.id LIMIT 10001")?;
+    let workspaces = json_doc_object()?;
+    cli_put_bool(&workspaces,workspaces.root(),worktree_path_key(job.spec.target.as_str())?.as_str(),true)?;
+    let mut scanned = 0;
+    while sessions.step()? {
+        scanned = scanned + 1; if scanned > 10000 { return state_bool_error(13); };
+        let id = sessions.text(0)?; let directory = sessions.text(1)?; let checkout = sessions.text(2)?;
+        if not worktree_contains(job.spec.target.as_str(),directory.as_str())? and (checkout.len() == 0 or not worktree_contains(job.spec.target.as_str(),checkout.as_str())?) { continue; };
+        if job.session_leases.len() >= 128 { return state_bool_error(13); };
+        let path = state_lock_path(state.path.as_str(),"session",id.as_str())?;
+        let lease = file_lock(path.as_str())?;
+        let held = WorktreeSessionLease { lease: lease };
+        if not job.session_leases.push(held) { return state_bool_error(13); };
+        // An idle explicit terminal can hold a nested project's workspace lock
+        // without a running session execution. Guard all known target project
+        // roots as well as the checkout root, with duplicate identities folded.
+        let directory_key = worktree_path_key(directory.as_str())?;
+        if worktree_contains(job.spec.target.as_str(),directory.as_str())? and not workspaces.root().object_has(directory_key.as_str()) {
+            let workspace_path = state_lock_path(state.path.as_str(),"workspace",canonical_path_string(directory.as_str())?.as_str())?;
+            let workspace_lease = file_lock(workspace_path.as_str())?;
+            let held_workspace = WorktreeSessionLease { lease: workspace_lease };
+            if not job.session_leases.push(held_workspace) { return state_bool_error(13); };
+            cli_put_bool(&workspaces,workspaces.root(),directory_key.as_str(),true)?;
+            ();
+        };
+        let mut active = job.transaction.prepare("SELECT 1 FROM shared_executions WHERE session_id=? AND (active=1 OR cleanup_required=1) UNION ALL SELECT 1 FROM sessions WHERE id=? AND run_state='running' UNION ALL SELECT 1 FROM shared_tool_ledger WHERE session_id=? AND state='running' UNION ALL SELECT 1 FROM meeting_runs WHERE session_id=? AND state NOT IN('completed','cancelled') UNION ALL SELECT 1 FROM fusion_runs WHERE session_id=? AND state NOT IN('decided','partial','interrupted','cancelled') LIMIT 1")?;
+        active.bind_text(1,id.as_str())?; active.bind_text(2,id.as_str())?; active.bind_text(3,id.as_str())?; active.bind_text(4,id.as_str())?; active.bind_text(5,id.as_str())?;
+        if active.step()? { return state_bool_error(7); };
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def worktree_advance(state: &CliState, job: &mut WorktreeJob, code: i64) -> Result<bool,i64> {
+    let step = job.step;
+    if code != 0 and not (step == 5 and code == 1) {
+        if step == 0 { cli_put_string(&job.report,job.report.root(),"capability","not_repository")?; return worktree_finish(job,"unsupported",5,"The selected directory is not a Git checkout"); };
+        return worktree_finish(job,"failed",code,if step == 8 { "Git mutation failed; inspect again before any further action" } else { "Git query failed" });
+    };
+    if step == 0 {
+        let bare = worktree_line(&job.stdout)?;
+        if bare.as_str() != "false" { cli_put_string(&job.report,job.report.root(),"capability","bare_repository")?; return worktree_finish(job,"unsupported",8,"Bare repositories cannot be used as the current CLI checkout"); };
+        return worktree_launch(job,1);
+    };
+    if step == 1 {
+        let root = worktree_local_directory(worktree_line(&job.stdout)?.as_str())?;
+        cli_put_string(&job.report,job.report.root(),"checkout",root.as_str())?;
+        return worktree_launch(job,2);
+    };
+    if step == 2 {
+        let common = worktree_local_directory(worktree_line(&job.stdout)?.as_str())?;
+        cli_put_string(&job.report,job.report.root(),"common_dir",common.as_str())?;
+        if job.spec.operation.as_str() != "inspect" {
+            if cli_json_string(job.spec.snapshot.root(),"common_dir")?.as_str() != common.as_str() { return worktree_finish(job,"refused",7,"Repository identity changed; approve a fresh inspection"); };
+            let path = state_lock_path(state.path.as_str(),"git-worktrees",worktree_path_key(common.as_str())?.as_str())?;
+            job.repository_lease = file_lock(path.as_str())?;
+            job.source_lease = cli_state_workspace_lock(state,job.cwd.as_str())?;
+            let destination = worktree_target_path(job.cwd.as_str(),job.spec.target.as_str(),job.spec.operation.as_str() == "create")?;
+            if destination.as_str() != job.spec.target.as_str() { return worktree_finish(job,"refused",7,"Destination identity changed"); };
+            let target_lock = state_lock_path(state.path.as_str(),"workspace",destination.as_str())?;
+            job.target_lease = file_lock(target_lock.as_str())?;
+        };
+        return worktree_launch(job,3);
+    };
+    if step == 3 {
+        let head = worktree_line(&job.stdout)?;
+        if head.len() != 40 and head.len() != 64 { return state_bool_error(2); };
+        let bytes = head.bytes();
+        loop { let next = bytes.next(); if not next.is_some { break; }; if not (next.value >= 48 and next.value <= 57 or next.value >= 97 and next.value <= 102) { return state_bool_error(2); }; };
+        cli_put_string(&job.report,job.report.root(),"head",head.as_str())?;
+        if job.spec.operation.as_str() != "inspect" and not worktree_source_matches(job).is_ok() { return worktree_finish(job,"refused",7,"Source identity or HEAD changed; approve a fresh inspection"); };
+        return worktree_launch(job,4);
+    };
+    if step == 4 or step == 9 {
+        let parsed = worktree_parse_entries(&job.stdout)?;
+        job.report.root().object_set("worktrees",job.report.copy(parsed.root().object_get("worktrees")?)?)?;
+        cli_put_string(&job.report,job.report.root(),"capability","ready")?;
+        if step == 9 { return worktree_finish(job,"complete",0,"Worktree operation completed; current checkout edits were preserved"); };
+        if job.spec.operation.as_str() == "inspect" { return worktree_finish(job,"complete",0,"Git worktrees inspected"); };
+        if job.spec.operation.as_str() == "remove" {
+            let checked = worktree_mutation_spec(&job.report,"remove",job.spec.target.as_str(),"");
+            if not checked.is_ok() { return worktree_finish(job,"refused",7,"The checkout is primary, current, locked, prunable or no longer registered"); };
+            if worktree_approval_key(&checked.value)?.as_str() != worktree_approval_key(&job.spec)?.as_str() { return worktree_finish(job,"refused",7,"The target changed; approve a fresh inspection"); };
+        };
+        return worktree_launch(job,5);
+    };
+    if step == 5 {
+        worktree_parse_filters(job)?;
+        if job.spec.operation.as_str() == "create" {
+            if job.spec.branch.len() > 0 { return worktree_launch(job,6); };
+            return worktree_launch(job,8);
+        };
+        worktree_session_guard(state,job)?;
+        return worktree_launch(job,7);
+    };
+    if step == 6 { return worktree_launch(job,8); };
+    if step == 7 {
+        if job.stdout.used_len() != 0 { return worktree_finish(job,"refused",7,"The worktree has tracked changes or untracked files; nothing was removed"); };
+        let current = worktree_local_directory(job.spec.target.as_str())?;
+        if current.as_str() != job.spec.target.as_str() { return worktree_finish(job,"refused",7,"Target path changed"); };
+        return worktree_launch(job,8);
+    };
+    if step == 8 { return worktree_launch(job,9); };
+    state_bool_error(2)
+}
+
+def worktree_poll(state: &CliState, policy: &AgentPolicy, job: &mut WorktreeJob) -> Result<bool,i64> {
+    if job.done { return Result { is_ok: true, value: true, error: 0 }; };
+    if job.cancelled { return worktree_finish(job,"cancelled",12,"Worktree operation cancelled; it will not be replayed"); };
+    if job.spec.operation.as_str() != "inspect" and (policy.plan or policy.depth != 0 or not policy.interactive) { return worktree_finish(job,"refused",7,"The current policy no longer permits worktree mutation"); };
+    if job.command_timeout_ms < 1 or job.command_timeout_ms > 600000 or job.overall_timeout_ms < 1 or job.overall_timeout_ms > 600000 { return worktree_finish(job,"refused",2,"Invalid Git job deadline"); };
+    if time_since_ms(job.command_started_at) >= job.command_timeout_ms or time_since_ms(job.started_at) >= job.overall_timeout_ms { return worktree_finish(job,"timed_out",11,"Git worktree operation timed out; it will not be replayed"); };
+    let output = job.process.read_stdout(&mut job.chunk);
+    if not output.is_ok() { return worktree_finish(job,"failed",output.error,"Cannot read Git stdout"); };
+    if output.value > 0 {
+        if job.stdout.used_len() + output.value > job.stdout.capacity() { return worktree_finish(job,"failed",13,"Git stdout exceeded its 1 MiB bound"); };
+        job.stdout.append_copy(&job.chunk,0,output.value)?;
+        ();
+    };
+    let errors = job.process.read_stderr(&mut job.chunk);
+    if not errors.is_ok() { return worktree_finish(job,"failed",errors.error,"Cannot read Git stderr"); };
+    if errors.value > 0 {
+        if job.stderr.used_len() + errors.value > job.stderr.capacity() { return worktree_finish(job,"failed",13,"Git stderr exceeded its 1 MiB bound"); };
+        job.stderr.append_copy(&job.chunk,0,errors.value)?;
+        ();
+    };
+    let finished = job.process.try_wait();
+    if not finished.is_ok() { return worktree_finish(job,"failed",finished.error,"Cannot poll Git process"); };
+    if not finished.value { return Result { is_ok: true, value: false, error: 0 }; };
+    if not job.process.stdout_eof()? or not job.process.stderr_eof()? { return Result { is_ok: true, value: false, error: 0 }; };
+    let code = job.process.reap(0)?;
+    let quiet = job.process.tree_quiescent();
+    if not quiet.is_ok() { return worktree_finish(job,"failed",7,"Cannot verify the Git process tree; it will not be replayed"); };
+    if not quiet.value { return Result { is_ok: true, value: false, error: 0 }; };
+    let token = job.process.handle; job.process.handle = 0;
+    if sengoo_process_handle_close(token) != 0 { return worktree_finish(job,"failed",3,"Cannot release Git process"); };
+    job.running = false;
+    let next = worktree_advance(state,job,code);
+    if not next.is_ok() {
+        if job.transaction.handle != 0 { job.transaction.rollback(); (); };
+        worktree_finish(job,if next.error == 7 or next.error == 11 { "refused" } else { "failed" },next.error,"Worktree safety or process check failed; no automatic cleanup or replay will run")?;
+        ();
+    };
+    Result { is_ok: true, value: job.done, error: 0 }
+}
+
+def worktree_cancel(job: &mut WorktreeJob) { job.cancelled = true; (); }
+def worktree_result(job: &WorktreeJob) -> Result<JsonDoc,i64> { worktree_document_copy(&job.report) }
+def worktree_status(job: &WorktreeJob) -> Result<JsonDoc,i64> {
+    let document = worktree_result(job)?;
+    cli_put_bool(&document,document.root(),"done",job.done)?;
+    cli_put_i64(&document,document.root(),"step",job.step)?;
+    cli_put_bool(&document,document.root(),"shared_writes_reserved",job.transaction.handle != 0)?;
+    cli_put_bool(&document,document.root(),"mutation_started",job.mutation_started)?;
+    cli_put_bool(&document,document.root(),"cleanup_unknown",job.cleanup_unknown)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+def worktree_close(job: &mut WorktreeJob) -> Result<bool,i64> {
+    if not job.done { return worktree_finish(job,"cancelled",12,"Worktree job closed; it will not be replayed"); };
+    Result { is_ok: true, value: worktree_release(job), error: 0 }
+}
+impl Drop for WorktreeJob { def drop(&mut self) { worktree_release(&mut self); (); } }

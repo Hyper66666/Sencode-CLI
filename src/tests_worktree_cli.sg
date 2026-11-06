@@ -1,0 +1,12 @@
+import worktree_cli;
+
+def probe() -> Result<i64,i64> {
+    let arguments = cli_arguments()?;
+    let cwd = cli_option(&arguments,"cwd",cli_current_directory()?.as_str())?;
+    let database = cli_option(&arguments,"database","")?;
+    if database.len() == 0 { return cli_ok(2); };
+    let state = cli_state_open(database.as_str())?;
+    let terminal = terminal_open()?;
+    worktree_cli_run(&state,cwd.as_str(),&arguments,&terminal)
+}
+def main() -> i64 { let result = probe(); if not result.is_ok() { println(result.error); return 1; }; result.value }

@@ -1,0 +1,23 @@
+import hook_management;
+import management;
+
+// --yes is confined to this explicit fingerprint-review command. It never
+// becomes a policy grant for hooks, tools, children or model requests.
+def extension_commands(state: &CliState, options: &JsonDoc, terminal: &Terminal) -> Result<i64,i64> {
+    let action = management_positional(options, 1);
+    let operation = if action.len() == 0 { cli_text("list") } else { action.clone()? };
+    let target = management_positional(options, 2);
+    let length = options.root().object_get("positionals")?.array_len()?;
+    if length > 3 or (operation.as_str() == "list" and target.len() > 0) { return cli_ok(2); };
+    if cli_flag(options, "yes") and operation.as_str() != "enable" { return cli_ok(2); };
+    if cli_flag(options, "plan") and operation.as_str() != "list" and operation.as_str() != "inspect" {
+        cli_diagnostic("Plan permits extension inspection only; no trust or configuration was changed.");
+        return cli_ok(7);
+    };
+    if operation.as_str() == "enable" and not cli_flag(options, "yes") and terminal.is_tty() { terminal.enter_raw()?; (); };
+    let input: Vec<TerminalEvent> = vec_new();
+    let result = hook_management(state, operation.as_str(), target.as_str(), cli_flag(options, "yes"), terminal, &input)?;
+    output_document(&result)?;
+    if result.root().object_has("permission_required") and result.root().object_get("permission_required")?.bool_value()? { return cli_ok(7); };
+    cli_ok(0)
+}

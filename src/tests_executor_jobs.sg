@@ -1,0 +1,53 @@
+import executor;
+import command_line;
+
+def expect_executor_job(value: bool, label: &str) -> Result<bool, i64> {
+    if value { return Result { is_ok: true, value: true, error: 0 }; };
+    cli_diagnostic(label); Result { is_ok: false, value: false, error: 99 }
+}
+
+def executor_job_fixture(command: &str, timeout_ms: i64) -> Result<ExecutorJob, i64> {
+    let builder = process_command("powershell.exe")?;
+    builder.arg("-NoProfile")?; builder.arg("-NonInteractive")?;
+    builder.arg("-Command")?; builder.arg(command)?;
+    executor_job_start(&builder, timeout_ms)
+}
+
+def check_executor_jobs() -> Result<bool, i64> {
+    let terminal = terminal_open()?;
+    let input: Vec<TerminalEvent> = vec_new();
+    println("executor jobs: bounded simultaneous pipe draining");
+    let mut large = executor_job_fixture("[Console]::Out.Write('s' * 1100000); [Console]::Error.Write('e' * 1100000)", 20000)?;
+    executor_job_wait(&mut large, &terminal, &input)?;
+    expect_executor_job(large.output.truncated and large.output.stdout.used_len() <= 1048576 and large.output.stderr.used_len() <= 1048576 and large.output.stdout.used_len() > 0 and large.output.stderr.used_len() > 0, "Both large streams drain within independent one MiB bounds")?;
+    expect_executor_job(large.process.tree_quiescent()? and large.process.try_wait()?, "Truncated output does not bypass process cleanup")?;
+
+    println("executor jobs: direct child exit is not tree quiescence");
+    let mut tree = executor_job_fixture("Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru -WindowStyle Hidden | Out-Null; [Console]::Out.Write('ready')", 10000)?;
+    let started = time_unix_ms();
+    let mut root_exited = false;
+    while not root_exited {
+        executor_job_poll(&mut tree);
+        root_exited = tree.process.try_wait()?;
+        if time_since_ms(started) > 8000 { executor_job_cancel(&mut tree); executor_job_wait(&mut tree, &terminal, &input)?; return Result { is_ok: false, value: false, error: 12 }; };
+        time_sleep_ms(1);
+    };
+    expect_executor_job(not tree.process.tree_quiescent()? and tree.state.get(2).unwrap_or(0) == 0, "Live grandchild keeps job active after root exits")?;
+    executor_job_cancel(&mut tree);
+    executor_job_wait(&mut tree, &terminal, &input)?;
+    expect_executor_job(tree.output.cancelled and tree.process.tree_quiescent()?, "Cancel waits for entire descendant tree before exposing a result")?;
+
+    println("executor jobs: timeouts and early result rejection");
+    let mut timed = executor_job_fixture("Start-Sleep -Seconds 30", 100)?;
+    expect_executor_job(not executor_job_result(&timed).is_ok(), "Live job cannot fabricate a final result")?;
+    executor_job_wait(&mut timed, &terminal, &input)?;
+    expect_executor_job(timed.output.timed_out and timed.process.tree_quiescent()? and executor_job_result(&timed).is_ok(), "Timeout marks failure only after owned cleanup")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let result = check_executor_jobs();
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_process_live_resource_count() != 0 or sengoo_process_live_handle_count() != 0 { cli_diagnostic("Executor jobs leaked a process resource"); return 1; };
+    println("executor jobs acceptance passed"); 0
+}

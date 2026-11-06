@@ -1,0 +1,71 @@
+import controller;
+import views;
+
+// Public metadata only: no environment enumeration, raw connection JSON or keys.
+def diagnostics_config(state: &CliState, options: &AgentOptions, permission_profile: &str) -> Result<JsonDoc, i64> {
+    let report = json_doc_object()?;
+    cli_put_i64(&report, report.root(), "schema", 1)?;
+    cli_put_string(&report, report.root(), "cwd", options.cwd.as_str())?;
+    cli_put_string(&report, report.root(), "database", state.path.as_str())?;
+    cli_put_string(&report, report.root(), "session", options.session.as_str())?;
+    cli_put_string(&report, report.root(), "permission_profile", permission_profile)?;
+    cli_put_bool(&report, report.root(), "plan", options.policy.plan)?;
+    cli_put_bool(&report, report.root(), "auto_edit", options.policy.auto_edit)?;
+    cli_put_bool(&report, report.root(), "allow_commands", options.allow_commands)?;
+    cli_put_string(&report, report.root(), "connection_source", if options.connection.len() > 0 { "explicit current CLI target" } else { "shared preferred connection, or the sole configured connection" })?;
+    cli_put_string(&report, report.root(), "model_source", if options.model.len() > 0 { "explicit current CLI model" } else { "selected connection model" })?;
+    let selected = view_selection(state, options.connection.as_str(), options.model.as_str())?;
+    report.root().object_set("target", report.copy(selected.root())?)?;
+    cli_put_string(&report, report.root(), "project_instructions", "AGENTS.md and CLAUDE.md, from repository root through the current directory; nested tool paths load applicable descendants")?;
+    cli_put_string(&report, report.root(), "scope", "Effective CLI settings only; arbitrary desktop and extension configuration is not inspected")?;
+    Result { is_ok: true, value: report, error: 0 }
+}
+
+def diagnostics_doctor(state: &CliState, cwd: &str, tty: bool) -> Result<JsonDoc, i64> {
+    let report = json_doc_object()?;
+    cli_put_i64(&report, report.root(), "schema", 1)?;
+    cli_put_string(&report, report.root(), "engine", "sengoo")?;
+    cli_put_string(&report, report.root(), "version", "0.1.0-dev.0")?;
+    cli_put_string(&report, report.root(), "image", current_executable_string()?.as_str())?;
+    cli_put_string(&report, report.root(), "cwd", cwd)?;
+    cli_put_bool(&report, report.root(), "terminal", tty)?;
+    cli_put_bool(&report, report.root(), "shared_contract_v1", true)?;
+    let search = report.new_object()?;
+    let ripgrep = executor_search_executable(cwd);
+    cli_put_bool(&report, search, "available", ripgrep.is_ok)?;
+    cli_put_string(&report, search, "required_bundled_version", "14.1.1")?;
+    if ripgrep.is_ok {
+        cli_put_string(&report, search, "executable", ripgrep.value.as_str())?;
+        let bundled = path_join_string(path_parent_string(current_executable_string()?.as_str())?.as_str(), "rg.exe")?;
+        cli_put_string(&report, search, "source", if ripgrep.value.as_str() == bundled.as_str() { "bundled" } else { "external PATH" })?; ();
+    } else {
+        cli_put_string(&report, search, "repair", "Reinstall the complete Sencode CLI package, including rg.exe; source builds may put ripgrep on an absolute PATH outside the workspace.")?; ();
+    };
+    report.root().object_set("ripgrep", search)?;
+    let connections = cli_state_connections(state)?;
+    report.root().object_set("connections", report.copy(connections.root().object_get("connections")?)?)?;
+    let statuses = report.new_array()?;
+    let source = connections.root().object_get("connections")?;
+    let mut index = 0;
+    while index < source.array_len()? {
+        let item = source.array_get(index)?;
+        let id = cli_json_string(item, "id")?; let kind = cli_json_string(item, "kind")?;
+        let status = report.new_object()?;
+        cli_put_string(&report, status, "connection_id", id.as_str())?;
+        cli_put_string(&report, status, "kind", kind.as_str())?;
+        if kind.as_str() == "customApi" {
+            let credential = cli_state_credential(id.as_str());
+            cli_put_bool(&report, status, "credential_available", credential.is_ok())?;
+            cli_put_string(&report, status, "network", "not contacted; use an explicit turn to verify the provider")?;
+            ();
+        } else {
+            let runtime = cli_state_connection_metadata(state, id.as_str());
+            cli_put_bool(&report, status, "pinned_runtime_available", runtime.is_ok())?;
+            cli_put_string(&report, status, "credentials", "owned by the managed runtime; not inspected")?;
+            if not runtime.is_ok() { cli_put_i64(&report, status, "error", runtime.error)?; (); }; ();
+        };
+        statuses.array_push(status)?; index = index + 1;
+    };
+    report.root().object_set("credentials", statuses)?;
+    Result { is_ok: true, value: report, error: 0 }
+}

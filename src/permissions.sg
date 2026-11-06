@@ -1,0 +1,25 @@
+import policy;
+
+// Native request policy only. Backend-owned account policy is displayed
+// separately and must never be described as one of these enforced modes.
+def permission_mode(policy: &AgentPolicy) -> &str {
+    if policy.full_access { "full" } else { if policy.auto_edit { "auto" } else { "manual" } }
+}
+
+def permission_next(policy: &AgentPolicy) -> &str {
+    if policy.full_access { "manual" } else { if policy.auto_edit { "full" } else { "auto" } }
+}
+
+def permission_label(mode: &str) -> &str {
+    if mode == "full" { "完全权限" } else { if mode == "auto" { "自动审批" } else { "手动审批" } }
+}
+
+// The caller also sets its legacy allow_commands flag to mode == "full".
+// Plan is intentionally retained, so switching never approves leaving Plan.
+// Existing requests keep their captured policy; this updates the next submit.
+def permission_apply(policy: &mut AgentPolicy, mode: &str) -> bool {
+    if mode != "manual" and mode != "auto" and mode != "full" { return false; };
+    policy.auto_edit = mode == "auto" or mode == "full";
+    policy.full_access = mode == "full";
+    true
+}

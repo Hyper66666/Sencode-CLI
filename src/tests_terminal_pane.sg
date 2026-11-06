@@ -1,0 +1,61 @@
+import terminal_pane;
+import command_line;
+
+def pane_test_assert(condition: bool, text: &str) -> Result<bool, i64> { if not condition { cli_diagnostic(text); return state_bool_error(99); }; tui_true() }
+def pane_test_spec(cwd: &str, script: &str) -> Result<PtySessionSpec, i64> {
+    let spec = pty_session_spec("powershell.exe", cwd)?;
+    spec.args.push(cli_text("-NoLogo")); spec.args.push(cli_text("-NoProfile")); spec.args.push(cli_text("-Command")); spec.args.push(cli_text(script));
+    Result { is_ok: true, value: spec, error: 0 }
+}
+def pane_test_pending(pane: &mut TerminalPane, cwd: &str, script: &str) -> Result<bool, i64> {
+    pane.spec = pane_test_spec(cwd, script)?; pane.key = pty_session_approval_key(cwd, &pane.spec)?; pane.pending = true; tui_true()
+}
+def pane_tests(state: &CliState, cwd: &str) -> Result<bool, i64> {
+    let id = cli_state_create_session(state, cwd)?;
+    let mut pane = pane_new(cwd)?; let mut policy = policy_default();
+    let mut app = tui_new(cwd, "", "", id.as_str()); let unopened = Terminal { handle: 0 }; policy.interactive = true;
+    pane_prepare(&mut pane, cwd, "cmd", &unopened, &policy, &mut app)?;
+    pane_test_assert(pane.spec.executable.as_str() == canonical_path_string(pane.spec.executable.as_str())?.as_str(), "preview and launch use a canonical native executable path")?;
+    pane_start(&mut pane, state, cwd, id.as_str(), &policy, false)?;
+    pane_test_assert(not pane_start(&mut pane, state, cwd, id.as_str(), &policy, true).is_ok(), "no pending interaction cannot launch")?;
+    pane_test_pending(&mut pane, cwd, "exit 0")?;
+    pane_start(&mut pane, state, cwd, id.as_str(), &policy, false)?;
+    pane_test_assert(not pane.active and not pane.pending, "default cancel clears pending without launch")?;
+    pane_test_pending(&mut pane, cwd, "exit 0")?; policy.plan = true;
+    pane_test_assert(not pane_start(&mut pane, state, cwd, id.as_str(), &policy, true).is_ok(), "Plan denies launch")?; policy.plan = false;
+    pane_test_pending(&mut pane, cwd, "Write-Host 'PANE_READY'; Start-Sleep -Seconds 60")?;
+    pane_start(&mut pane, state, cwd, id.as_str(), &policy, true)?;
+    pane_test_assert(pane.active and not pane.certified, "approved terminal owns execution")?;
+    pane_test_assert(not cli_state_begin_maintenance(state, id.as_str()).is_ok(), "other execution cannot acquire the session")?;
+    pane_test_assert(not cli_state_workspace_lock(state, cwd).is_ok(), "terminal owns workspace exclusion")?;
+    pane_test_assert(not pane_certify(&mut pane, state).is_ok(), "live tree cannot certify cleanup")?;
+    pane_test_assert(not cli_state_tool_result(state, id.as_str(), pane.call_id.as_str()).is_ok(), "unknown tool result remains unresolved")?;
+    pane_close(&mut pane, state)?;
+    pane_test_assert(not pane.active and pane.certified and not pane.execution.active, "close certifies tree before handing off")?;
+    cli_state_tool_result(state, id.as_str(), pane.call_id.as_str())?;
+    { let mut next = cli_state_begin_maintenance(state, id.as_str())?; cli_state_finish(state, &mut next, "idle")?; (); };
+    { let lock = cli_state_workspace_lock(state, cwd)?; (); };
+    pane_test_pending(&mut pane, cwd, "Write-Host 'NATURAL'; exit 0")?; pane_start(&mut pane, state, cwd, id.as_str(), &policy, true)?;
+    let terminal = Terminal { handle: 0 }; let deadline = time_unix_ms() + 15000;
+    while not pane.certified and time_unix_ms() < deadline { pane_tick(&mut pane, state, &policy, &terminal)?; time_sleep_ms(1); };
+    pane_test_assert(pane.certified, "natural completion drains output and certifies")?;
+    let text = cli_bytes_text(&pane.session.display, 0, pane.session.display.used_len())?;
+    pane_test_assert(str_contains(text.as_str(), "NATURAL"), "natural output retained before certification")?;
+    pane_close(&mut pane, state)?;
+    let right = TerminalEvent { kind: 1, code: 1003, modifiers: 0, width: 0, height: 0, data: string_new() };
+    pane_test_assert(pane_bytes(&right, false)?.as_str() == "\x1b[C", "canonical right arrow encodes correctly")?;
+    let pasted = TerminalEvent { kind: 2, code: 0, modifiers: 0, width: 0, height: 0, data: cli_text("one\ntwo") };
+    pane_test_assert(not pane_bytes(&pasted, false).is_ok(), "non bracketed multiline paste is denied")?;
+    pane_test_assert(pane_bytes(&pasted, true)?.as_str() == "\x1b[200~one\ntwo\x1b[201~", "bracketed paste bounded encoding")?;
+    println("terminal pane: approval, Plan, session/workspace exclusion, durable cleanup, output drain and input bounds passed"); tui_true()
+}
+def main() -> i64 {
+    let arguments = cli_arguments().unwrap_or(json_doc_object().value);
+    let database = cli_option(&arguments, "database", "").unwrap_or(string_new());
+    let root = path_parent_string(database.as_str()).unwrap_or(string_new());
+    let path = path_join_string(root.as_str(), "pane-workspace-中文").unwrap_or(string_new());
+    let directory = dir_create_all(path.as_str()); if not directory.is_ok { return directory.error; };
+    let cwd = canonical_path_string(path.as_str()).unwrap_or(string_new());
+    let state = cli_state_open(database.as_str()); if not state.is_ok { return state.error; };
+    let tested = pane_tests(&state.value, cwd.as_str()); if not tested.is_ok { return tested.error; }; 0
+}

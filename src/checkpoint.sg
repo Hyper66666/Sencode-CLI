@@ -1,0 +1,154 @@
+import sessions;
+
+// A bounded file-edit journal lives in the extensible shared_modes contract.
+// It captures only native UTF-8 write/patch tools; shell effects are not undone.
+def checkpoint_load(state: &CliState, session: &str) -> Result<JsonDoc, i64> {
+    let saved = cli_state_mode_load(state, session, "checkpoints")?;
+    if saved.root().object_has("value") {
+        let document = json_doc_object()?;
+        let value = saved.root().object_get("value")?;
+        if cli_json_optional_i64(value, "schema", 0) != 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+        document.root().object_set("entries", document.copy(value.object_get("entries")?)?)?;
+        cli_put_i64(&document, document.root(), "schema", 1)?;
+        return Result { is_ok: true, value: document, error: 0 };
+    };
+    json_parse("{\"schema\":1,\"entries\":[]}")
+}
+
+def checkpoint_save(state: &CliState, execution: &CliExecution, document: &JsonDoc) -> Result<bool, i64> {
+    let raw = document.serialize_string()?;
+    if raw.len() > 8388608 { return state_bool_error(13); };
+    cli_state_mode_save(state, execution, "checkpoints", document)
+}
+
+def checkpoint_matches(cwd: &str, entry: JsonValue, after: bool) -> Result<bool, i64> {
+    let relative = cli_json_string(entry, "path")?;
+    let path = workspace_path(cwd, relative.as_str())?;
+    let exists = if after { true } else { entry.object_get("before_exists")?.bool_value()? };
+    if not exists { return Result { is_ok: true, value: not file_exists(path.as_str()) and not dir_exists(path.as_str()), error: 0 }; };
+    if file_kind(path.as_str()).unwrap_or(0) != PATH_KIND_FILE() { return Result { is_ok: true, value: false, error: 0 }; };
+    let current = workspace_read(path.as_str(), 1048576)?;
+    let expected = cli_json_string(entry, if after { "after" } else { "before" })?;
+    Result { is_ok: true, value: current.as_str() == expected.as_str(), error: 0 }
+}
+
+def checkpoint_bounded(source: &JsonDoc) -> Result<JsonDoc, i64> {
+    let entries = source.root().object_get("entries")?;
+    let mut skip = 0;
+    loop {
+        let bounded = json_parse("{\"schema\":1,\"entries\":[]}")?;
+        let output = bounded.root().object_get("entries")?;
+        let mut index = skip;
+        while index < entries.array_len()? { output.array_push(bounded.copy(entries.array_get(index)?)?)?; index = index + 1; };
+        if output.array_len()? <= 32 and bounded.serialize_string()?.len() <= 8388608 { return Result { is_ok: true, value: bounded, error: 0 }; };
+        if skip >= entries.array_len()? - 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        let oldest = entries.array_get(skip)?;
+        let status = cli_json_string(oldest, "status")?;
+        if status.as_str() != "complete" and status.as_str() != "restored" { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 12 }; };
+        skip = skip + 1;
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }
+}
+
+// Caller owns the execution lease, workspace FIFO permit and OS write lock,
+// and has already approved the exact tool arguments.
+def checkpoint_apply(state: &CliState, execution: &CliExecution, cwd: &str, tool: &str, arguments: &JsonDoc) -> Result<JsonDoc, i64> {
+    if tool != "write_file" and tool != "apply_patch" { return workspace_file_tool(cwd, tool, arguments); };
+    state_exec_valid(state, execution)?;
+    let root = arguments.root();
+    let relative = cli_json_string(root, "path")?;
+    let path = workspace_path(cwd, relative.as_str())?;
+    let exists = file_exists(path.as_str());
+    let before = if exists { workspace_read(path.as_str(), 1048576)? } else { string_new() };
+    let after = if tool == "apply_patch" {
+        if not exists { return workspace_result("Patch target does not exist", true); };
+        workspace_patch_text(before.as_str(), cli_json_string(root, "old")?.as_str(), cli_json_string(root, "new")?.as_str())?
+    } else {
+        if exists {
+            if not root.object_has("expected_content") { return workspace_result("Existing file requires expected_content", true); };
+            if cli_json_string(root, "expected_content")?.as_str() != before.as_str() { return workspace_result("File changed since it was read", true); };
+        };
+        cli_json_string(root, "content")?
+    };
+    if after.len() > 1048576 { return workspace_result("File exceeds 1 MiB", true); };
+    let journal = checkpoint_load(state, execution.session.as_str())?;
+    let entries = journal.root().object_get("entries")?;
+    let entry = journal.new_object()?;
+    let id = state_id("edit-")?;
+    cli_put_string(&journal, entry, "id", id.as_str())?;
+    cli_put_string(&journal, entry, "path", relative.as_str())?;
+    cli_put_string(&journal, entry, "cwd", cwd)?;
+    cli_put_bool(&journal, entry, "before_exists", exists)?;
+    cli_put_string(&journal, entry, "before", before.as_str())?;
+    cli_put_string(&journal, entry, "after", after.as_str())?;
+    cli_put_string(&journal, entry, "status", "prepared")?;
+    cli_put_i64(&journal, entry, "created_at", time_unix_ms())?;
+    entries.array_push(entry)?;
+    let retained = checkpoint_bounded(&journal)?;
+    let retained_entry = checkpoint_find(&retained, id.as_str())?;
+    checkpoint_save(state, execution, &retained)?;
+    if not checkpoint_matches(cwd, entry, false)? { return workspace_result("External file change detected after checkpoint; no write performed", true); };
+    let written = workspace_atomic_write(path.as_str(), after.as_str());
+    if not written.is_ok() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: written.error }; };
+    cli_put_string(&retained, retained_entry, "status", "complete")?;
+    checkpoint_save(state, execution, &retained)?;
+    let output = cli_join("File edit saved; checkpoint ", id.as_str())?;
+    workspace_result(output.as_str(), false)
+}
+
+def checkpoint_find(document: &JsonDoc, id: &str) -> Result<JsonValue, i64> {
+    let items = document.root().object_get("entries")?;
+    let mut index = 0;
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        if cli_json_string(item, "id")?.as_str() == id { return Result { is_ok: true, value: item, error: 0 }; };
+        index = index + 1;
+    };
+    Result { is_ok: false, value: JsonValue { doc_handle: 0, node_id: 0 }, error: 5 }
+}
+
+def checkpoint_preview(state: &CliState, session: &str, cwd: &str, id: &str) -> Result<String, i64> {
+    let journal = checkpoint_load(state, session)?;
+    let entry = checkpoint_find(&journal, id)?;
+    let status = cli_json_string(entry, "status")?;
+    if status.as_str() != "complete" and status.as_str() != "prepared" { return string_result_err(12); };
+    if cli_json_string(entry, "cwd")?.as_str() != cwd or not checkpoint_matches(cwd, entry, true)? { return string_result_err(12); };
+    let output = cli_text("Restore file checkpoint: ");
+    output.push_str(cli_json_string(entry, "path")?.as_str())?;
+    output.push_str("\nOnly this native file edit is reversed. Conversation, budgets and shell effects remain recorded.\n")?;
+    if status.as_str() == "prepared" { output.push_str("The original edit result was not committed; current bytes match its expected result.\n")?; (); };
+    output.push_str("--- current\n+++ checkpoint\n")?;
+    workspace_diff_lines(&output, cli_json_string(entry, "after")?.as_str(), "-")?;
+    if entry.object_get("before_exists")?.bool_value()? { workspace_diff_lines(&output, cli_json_string(entry, "before")?.as_str(), "+")?; (); } else { output.push_str("(remove the file created by this edit)\n")?; (); };
+    if output.len() > 262144 { return string_result_err(13); };
+    Result { is_ok: true, value: output, error: 0 }
+}
+
+// Explicit user confirmation is mandatory. Revalidate after acquiring both
+// execution and workspace ownership; never replay an interrupted tool.
+def checkpoint_rewind(state: &CliState, session: &str, cwd: &str, id: &str, approved: bool) -> Result<bool, i64> {
+    if not approved { return state_bool_error(7); };
+    let mut execution = cli_state_begin_maintenance(state, session)?;
+    let restored = checkpoint_rewind_owned(state, &execution, cwd, id);
+    cli_state_finish(state, &mut execution, if restored.is_ok() { "idle" } else { "error" })?;
+    restored
+}
+
+def checkpoint_rewind_owned(state: &CliState, execution: &CliExecution, cwd: &str, id: &str) -> Result<bool, i64> {
+    let lock = cli_state_workspace_lock(state, cwd)?;
+    checkpoint_preview(state, execution.session.as_str(), cwd, id)?;
+    let journal = checkpoint_load(state, execution.session.as_str())?;
+    let entry = checkpoint_find(&journal, id)?;
+    cli_put_string(&journal, entry, "status", "restoring")?;
+    checkpoint_save(state, execution, &journal)?;
+    // A crash after this point stays explicit. Opening another client never
+    // applies a recovery write or assumes a shell operation was reversed.
+    if not checkpoint_matches(cwd, entry, true)? { return state_bool_error(12); };
+    let path = workspace_path(cwd, cli_json_string(entry, "path")?.as_str())?;
+    if entry.object_get("before_exists")?.bool_value()? {
+        workspace_atomic_write(path.as_str(), cli_json_string(entry, "before")?.as_str())?;
+        ();
+    } else { if not file_remove(path.as_str()) { return state_bool_error(10); }; };
+    cli_put_string(&journal, entry, "status", "restored")?;
+    checkpoint_save(state, execution, &journal)
+}

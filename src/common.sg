@@ -1,0 +1,122 @@
+import std::string;
+import std::json;
+import std::collections;
+import std::ffi;
+import std::io;
+
+def cli_ok(value: i64) -> Result<i64, i64> {
+    Result { is_ok: true, value: value, error: 0 }
+}
+
+def cli_fail(code: i64) -> Result<i64, i64> {
+    Result { is_ok: false, value: 0, error: code }
+}
+
+def cli_text(text: &str) -> String {
+    string_from_str(text).unwrap_or(string_new())
+}
+
+def cli_join(a: &str, b: &str) -> Result<String, i64> {
+    let out = string_from_str(a)?;
+    out.push_str(b)?;
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+// String slices must end at UTF-8 boundaries. Protocol fragments use Buffer.
+def cli_byte_slice(text: &str, start: i64, end: i64) -> Result<String, i64> {
+    if start < 0 or end < start or end > text.len() { return string_result_err(2); };
+    string_from_bytes_raw(sengoo_stdlib_str_ptr(text) + start, end - start)
+}
+
+def cli_bytes(capacity: i64) -> Buffer {
+    ffi_buffer_new(capacity).unwrap_or(Buffer { handle: 0 })
+}
+
+def cli_bytes_error(code: i64) -> Result<Buffer, i64> {
+    Result { is_ok: false, value: cli_bytes(0), error: code }
+}
+
+def cli_bytes_index(buffer: &Buffer, pattern: &str) -> Result<i64, i64> {
+    let needle = ffi_buffer_from_bytes(pattern)?;
+    buffer.index_of_bytes(needle, 0)
+}
+
+def cli_bytes_append(destination: &Buffer, source: &Buffer, start: i64, count: i64) -> Result<i64, i64> {
+    if start < 0 or count < 0 or start > source.used_len() or count > source.used_len() - start { return cli_fail(2); };
+    ffi_byte_count_result(sengoo_ffi_buffer_append(destination.raw_handle(), source.ptr() + start, count))
+}
+
+def cli_bytes_text(buffer: &Buffer, start: i64, count: i64) -> Result<String, i64> {
+    if start < 0 or count < 0 or start > buffer.used_len() or count > buffer.used_len() - start { return string_result_err(2); };
+    string_from_bytes_raw(buffer.ptr() + start, count)
+}
+
+def cli_parse_unsigned(text: &str, radix: i64) -> Result<i64, i64> {
+    if text.len() == 0 { return cli_fail(2); };
+    let source = cli_text(text);
+    let iter = source.bytes();
+    let mut result = 0;
+    loop {
+        let byte = iter.next();
+        if not byte.is_some { break; };
+        let mut digit = byte.value - 48;
+        if byte.value >= 65 and byte.value <= 70 { digit = byte.value - 55; };
+        if byte.value >= 97 and byte.value <= 102 { digit = byte.value - 87; };
+        if digit < 0 or digit >= radix { iter.free(); return cli_fail(2); };
+        if result > (9223372036854775807 - digit) / radix { iter.free(); return cli_fail(13); };
+        result = result * radix + digit;
+    };
+    iter.free(); cli_ok(result)
+}
+
+def cli_json_string(object: JsonValue, key: &str) -> Result<String, i64> {
+    object.object_get(key)?.string_value()
+}
+
+def cli_json_optional_string(object: JsonValue, key: &str) -> String {
+    if not object.object_has(key) { return string_new(); };
+    object.object_get(key).value.string_value().unwrap_or(string_new())
+}
+
+def cli_json_optional_i64(object: JsonValue, key: &str, fallback: i64) -> i64 {
+    if not object.object_has(key) { return fallback; };
+    let field = object.object_get(key);
+    if not field.is_ok() { return fallback; };
+    field.value.number_i64().unwrap_or(fallback)
+}
+
+def cli_put_string(document: &JsonDoc, object: JsonValue, key: &str, text: &str) -> Result<bool, i64> {
+    object.object_set(key, document.new_string(text)?)
+}
+
+def cli_put_i64(document: &JsonDoc, object: JsonValue, key: &str, value: i64) -> Result<bool, i64> {
+    object.object_set(key, document.new_i64(value)?)
+}
+
+def cli_put_bool(document: &JsonDoc, object: JsonValue, key: &str, value: bool) -> Result<bool, i64> {
+    object.object_set(key, document.new_bool(value)?)
+}
+
+def cli_diagnostic(text: &str) {
+    io_stderr_write(text);
+    io_stderr_write("\n");
+    ();
+}
+
+// Render model/tool output as text. Never forward terminal control sequences.
+def cli_terminal_safe(text: &str) -> Result<String, i64> {
+    let source = string_from_str(text)?;
+    let out = string_new();
+    let iterator = source.chars();
+    loop {
+        let item = iterator.next();
+        if not item.is_some { break; };
+        let code = char_codepoint(item.value)?;
+        if code == 10 or code == 9 or code >= 32 and (code < 127 or code > 159) {
+            out.push_char(item.value)?;
+            ();
+        };
+    };
+    iterator.free();
+    Result { is_ok: true, value: out, error: 0 }
+}

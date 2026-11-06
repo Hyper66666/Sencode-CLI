@@ -1,0 +1,76 @@
+import state;
+import connection;
+import command_line;
+
+def capability_expect(condition: bool, label: &str) -> Result<bool, i64> {
+    if not condition { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def capability_config(count: i64, deny_connection: bool) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?; let root = document.root();
+    cli_put_string(&document, root, "baseUrl", "https://fixture.invalid/v1")?;
+    cli_put_string(&document, root, "protocol", "responses")?;
+    cli_put_string(&document, root, "credentialRef", "fixture-credential-ref-never-project")?;
+    cli_put_string(&document, root, "apiKey", "fixture-raw-secret-never-project")?;
+    cli_put_string(&document, root, "api_key", "fixture-legacy-secret-never-project")?;
+    cli_put_string(&document, root, "private_field", "fixture-private-config-never-project")?;
+    let models = document.new_array()?; let mut index = 0;
+    while index < count {
+        let item = document.new_object()?; let caps = document.new_object()?;
+        let id = if index == count - 1 { cli_text("vision-exact") } else { if index == 0 { cli_text("plain-exact") } else { let label = cli_text("model-"); label.push_i64(index)?; label } };
+        cli_put_string(&document, item, "id", id.as_str())?;
+        cli_put_bool(&document, caps, "visionSupported", index == count - 1)?;
+        item.object_set("capabilities", caps)?; models.array_push(item)?; index = index + 1;
+    };
+    root.object_set("enabledModels", models)?;
+    if deny_connection { let caps = document.new_object()?; cli_put_bool(&document, caps, "visionSupported", false)?; root.object_set("capabilities", caps)?; (); };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def capability_store(state: &CliState, id: &str, config: &JsonDoc) -> Result<bool, i64> {
+    let raw = config.serialize_string()?;
+    let mut insert = state.db.prepare("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES(?,'customApi','managed','Capability regression',?,'vision-exact',1,1) ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json,selected_model_id=excluded.selected_model_id")?;
+    insert.bind_text(1, id)?; insert.bind_text(2, raw.as_str())?; insert.step()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def capability_db_tests(database: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let config = capability_config(2, false)?; capability_store(&state, "capability-exact", &config)?;
+    let projected = cli_state_connection(&state, "capability-exact")?;
+    capability_expect(projected.root().object_has("enabledModels") and projected.root().object_get("enabledModels")?.array_len()? == 2, "Saved connection projection preserves its enabled model capabilities")?;
+    let vision = connection_normalize(&projected, "vision-exact")?;
+    capability_expect(vision.images_allowed() and vision.model_id() == "vision-exact", "Exact saved vision model remains image-capable through DB projection and normalization")?;
+    let plain = connection_normalize(&projected, "plain-exact")?;
+    capability_expect(not plain.images_allowed(), "Saved plain model cannot borrow another enabled model's image capability")?;
+    let partial = connection_normalize(&projected, "vision-exac")?;
+    capability_expect(not partial.images_allowed(), "A model prefix does not match the saved exact image capability")?;
+    let unknown = connection_normalize(&projected, "vision-exact-other")?;
+    capability_expect(not unknown.images_allowed(), "Unknown model names cannot inherit image permission")?;
+    let selected = connection_normalize(&projected, "")?;
+    capability_expect(selected.images_allowed() and selected.model_id() == "vision-exact", "Default selected model uses the same preserved capabilities")?;
+    let public = projected.serialize_string()?;
+    capability_expect(not projected.root().object_has("config_json") and not projected.root().object_has("configJson") and not projected.root().object_has("credentialRef") and not projected.root().object_has("apiKey") and not projected.root().object_has("api_key") and not projected.root().object_has("private_field"), "Projection exposes capability metadata without raw config or credential fields")?;
+    capability_expect(not str_contains(public.as_str(), "fixture-raw-secret-never-project") and not str_contains(public.as_str(), "fixture-legacy-secret-never-project") and not str_contains(public.as_str(), "fixture-credential-ref-never-project") and not str_contains(public.as_str(), "fixture-private-config-never-project"), "Raw credentials and private config sentinels never appear in serialized projection")?;
+    let disabled = capability_config(2, true)?; capability_store(&state, "capability-denied", &disabled)?;
+    let denied_projection = cli_state_connection(&state, "capability-denied")?;
+    capability_expect(denied_projection.root().object_has("capabilities"), "Connection-level capability override survives the saved projection")?;
+    let denied = connection_normalize(&denied_projection, "vision-exact")?;
+    capability_expect(not denied.images_allowed(), "Connection-level false overrides exact model-level vision true")?;
+    let bounded = capability_config(256, false)?; capability_store(&state, "capability-boundary", &bounded)?;
+    let boundary_projection = cli_state_connection(&state, "capability-boundary")?; let boundary = connection_normalize(&boundary_projection, "vision-exact")?;
+    capability_expect(boundary.images_allowed() and boundary_projection.root().object_get("enabledModels")?.array_len()? == 256, "Exactly 256 enabled models preserve and resolve the final model")?;
+    let excessive = capability_config(257, false)?; capability_store(&state, "capability-overflow", &excessive)?;
+    let excessive_projection = cli_state_connection(&state, "capability-overflow")?; let overflow = connection_normalize(&excessive_projection, "vision-exact");
+    capability_expect(not overflow.is_ok() and overflow.error == 13, "257 enabled models fail with the stable bounded-capability diagnostic")?;
+    state.db.exec("DELETE FROM connection_configs WHERE id IN('capability-exact','capability-denied','capability-boundary','capability-overflow')")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", ""); if not database.is_ok() or database.value.len() == 0 { cli_diagnostic("Use --database with an isolated temporary fixture database"); return 2; };
+    let result = capability_db_tests(database.value.as_str()); if not result.is_ok() { println(result.error); return 1; };
+    println("saved connection capabilities: exact vision/plain, connection deny, credential isolation and 256-model boundary passed"); 0
+}

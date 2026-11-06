@@ -1,0 +1,125 @@
+import tui_agents;
+
+def agents_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return Result { is_ok: false, value: false, error: 99 }; }; tui_true()
+}
+
+def agents_event(session: &str, id: i64, request: i64, kind: &str, content: &str, error: i64) -> Result<String, i64> {
+    let out = json_doc_object()?; let event = out.new_object()?; let value = out.new_object()?;
+    cli_put_i64(&out, event, "id", id)?; cli_put_i64(&out, event, "request", request)?;
+    cli_put_string(&out, event, "session_id", session)?; cli_put_string(&out, event, "model", "gpt-fixture")?;
+    cli_put_string(&out, event, "role", "explore")?; cli_put_bool(&out, event, "read_only", true)?;
+    cli_put_string(&out, event, "connection_id", "custom-opaque-connection-should-not-be-shown")?;
+    cli_put_string(&out, event, "kind", kind)?;
+    cli_put_string(&out, value, "content", content)?;
+    if error >= 0 { cli_put_i64(&out, value, "error", error)?; (); };
+    event.object_set("value", value)?; out.root().object_set("agent", event)?; out.serialize_string()
+}
+
+def agents_tool(session: &str, id: &str, status: &str, unknown: bool) -> Result<JsonDoc, i64> {
+    let tool = json_doc_object()?; let arguments = tool.new_object()?; let result = tool.new_object()?;
+    cli_put_string(&tool, tool.root(), "name", "read_file")?; cli_put_string(&tool, tool.root(), "status", status)?;
+    cli_put_string(&tool, arguments, "path", "windows/README.md")?; tool.root().object_set("arguments", arguments)?;
+    cli_put_bool(&tool, result, "is_error", status == "failed")?;
+    if unknown { cli_put_bool(&tool, result, "outcome_unknown", true)?; (); };
+    tool.root().object_set("result", result)?;
+    let event = json_doc_object()?; cli_put_string(&event, event.root(), "session_id", session)?;
+    cli_put_string(&event, event.root(), "id", id)?; cli_put_string(&event, event.root(), "text", tool.serialize_string()?.as_str())?;
+    Result { is_ok: true, value: event, error: 0 }
+}
+
+def agents_projection_tests() -> Result<bool, i64> {
+    let agents = tui_agents_new(); let mut app = tui_new("D:/owned-fixture", "fixture", "fixture", "parent-session");
+    tui_resize(&mut app, 120, 42)?; tui_begin(&mut app)?; tui_delta(&mut app, "PARENT BEFORE")?;
+    let start = agents_event("child-opaque-session-1", 2, 1, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, start.as_str())?;
+    agents_expect(app.messages.len() == 2 and app.messages.get(0).text.as_str() == "PARENT BEFORE", "first child seals parent text in chronological place")?;
+    let key = agents.cards.get(0).key.clone()?;
+    let delta = agents_event("child-opaque-session-1", 2, 1, "text_delta", "正在检查代码 中文 ", -1)?;
+    let mut index = 0;
+    while index < 1000 { tui_agent_event(&agents, &mut app, delta.as_str())?; index = index + 1; };
+    agents_expect(app.messages.len() == 2 and agents.cards.len() == 1 and agents.cards.get(0).preview.len() <= 576, "one thousand deltas retain one bounded card")?;
+    let frame = tui_frame(&app)?;
+    agents_expect(str_contains(frame.as_str(), "Agent #2") and str_contains(frame.as_str(), "gpt-fixture") and str_contains(frame.as_str(), "read only") and str_contains(frame.as_str(), "正在检查代码"), "card shows child identity model role and readable preview")?;
+    agents_expect(not str_contains(frame.as_str(), "\"agent\"") and not str_contains(frame.as_str(), "text_delta") and not str_contains(frame.as_str(), "child-opaque") and not str_contains(frame.as_str(), "custom-opaque"), "wire JSON and opaque ids are never visible")?;
+    tui_delta(&mut app, "PARENT AFTER STILL STREAMING")?; let parent_stream = app.stream_id;
+    let tool = agents_tool("child-opaque-session-1", "shared-call-id", "running", false)?;
+    tui_agent_tool_event(&agents, &mut app, &tool)?; tui_agent_tool_event(&agents, &mut app, &tool)?;
+    agents_expect(app.messages.len() == 2 and tui_agent_count(agents.cards.get(0), 3) == 1 and app.stream_id == parent_stream and app.streaming.as_str() == "PARENT AFTER STILL STREAMING", "child tools update one card once without sealing newer parent stream")?;
+    let done = agents_tool("child-opaque-session-1", "shared-call-id", "completed", false)?;
+    tui_agent_tool_event(&agents, &mut app, &done)?;
+    agents_expect(tui_agent_count(agents.cards.get(0), 2) == 0 and str_contains(tui_frame(&app)?.as_str(), "read_file done"), "a completed tool does not prematurely complete the child")?;
+    let newer = agents_event("child-opaque-session-1", 2, 2, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, newer.as_str())?;
+    let fresh = agents_event("child-opaque-session-1", 2, 2, "text_delta", "New request preview", -1)?;
+    tui_agent_event(&agents, &mut app, fresh.as_str())?; tui_agent_event(&agents, &mut app, delta.as_str())?;
+    agents_expect(agents.cards.get(0).preview.as_str() == "New request preview" and app.messages.len() == 2, "stale request delta cannot replace a newer request or create a new card")?;
+    let cancelled = agents_event("child-opaque-session-1", 2, 2, "finished", "Partial answer", 19)?;
+    tui_agent_event(&agents, &mut app, cancelled.as_str())?; tui_agent_event(&agents, &mut app, newer.as_str())?;
+    let slot = tui_tool_slot(&app, key.as_str());
+    agents_expect(app.messages.get(slot).tool_status.as_str() == "interrupted" and tui_agent_count(agents.cards.get(0), 2) == 3, "cancelled child remains interrupted after late starts")?;
+    let second = agents_event("child-opaque-session-2", 2, 1, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, second.as_str())?;
+    agents_expect(agents.cards.len() == 2 and agents.cards.get(0).key.as_str() != agents.cards.get(1).key.as_str(), "reused agent id in a different child session cannot overwrite old cards")?;
+    let second_done = agents_event("child-opaque-session-2", 2, 1, "finished", "Verified 12 files", 0)?;
+    tui_agent_event(&agents, &mut app, second_done.as_str())?;
+    agents_expect(tui_agent_count(agents.cards.get(1), 2) == 1, "explicit zero error is the child completion proof")?;
+    tui_agents_finish(&agents, &mut app, true)?; tui_finish(&mut app, true)?;
+    agents_expect(tui_agent_count(agents.cards.get(0), 2) == 3 and tui_agent_count(agents.cards.get(1), 2) == 1, "parent completion preserves child cancellation and known success")?;
+    tui_true()
+}
+
+def agents_invalid_and_unknown_tests() -> Result<bool, i64> {
+    let agents = tui_agents_new(); let mut app = tui_new("D:/fixture", "fixture", "fixture", "parent-session"); tui_begin(&mut app)?;
+    tui_agent_event(&agents, &mut app, "{INVALID_INTERNAL_JSON}")?;
+    tui_agent_event(&agents, &mut app, "{\"agent\":{\"id\":\"wrong\"}}")?;
+    let future = agents_event("child-sentinel", 3, 1, "future_secret_event", "SENSITIVE_INTERNAL_PAYLOAD", -1)?;
+    tui_agent_event(&agents, &mut app, future.as_str())?;
+    let parent = agents_event("parent-session", 3, 1, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, parent.as_str())?;
+    agents_expect(agents.cards.len() == 0 and app.messages.len() == 0, "malformed unknown and self-session events never become tool messages")?;
+    let start = agents_event("child-sentinel", 3, 1, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, start.as_str())?;
+    let invalid_done = agents_event("child-sentinel", 3, 1, "finished", "No error field", -1)?;
+    tui_agent_event(&agents, &mut app, invalid_done.as_str())?;
+    agents_expect(tui_agent_count(agents.cards.get(0), 2) == 0, "missing terminal proof cannot be success")?;
+    let tool = agents_tool("child-sentinel", "unknown-call", "running", false)?; tui_agent_tool_event(&agents, &mut app, &tool)?;
+    let unknown = agents_tool("child-sentinel", "unknown-call", "failed", true)?; tui_agent_tool_event(&agents, &mut app, &unknown)?;
+    let late_success = agents_event("child-sentinel", 3, 1, "finished", "Incorrect success", 0)?;
+    tui_agent_event(&agents, &mut app, late_success.as_str())?;
+    agents_expect(tui_agent_count(agents.cards.get(0), 2) == 3 and str_contains(tui_frame(&app)?.as_str(), "outcome unknown"), "unknown child tool outcome remains interrupted after a late success")?;
+    let another = agents_event("child-unfinished", 4, 1, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, another.as_str())?;
+    tui_agents_finish(&agents, &mut app, true)?;
+    agents_expect(tui_agent_count(agents.cards.get(1), 2) == 3 and not str_contains(tui_frame(&app)?.as_str(), "INVALID_INTERNAL_JSON"), "parent success does not fabricate a child result and diagnostic never echoes payload")?;
+    tui_true()
+}
+
+def agents_canonical_tool_tests() -> Result<bool, i64> {
+    let agents = tui_agents_new(); let mut app = tui_new("D:/fixture", "fixture", "fixture", "parent"); tui_begin(&mut app)?;
+    let turn = json_parse(agents_event("canonical-child", 2, 1, "turn", "Inspecting files", -1)?.as_str())?;
+    let calls = turn.new_array()?; let call = turn.new_object()?;
+    cli_put_string(&turn, call, "id", "canonical-read")?; cli_put_string(&turn, call, "name", "read_file")?;
+    cli_put_string(&turn, call, "arguments", "{\"path\":\"windows/README.md\"}")?;
+    calls.array_push(call)?; turn.root().object_get("agent")?.object_get("value")?.object_set("tool_calls", calls)?;
+    tui_agent_event(&agents, &mut app, turn.serialize_string()?.as_str())?;
+    agents_expect(app.messages.len() == 1 and tui_agent_count(agents.cards.get(0), 3) == 1 and str_contains(tui_frame(&app)?.as_str(), "read_file") and str_contains(tui_frame(&app)?.as_str(), "windows/README.md"), "actual canonical child turn supplies tool progress without outer tool events")?;
+    let completed = json_parse(agents_event("canonical-child", 2, 1, "tool_completed", "File contents", -1)?.as_str())?;
+    cli_put_bool(&completed, completed.root().object_get("agent")?.object_get("value")?, "is_error", false)?;
+    tui_agent_event(&agents, &mut app, completed.serialize_string()?.as_str())?;
+    agents_expect(app.messages.len() == 1 and str_contains(tui_frame(&app)?.as_str(), "read_file done") and tui_agent_count(agents.cards.get(0), 2) == 0, "actual child tool_completed updates the same card while child remains active")?;
+    let next = agents_event("canonical-child", 2, 2, "request_started", "", -1)?;
+    tui_agent_event(&agents, &mut app, next.as_str())?;
+    agents_expect(agents.cards.get(0).tool_call.len() == 0 and str_contains(app.messages.get(0).tool_detail.as_str(), "1 tool · read_file") and str_contains(tui_frame(&app)?.as_str(), "read_file"), "latest tool remains readable after a new request clears transient activity")?;
+    let finished = agents_event("canonical-child", 2, 2, "finished", "Files verified", 0)?;
+    tui_agent_event(&agents, &mut app, finished.as_str())?;
+    agents_expect(app.messages.len() == 1 and app.messages.get(0).tool_status.as_str() == "completed" and str_contains(app.messages.get(0).tool_detail.as_str(), "1 tool · read_file") and str_contains(tui_frame(&app)?.as_str(), "Files verified"), "completed child retains latest tool summary beside its answer")?;
+    tui_true()
+}
+
+def main() -> i64 {
+    let projected = agents_projection_tests(); if not projected.is_ok() { return 1; };
+    let invalid = agents_invalid_and_unknown_tests(); if not invalid.is_ok() { return 1; };
+    let canonical = agents_canonical_tool_tests(); if not canonical.is_ok() { return 1; };
+    println("Agent projection: stable bounded cards, request watermarks, child tools, opaque wire suppression and honest terminal states passed"); 0
+}

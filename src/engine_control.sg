@@ -1,0 +1,254 @@
+import common;
+import std::terminal;
+import std::time;
+import std::random;
+import question;
+
+// Private host queue records are never terminal keystrokes. In particular a
+// queued submit cannot answer an approval. 90=partial, 91=submit, 92=cancel,
+// 93=shutdown/EOF, 94=active submission, 95=approval nonce, 96=answer.
+def engine_control_record(kind: i64, code: i64, text: &str) -> TerminalEvent {
+    TerminalEvent { kind: kind, code: code, modifiers: 0, width: 0, height: 0, data: cli_text(text) }
+}
+
+def engine_control_slot(input: &Vec<TerminalEvent>, kind: i64) -> i64 {
+    let mut index = 0;
+    while index < input.len() { let item: &TerminalEvent = input.get(index); if item.kind == kind { return index; }; index = index + 1; };
+    -1
+}
+
+def engine_control_enabled(input: &Vec<TerminalEvent>) -> bool { engine_control_slot(input, 90) >= 0 }
+
+def engine_control_init(input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    if engine_control_enabled(input) { return Result { is_ok: true, value: true, error: 0 }; };
+    if input.len() != 0 { return Result { is_ok: false, value: false, error: 12 }; };
+    if not input.push(engine_control_record(90, 0, "")) { return Result { is_ok: false, value: false, error: 8 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_control_remove(input: &Vec<TerminalEvent>, kind: i64) {
+    let mut index = engine_control_slot(input, kind);
+    while index >= 0 { input.remove(index); index = engine_control_slot(input, kind); };
+}
+
+def engine_control_active(input: &Vec<TerminalEvent>) -> String {
+    let index = engine_control_slot(input, 94);
+    if index < 0 { return string_new(); };
+    let item: &TerminalEvent = input.get(index); cli_text(item.data.as_str())
+}
+
+def engine_control_begin(input: &Vec<TerminalEvent>, id: &str) -> Result<bool, i64> {
+    engine_control_remove(input, 92); engine_control_remove(input, 94);
+    engine_control_remove(input, 95); engine_control_remove(input, 96);
+    if not input.push(engine_control_record(94, 0, id)) { return Result { is_ok: false, value: false, error: 8 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_control_end(input: &Vec<TerminalEvent>) {
+    engine_control_remove(input, 92); engine_control_remove(input, 94);
+    engine_control_remove(input, 95); engine_control_remove(input, 96);
+}
+
+def engine_control_emit(kind: &str, id: &str, request: &str, text: &str) -> Result<bool, i64> {
+    let document = json_doc_object()?;
+    cli_put_i64(&document, document.root(), "schema", 1)?;
+    cli_put_string(&document, document.root(), "type", kind)?;
+    cli_put_string(&document, document.root(), "id", id)?;
+    cli_put_string(&document, document.root(), "request_id", request)?;
+    cli_put_string(&document, document.root(), "text", text)?;
+    let encoded = document.serialize_string()?;
+    io_stdout_write(encoded.as_str())?; io_stdout_write("\n")?; io_stdout_flush()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_control_accept(input: &Vec<TerminalEvent>, line: &str) -> Result<bool, i64> {
+    let parsed = json_parse(line);
+    if not parsed.is_ok() { engine_control_emit("notice", "invalid-command", "", "Invalid engine JSONL command")?; return Result { is_ok: true, value: false, error: 0 }; };
+    let document = parsed.value;
+    if document.root().kind()? != JSON_KIND_OBJECT() { engine_control_emit("notice", "invalid-command", "", "Engine JSONL commands must be objects")?; return Result { is_ok: true, value: false, error: 0 }; };
+    let kind = cli_json_optional_string(document.root(), "type");
+    let id = cli_json_optional_string(document.root(), "id");
+    if kind.as_str() == "shutdown" {
+        if engine_control_slot(input, 93) < 0 { input.push(engine_control_record(93, 0, "shutdown")); (); };
+        return Result { is_ok: true, value: true, error: 0 };
+    };
+    if kind.as_str() == "cancel" {
+        let active = engine_control_active(input);
+        if active.len() > 0 and (id.len() == 0 or id.as_str() == active.as_str()) {
+            if engine_control_slot(input, 92) < 0 { input.push(engine_control_record(92, 0, active.as_str())); (); };
+        };
+        return Result { is_ok: true, value: true, error: 0 };
+    };
+    if kind.as_str() == "approval" {
+        let index = engine_control_slot(input, 95);
+        if index >= 0 and engine_control_slot(input, 96) < 0 {
+            let nonce: &TerminalEvent = input.get(index);
+            if id.as_str() == nonce.data.as_str() {
+                let active = engine_control_active(input);
+                let target = cli_json_optional_string(document.root(), "request_id");
+                if target.len() == 0 or target.as_str() == active.as_str() {
+                    if not input.push(engine_control_record(96, 0, line)) { return Result { is_ok: false, value: false, error: 8 }; };
+                    return Result { is_ok: true, value: true, error: 0 };
+                };
+            };
+        };
+        engine_control_emit("notice", "stale-approval", "", "Approval does not match the active interaction")?;
+        return Result { is_ok: true, value: false, error: 0 };
+    };
+    if kind.as_str() != "submit" or id.len() == 0 or id.len() > 128 or cli_json_optional_string(document.root(), "text").len() == 0 {
+        engine_control_emit("notice", "invalid-command", id.as_str(), "Expected submit with id/text, cancel, approval or shutdown")?;
+        return Result { is_ok: true, value: false, error: 0 };
+    };
+    let mut count = 0; let mut index = 0;
+    while index < input.len() {
+        let queued: &TerminalEvent = input.get(index);
+        if queued.kind == 91 { count = count + 1; };
+        index = index + 1;
+    };
+    if count >= 16 { engine_control_emit("notice", "queue-full", id.as_str(), "Engine submission queue is full")?; return Result { is_ok: true, value: false, error: 0 }; };
+    if not input.push(engine_control_record(91, 0, line)) { return Result { is_ok: false, value: false, error: 8 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+// Bounded polling is shared by provider, process, MCP and approval waits.
+def engine_control_poll(terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let partial_slot = engine_control_slot(input, 90);
+    if partial_slot < 0 { return Result { is_ok: false, value: false, error: 2 }; };
+    let mut observed = 0;
+    while observed < 8192 {
+        let event = terminal.read_event(0)?;
+        if event.kind == 0 { break; };
+        if event.kind == 4 or event.kind == 5 {
+            let kind = if event.kind == 5 { 93 } else { 92 };
+            if engine_control_slot(input, kind) < 0 { input.push(engine_control_record(kind, 0, "")); (); };
+            break;
+        };
+        if event.kind == 1 {
+            let partial: &TerminalEvent = input.get(partial_slot);
+            if event.code == 10 {
+                // Accept can grow the queue and invalidate this element borrow.
+                let line = partial.data.clone()?;
+                partial.data.clear();
+                if line.len() > 0 { engine_control_accept(input, line.as_str())?; (); };
+            } else { if event.code != 13 {
+                if event.code < 32 { return Result { is_ok: false, value: false, error: 10 }; };
+                if partial.data.len() + event.data.len() > 262144 { return Result { is_ok: false, value: false, error: 13 }; };
+                partial.data.push_str(event.data.as_str())?;
+                ();
+            }; };
+        };
+        observed = observed + 1;
+    };
+    Result { is_ok: true, value: engine_control_slot(input, 92) >= 0 or engine_control_slot(input, 93) >= 0, error: 0 }
+}
+
+def engine_control_next(input: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let index = engine_control_slot(input, 91);
+    if index < 0 { return json_doc_object(); };
+    let item = input.remove(index);
+    if not item.is_some { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    json_parse(item.value.data.as_str())
+}
+
+def engine_control_interaction_start(input: &Vec<TerminalEvent>, tool: &str, text: &str, question: bool) -> Result<String, i64> {
+    let details = json_doc_object()?;
+    engine_control_interaction_start_details(input, tool, text, question, &details)
+}
+
+def engine_control_interaction_event(id: &str, request: &str, tool: &str, text: &str, question: bool, details: &JsonDoc) -> Result<JsonDoc, i64> {
+    let event = json_doc_object()?;
+    cli_put_i64(&event, event.root(), "schema", 1)?;
+    cli_put_string(&event, event.root(), "type", "approval")?;
+    cli_put_string(&event, event.root(), "id", id)?;
+    cli_put_string(&event, event.root(), "request_id", request)?;
+    cli_put_string(&event, event.root(), "tool", tool)?;
+    cli_put_string(&event, event.root(), "text", text)?;
+    cli_put_string(&event, event.root(), "mode", if question { "question" } else { "permission" })?;
+    if question and details.root().object_has("options") {
+        let options = details.root().object_get("options")?;
+        if not question_options_valid(options) { return Result { is_ok: false, value: event, error: 2 }; };
+        event.root().object_set("options", event.copy(options)?)?;
+        ();
+    };
+    Result { is_ok: true, value: event, error: 0 }
+}
+
+def engine_control_interaction_start_details(input: &Vec<TerminalEvent>, tool: &str, text: &str, question: bool, details: &JsonDoc) -> Result<String, i64> {
+    let active_slot = engine_control_slot(input, 94);
+    if active_slot < 0 { return string_result_err(12); };
+    let active: &TerminalEvent = input.get(active_slot);
+    let id = cli_join(active.data.as_str(), "-approval-")?;
+    id.push_i64(active.code + 1)?;
+    id.push_str("-")?;id.push_i64(random_i64())?;
+    id.push_str("-")?;id.push_i64(random_i64())?;
+    let next = engine_control_record(94, active.code + 1, active.data.as_str());
+    input.set(active_slot, next);
+    engine_control_remove(input, 95); engine_control_remove(input, 96);
+    input.push(engine_control_record(95, 0, id.as_str()));
+    let event = engine_control_interaction_event(id.as_str(), engine_control_active(input).as_str(), tool, text, question, details)?;
+    let encoded = event.serialize_string()?;
+    io_stdout_write(encoded.as_str())?; io_stdout_write("\n")?; io_stdout_flush()?;
+    Result { is_ok: true, value: id, error: 0 }
+}
+
+def engine_control_interaction_take(input: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let index = engine_control_slot(input, 96);
+    if index < 0 { return json_doc_object(); };
+    let answer = input.remove(index);
+    engine_control_remove(input, 95);
+    if not answer.is_some { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    json_parse(answer.value.data.as_str())
+}
+
+def engine_control_interaction(terminal: &Terminal, input: &Vec<TerminalEvent>, tool: &str, text: &str, question: bool) -> Result<JsonDoc, i64> {
+    let details = json_doc_object()?;
+    engine_control_interaction_details(terminal, input, tool, text, question, &details)
+}
+
+def engine_control_interaction_details(terminal: &Terminal, input: &Vec<TerminalEvent>, tool: &str, text: &str, question: bool, details: &JsonDoc) -> Result<JsonDoc, i64> {
+    // Discard approvals already queued before the new interaction. Opaque
+    // unpredictable nonces also prevent speculative approval of a future id.
+    engine_control_remove(input,95);engine_control_remove(input,96);
+    if engine_control_poll(terminal,input)?{return Result{is_ok:false,value:JsonDoc{handle:0},error:19};};
+    engine_control_interaction_start_details(input, tool, text, question, details)?;
+    loop {
+        if engine_control_poll(terminal, input)? { engine_control_remove(input, 95); engine_control_remove(input, 96); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 19 }; };
+        let index = engine_control_slot(input, 96);
+        if index >= 0 {
+            return engine_control_interaction_take(input);
+        };
+        time_sleep_ms(2);
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 19 }
+}
+
+def engine_control_confirm(terminal: &Terminal, input: &Vec<TerminalEvent>, tool: &str, preview: &str) -> Result<bool, i64> {
+    let response = engine_control_interaction(terminal, input, tool, preview, false)?;
+    if response.root().object_has("cancelled") and response.root().object_get("cancelled")?.bool_value().unwrap_or(true) { return Result { is_ok: true, value: false, error: 0 }; };
+    if not response.root().object_has("approved") { return Result { is_ok: true, value: false, error: 0 }; };
+    let approved = response.root().object_get("approved")?.bool_value();
+    Result { is_ok: true, value: approved.is_ok and approved.value, error: 0 }
+}
+
+def engine_control_question(terminal: &Terminal, input: &Vec<TerminalEvent>, question: &str) -> Result<String, i64> {
+    let response = engine_control_interaction(terminal, input, "ask_user", question, true)?;
+    engine_control_question_answer(&response)
+}
+
+def engine_control_question_options(terminal: &Terminal, input: &Vec<TerminalEvent>, arguments: &JsonDoc) -> Result<String, i64> {
+    if not question_arguments_valid(arguments) { return string_result_err(2); };
+    let question = cli_json_string(arguments.root(), "question")?;
+    let response = engine_control_interaction_details(terminal, input, "ask_user", question.as_str(), true, arguments)?;
+    engine_control_question_answer(&response)
+}
+
+def engine_control_question_answer(response: &JsonDoc) -> Result<String, i64> {
+    if response.root().object_has("cancelled") {
+        let cancelled = response.root().object_get("cancelled")?.bool_value()?;
+        if cancelled { return string_result_err(19); };
+    };
+    if not response.root().object_has("text") or not question_text_bounded(response.root().object_get("text")?, 1, 8192) { return string_result_err(2); };
+    let text = cli_json_string(response.root(), "text")?;
+    if str_trim(text.as_str())?.len() == 0 { return string_result_err(2); };
+    Result { is_ok: true, value: text, error: 0 }
+}

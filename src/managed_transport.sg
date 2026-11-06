@@ -1,0 +1,123 @@
+import common;
+import std::process;
+import std::time;
+import std::env;
+import engine_control;
+import terminal;
+
+// Single-threaded ownership of the public JSONL protocol. Native process I/O
+// provides bounded byte transport; parsing and lifecycle stay in Sengoo.
+struct ManagedTransport { child: ProcessHandle, pending: Buffer, stdout: Buffer, stderr: Buffer }
+
+def managed_transport_env(command: &ProcessCommand, name: &str) -> Result<bool, i64> {
+    if not env_has_var(name) { return Result { is_ok: true, value: true, error: 0 }; };
+    let buffer = ffi_buffer_new(32768)?;
+    let count = env_var_copy(name, buffer)?;
+    let value = string_from_buffer(buffer, count)?;
+    command.env_set(name, value.as_str())
+}
+
+def managed_transport_start(metadata: &JsonDoc, cwd: &str) -> Result<ManagedTransport, i64> {
+    let executable = cli_json_string(metadata.root(), "executable")?;
+    let command = process_command(executable.as_str())?;
+    command.cwd(cwd)?;
+    let arguments = metadata.root().object_get("arguments")?;
+    let mut index = 0;
+    while index < arguments.array_len()? { let argument = arguments.array_get(index)?.string_value()?; command.arg(argument.as_str())?; index = index + 1; };
+    let name = cli_json_string(metadata.root(), "profile_env_name")?;
+    let profile = cli_json_string(metadata.root(), "profile_directory")?;
+    if name.as_str() != "CODEX_HOME" and name.as_str() != "GROK_HOME" { return Result { is_ok: false, value: ManagedTransport { child: ProcessHandle { handle: 0 }, pending: Buffer { handle: 0 }, stdout: Buffer { handle: 0 }, stderr: Buffer { handle: 0 } }, error: 7 }; };
+    // Preserve OS/tool discovery and explicit proxy/certificate configuration.
+    // Never inherit arbitrary provider secrets or backend auth override vars.
+    command.env_clear()?;
+    managed_transport_env(&command, "SystemRoot")?; managed_transport_env(&command, "WINDIR")?;
+    managed_transport_env(&command, "PATH")?; managed_transport_env(&command, "PATHEXT")?;
+    managed_transport_env(&command, "ComSpec")?; managed_transport_env(&command, "TEMP")?; managed_transport_env(&command, "TMP")?;
+    managed_transport_env(&command, "USERPROFILE")?; managed_transport_env(&command, "HOMEDRIVE")?; managed_transport_env(&command, "HOMEPATH")?;
+    managed_transport_env(&command, "APPDATA")?; managed_transport_env(&command, "LOCALAPPDATA")?;
+    managed_transport_env(&command, "PROGRAMDATA")?; managed_transport_env(&command, "ProgramFiles")?;
+    managed_transport_env(&command, "ProgramFiles(x86)")?; managed_transport_env(&command, "ProgramW6432")?;
+    managed_transport_env(&command, "SYSTEMDRIVE")?; managed_transport_env(&command, "NUMBER_OF_PROCESSORS")?;
+    managed_transport_env(&command, "OS")?; managed_transport_env(&command, "PROCESSOR_ARCHITECTURE")?;
+    managed_transport_env(&command, "HTTPS_PROXY")?; managed_transport_env(&command, "HTTP_PROXY")?;
+    managed_transport_env(&command, "ALL_PROXY")?; managed_transport_env(&command, "NO_PROXY")?;
+    managed_transport_env(&command, "SSL_CERT_FILE")?; managed_transport_env(&command, "SSL_CERT_DIR")?;
+    command.env_set(name.as_str(), profile.as_str())?;
+    let pending = ffi_buffer_new(1048576)?;
+    let stdout = ffi_buffer_new(8192)?;
+    let stderr = ffi_buffer_new(8192)?;
+    let child = command.spawn_piped()?;
+    Result { is_ok: true, value: ManagedTransport { child: child, pending: pending, stdout: stdout, stderr: stderr }, error: 0 }
+}
+
+def managed_transport_write(transport: &ManagedTransport, document: &JsonDoc, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let encoded = document.serialize_string()?;
+    if encoded.len() > 786432 { return Result { is_ok: false, value: false, error: 13 }; };
+    encoded.push_str("\n")?;
+    let buffer = ffi_buffer_from_bytes(encoded.as_str())?;
+    let mut offset = 0;
+    let started = time_unix_ms();
+    while offset < buffer.used_len() {
+        if ui_poll_busy(terminal, input)? { return Result { is_ok: false, value: false, error: 19 }; };
+        let part = ffi_buffer_new(buffer.used_len() - offset)?;
+        part.append_copy(&buffer, offset, buffer.used_len() - offset)?;
+        let written = transport.child.try_write_stdin(&part, part.used_len())?;
+        if written == 0 { if time_since_ms(started) > 10000 { return Result { is_ok: false, value: false, error: 9 }; }; time_sleep_ms(1); (); } else { offset = offset + written; };
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_rpc_request(transport: &ManagedTransport, id: &str, method: &str, params: &JsonDoc, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let request = json_doc_object()?;
+    cli_put_string(&request, request.root(), "jsonrpc", "2.0")?;
+    if id.len() > 0 { cli_put_string(&request, request.root(), "id", id)?; (); };
+    cli_put_string(&request, request.root(), "method", method)?;
+    request.root().object_set("params", request.copy(params.root())?)?;
+    managed_transport_write(transport, &request, terminal, input)
+}
+
+def managed_rpc_response(transport: &ManagedTransport, id: JsonValue, result: &JsonDoc, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let response = json_doc_object()?;
+    cli_put_string(&response, response.root(), "jsonrpc", "2.0")?;
+    response.root().object_set("id", response.copy(id)?)?;
+    response.root().object_set("result", response.copy(result.root())?)?;
+    managed_transport_write(transport, &response, terminal, input)
+}
+
+def managed_rpc_unsupported(transport: &ManagedTransport, id: JsonValue, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let response = json_parse("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Unsupported client method\"}}")?;
+    response.root().object_set("id", response.copy(id)?)?;
+    managed_transport_write(transport, &response, terminal, input)
+}
+
+def managed_transport_poll(transport: &mut ManagedTransport) -> Result<JsonDoc, i64> {
+    let error_count = transport.child.read_stderr(&mut transport.stderr)?;
+    // Stderr is drained independently and deliberately not forwarded: runtime
+    // diagnostics can contain account/profile details and tool output.
+    let count = transport.child.read_stdout(&mut transport.stdout)?;
+    if count > 0 {
+        if transport.pending.used_len() + count > transport.pending.capacity() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        transport.pending.append_copy(&transport.stdout, 0, count)?;
+        ();
+    };
+    let newline = cli_bytes_index(&transport.pending, "\n")?;
+    if newline >= 0 {
+        if newline > 786432 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        let line = cli_bytes_text(&transport.pending, 0, newline)?;
+        transport.pending.consume(newline + 1)?;
+        if line.len() == 0 { return json_doc_object(); };
+        let document = json_parse(line.as_str())?;
+        if document.root().kind()? != JSON_KIND_OBJECT() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
+        if document.root().object_has("jsonrpc") and cli_json_optional_string(document.root(), "jsonrpc").as_str() != "2.0" { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
+        return Result { is_ok: true, value: document, error: 0 };
+    };
+    if transport.child.try_wait()? and transport.child.stdout_eof()? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 9 }; };
+    json_doc_object()
+}
+
+def managed_transport_close(transport: &ManagedTransport) -> Result<bool, i64> {
+    transport.child.close_stdin()?;
+    transport.child.terminate_tree()?;
+    transport.child.reap(5000)?;
+    Result { is_ok: true, value: true, error: 0 }
+}

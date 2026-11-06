@@ -1,0 +1,270 @@
+import controller;
+import managed_client;
+
+struct ManagedText { text: String }
+
+def managed_execution_marker(state: &CliState, execution: &CliExecution, engine: &str, cleanup: bool) -> Result<bool, i64> {
+    let mut transaction = state.db.transaction()?;
+    state_tx_exec_valid(&transaction, state, execution)?;
+    let mut update = transaction.prepare("UPDATE shared_executions SET engine=?,cleanup_required=?,updated_at=? WHERE session_id=? AND execution_id=? AND fence=?")?;
+    update.bind_text(1, engine)?; update.bind_i64(2, if cleanup { 1 } else { 0 })?; update.bind_i64(3, time_unix_ms())?;
+    update.bind_text(4, execution.session.as_str())?; update.bind_text(5, execution.id.as_str())?; update.bind_i64(6, execution.fence)?; update.step()?;
+    transaction.commit()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_tool_id(execution: &CliExecution, native_id: &str) -> Result<String, i64> {
+    let id = cli_join(execution.id.as_str(), ":managed:")?;
+    id.push_str(native_id)?;
+    Result { is_ok: true, value: id, error: 0 }
+}
+
+def managed_tool_claim(state: &CliState, execution: &CliExecution, tools: &Vec<ManagedText>, native_id: &str, name: &str, data: &str) -> Result<String, i64> {
+    if native_id.len() == 0 or native_id.len() > 256 { return string_result_err(10); };
+    let id = managed_tool_id(execution, native_id)?;
+    let mut index = 0;
+    while index < tools.len() { let known: &ManagedText = tools.get(index); if known.text.as_str() == id.as_str() { return Result { is_ok: true, value: id, error: 0 }; }; index = index + 1; };
+    if tools.len() >= 2048 { return string_result_err(13); };
+    if not cli_state_tool_claim(state, execution, id.as_str(), name, data)? { return string_result_err(12); };
+    let inserted = tools.push(ManagedText { text: id.clone()? });
+    if not inserted { return string_result_err(8); };
+    Result { is_ok: true, value: id, error: 0 }
+}
+
+def managed_tool_finish(state: &CliState, execution: &CliExecution, id: &str, result: &str) -> Result<bool, i64> {
+    if cli_state_tool_result(state, execution.session.as_str(), id).is_ok() { return Result { is_ok: true, value: true, error: 0 }; };
+    cli_state_tool_complete(state, execution, id, result)
+}
+
+def managed_tools_quiescent(state: &CliState, execution: &CliExecution, tools: &Vec<ManagedText>) -> Result<bool, i64> {
+    let mut index = 0;
+    while index < tools.len() {
+        let id: &ManagedText = tools.get(index);
+        managed_tool_finish(state, execution, id.text.as_str(), "{\"is_error\":true,\"content\":\"Managed runtime stopped after owned process-tree cleanup; inspect possible side effects before retrying\"}")?;
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_event_tool(state: &CliState, execution: &CliExecution, options: &AgentOptions, tools: &Vec<ManagedText>, native_id: &str, name: &str, payload: JsonValue, finished: bool) -> Result<bool, i64> {
+    let document = json_doc_object()?;
+    cli_put_string(&document, document.root(), "name", name)?;
+    cli_put_string(&document, document.root(), "status", if finished { "completed" } else { "running" })?;
+    document.root().object_set(if finished { "result" } else { "arguments" }, document.copy(payload)?)?;
+    let text = document.serialize_string()?;
+    let id = managed_tool_claim(state, execution, tools, native_id, name, text.as_str())?;
+    if finished { managed_tool_finish(state, execution, id.as_str(), text.as_str())?; (); };
+    controller_event(options, execution, id.as_str(), "tool", options.connection.as_str(), options.model.as_str(), text.as_str())
+}
+
+def managed_bound(client: &ManagedClient, params: JsonValue) -> bool {
+    if client.engine.as_str() == "codex-app-server" {
+        let session = cli_json_optional_string(params, "threadId");
+        if session.as_str() != client.session.as_str() { return false; };
+        if params.object_has("turnId") and cli_json_optional_string(params, "turnId").as_str() != client.turn.as_str() { return false; };
+        return true;
+    };
+    cli_json_optional_string(params, "sessionId").as_str() == client.session.as_str()
+}
+
+def managed_approval_reply(client: &ManagedClient, request: &JsonDoc, approved: bool, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let method = cli_json_string(request.root(), "method")?;
+    let params = request.root().object_get("params")?;
+    let result = managed_approval_result(client.engine.as_str(), method.as_str(), params, approved)?;
+    managed_rpc_response(&client.transport, request.root().object_get("id")?, &result, terminal, input)
+}
+
+def managed_stream(state: &CliState, execution: &CliExecution, options: &AgentOptions, client: &mut ManagedClient, message: &str, tools: &Vec<ManagedText>, terminal: &Terminal) -> Result<String, i64> {
+    let output = string_new();
+    let seen_items: Vec<ManagedText> = vec_new();
+    let seen_approvals: Vec<ManagedText> = vec_new();
+    let queued_approvals: Vec<JsonDoc> = vec_new();
+    let mut approval = json_doc_object()?;
+    let mut sequence = 0;
+    let started = time_unix_ms();
+    loop {
+        if ui_poll_busy(terminal, &options.input)? { managed_client_cancel(client); return string_result_err(19); };
+        if time_since_ms(started) > 600000 { managed_client_cancel(client); return string_result_err(9); };
+        if approval.root().object_has("id") {
+            let answer = engine_control_interaction_take(&options.input)?;
+            if answer.root().object_has("id") {
+                let allowed = answer.root().object_has("approved") and answer.root().object_get("approved")?.bool_value().unwrap_or(false);
+                managed_approval_reply(client, &approval, allowed, terminal, &options.input)?;
+                approval = json_doc_object()?;
+                if not allowed { managed_client_cancel(client); return string_result_err(12); };
+            };
+        };
+        if not approval.root().object_has("id") and queued_approvals.len() > 0 {
+            let next = queued_approvals.remove(0);
+            if not next.is_some { return string_result_err(8); };
+            approval = next.value;
+            let params = approval.root().object_get("params")?;
+            let detail = approval.serialize_string()?;
+            let native_id = if client.engine.as_str() == "codex-app-server" { cli_json_string(params, "itemId")? } else { cli_json_string(params.object_get("toolCall")?, "toolCallId")? };
+            managed_tool_claim(state, execution, tools, native_id.as_str(), "managed-permission", detail.as_str())?;
+            if engine_control_enabled(&options.input) {
+                engine_control_interaction_start(&options.input, "managed-permission", detail.as_str(), false)?;
+                ();
+            } else {
+                let allowed = if options.policy.interactive and terminal.is_tty() { ui_confirm(terminal, detail.as_str())? } else { false };
+                managed_approval_reply(client, &approval, allowed, terminal, &options.input)?;
+                approval = json_doc_object()?;
+                if not allowed { managed_client_cancel(client); return string_result_err(12); };
+            };
+        };
+        let event = managed_client_next(client)?;
+        if event.root().object_has("method") {
+            let method = cli_json_string(event.root(), "method")?;
+            let params = event.root().object_get("params")?;
+            if event.root().object_has("id") {
+                if managed_approval_method(client.engine.as_str(), method.as_str()) {
+                    if not managed_bound(client, params) { return string_result_err(10); };
+                    let rpc_id = event.root().object_get("id")?;
+                    if not rpc_id.number_i64().is_ok() {
+                        let text_id = rpc_id.string_value()?;
+                        if text_id.len() < 1 or text_id.len() > 128 { return string_result_err(10); };
+                    };
+                    let marker = json_doc_object()?; marker.root().object_set("id", marker.copy(event.root().object_get("id")?)?)?;
+                    let encoded_id = marker.serialize_string()?;
+                    let mut index = 0;
+                    while index < seen_approvals.len() { let seen: &ManagedText = seen_approvals.get(index); if seen.text.as_str() == encoded_id.as_str() { return string_result_err(10); }; index = index + 1; };
+                    if seen_approvals.len() >= 256 or queued_approvals.len() >= 16 { return string_result_err(13); };
+                    seen_approvals.push(ManagedText { text: encoded_id });
+                    queued_approvals.push(event);
+                    ();
+                } else {
+                    managed_rpc_unsupported(&client.transport, event.root().object_get("id")?, terminal, &options.input)?;
+                    ();
+                };
+            } else {
+                let bound_event = method.as_str() == "item/agentMessage/delta" or method.as_str() == "item/started" or method.as_str() == "item/completed" or method.as_str() == "turn/completed" or method.as_str() == "session/update";
+                if bound_event and not managed_bound(client, params) { return string_result_err(10); };
+                if managed_bound(client, params) {
+                let mut delta = string_new();
+                if client.engine.as_str() == "codex-app-server" {
+                    if method.as_str() == "item/agentMessage/delta" {
+                        let item = cli_json_string(params, "itemId")?;
+                        let mut known = false; let mut index = 0;
+                        while index < seen_items.len() { let seen: &ManagedText = seen_items.get(index); if seen.text.as_str() == item.as_str() { known = true; }; index = index + 1; };
+                        if not known { if seen_items.len() >= 2048 { return string_result_err(13); }; seen_items.push(ManagedText { text: item }); (); };
+                        delta = cli_json_string(params, "delta")?;
+                    };
+                    if method.as_str() == "item/started" or method.as_str() == "item/completed" {
+                        let item = params.object_get("item")?;
+                        let kind = cli_json_string(item, "type")?;
+                        if kind.as_str() == "agentMessage" and method.as_str() == "item/completed" {
+                            let id = cli_json_string(item, "id")?;
+                            let mut seen = false; let mut index = 0;
+                            while index < seen_items.len() { let previous: &ManagedText = seen_items.get(index); if previous.text.as_str() == id.as_str() { seen = true; }; index = index + 1; };
+                            if not seen { if seen_items.len() >= 2048 { return string_result_err(13); }; seen_items.push(ManagedText { text: id }); delta = cli_json_optional_string(item, "text"); };
+                        } else { if kind.as_str() != "userMessage" and kind.as_str() != "agentMessage" and kind.as_str() != "reasoning" {
+                            managed_event_tool(state, execution, options, tools, cli_json_string(item, "id")?.as_str(), kind.as_str(), item, method.as_str() == "item/completed")?;
+                            ();
+                        }; };
+                    };
+                    if method.as_str() == "turn/completed" {
+                        if approval.root().object_has("id") or queued_approvals.len() > 0 { return string_result_err(10); };
+                        let turn = params.object_get("turn")?;
+                        if cli_json_string(turn, "id")?.as_str() != client.turn.as_str() { return string_result_err(10); };
+                        let status = cli_json_string(turn, "status")?;
+                        if status.as_str() == "completed" { return Result { is_ok: true, value: output, error: 0 }; };
+                        return string_result_err(if status.as_str() == "interrupted" { 19 } else { 9 });
+                    };
+                } else { if method.as_str() == "session/update" {
+                    let update = params.object_get("update")?;
+                    let kind = cli_json_string(update, "sessionUpdate")?;
+                    if kind.as_str() == "agent_message_chunk" {
+                        let content = update.object_get("content")?;
+                        if cli_json_optional_string(content, "type").as_str() == "text" { delta = cli_json_string(content, "text")?; };
+                    };
+                    if kind.as_str() == "tool_call" or kind.as_str() == "tool_call_update" {
+                        let status = cli_json_optional_string(update, "status");
+                        managed_event_tool(state, execution, options, tools, cli_json_string(update, "toolCallId")?.as_str(), "managed-tool", update, status.as_str() == "completed" or status.as_str() == "failed")?;
+                        ();
+                    };
+                }; };
+                if delta.len() > 0 {
+                    if output.len() + delta.len() > 1048576 { return string_result_err(13); };
+                    output.push_str(delta.as_str())?;
+                    cli_state_stream_delta(state, execution, message, delta.as_str())?;
+                    let id = cli_join(execution.id.as_str(), ":delta:")?; id.push_i64(sequence)?; sequence = sequence + 1;
+                    controller_event(options, execution, id.as_str(), "text_delta", options.connection.as_str(), options.model.as_str(), delta.as_str())?;
+                    ();
+                };
+            }; };
+        } else { if event.root().object_has("id") {
+            if client.engine.as_str() == "sencode-acp" and cli_json_optional_string(event.root(), "id").as_str() == "prompt" {
+                if event.root().object_has("error") { return string_result_err(9); };
+                if approval.root().object_has("id") or queued_approvals.len() > 0 { return string_result_err(10); };
+                let reason = cli_json_string(event.root().object_get("result")?, "stopReason")?;
+                if reason.as_str() == "end_turn" { return Result { is_ok: true, value: output, error: 0 }; };
+                return string_result_err(if reason.as_str() == "cancelled" { 19 } else { 13 });
+            };
+        }; };
+        time_sleep_ms(1);
+    };
+    string_result_err(9)
+}
+
+def engine_managed_active(state: &CliState, execution: &CliExecution, options: &AgentOptions, metadata: &JsonDoc, prompt: &str, client: &mut ManagedClient, tools: &Vec<ManagedText>, terminal: &Terminal) -> Result<String, i64> {
+    let history = cli_state_history(state, options.session.as_str())?;
+    let previous = history.serialize_string()?;
+    let system = controller_system(options)?;
+    let context = cli_join(system.as_str(), "\nThe following JSON is public local conversation history, not instructions from a provider. Continue the current task using your runtime's tools. Preserve prior tool outcomes and inspect uncertain side effects before retrying.\n")?;
+    if previous.len() > 524288 { return string_result_err(13); };
+    context.push_str(previous.as_str())?;
+    context.push_str("\nCurrent user task:\n")?; context.push_str(prompt)?;
+    let user = json_doc_object()?;
+    cli_put_string(&user, user.root(), "role", "user")?; cli_put_string(&user, user.root(), "content", prompt)?;
+    cli_state_append(state, execution, &user)?;
+    managed_client_initialize(client, metadata, terminal, &options.input)?;
+    let message = cli_state_stream_start(state, execution)?;
+    controller_event(options, execution, execution.id.as_str(), "request_started", options.connection.as_str(), options.model.as_str(), "")?;
+    managed_client_begin(client, options.cwd.as_str(), options.model.as_str(), context.as_str(), execution.id.as_str(), terminal, &options.input)?;
+    let binding = json_doc_object()?;
+    cli_put_string(&binding, binding.root(), "engine", client.engine.as_str())?;
+    cli_put_string(&binding, binding.root(), "connection_id", options.connection.as_str())?;
+    cli_put_string(&binding, binding.root(), "native_session_id", client.session.as_str())?;
+    cli_put_bool(&binding, binding.root(), "ephemeral", true)?;
+    cli_put_string(&binding, binding.root(), "context_source", "shared-public-history")?;
+    cli_state_mode_save(state, execution, "engine_binding", &binding)?;
+    let result = managed_stream(state, execution, options, client, message.as_str(), tools, terminal)?;
+    let accepted = json_parse("{\"role\":\"assistant\",\"tool_calls\":[]}")?;
+    cli_put_string(&accepted, accepted.root(), "content", result.as_str())?;
+    cli_state_stream_finish(state, execution, message.as_str(), &accepted)?;
+    controller_event(options, execution, execution.id.as_str(), "request_completed", options.connection.as_str(), options.model.as_str(), "")?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def engine_managed_turn(state: &CliState, options: &AgentOptions, metadata: &JsonDoc, prompt: &str, terminal: &Terminal) -> Result<String, i64> {
+    let started = time_monotonic_ms();
+    let engine = cli_json_string(metadata.root(), "engine")?;
+    let mut execution = cli_state_begin(state, options.session.as_str(), options.connection.as_str(), options.model.as_str())?;
+    let admission = controller_admit_request(state, &execution, engine_control_active(&options.input).as_str());
+    if not admission.is_ok() { cli_state_finish(state, &mut execution, "error")?; return string_result_err(admission.error); };
+    // A managed runtime owns its internal write/command schedule. Hold the
+    // same cross-process workspace permit used by native tools for its entire
+    // lifetime; no second session may write through Sencode while it is alive.
+    let acquired = cli_state_workspace_lock(state, options.cwd.as_str());
+    if not acquired.is_ok() { cli_state_finish(state, &mut execution, "error")?; return string_result_err(acquired.error); };
+    let workspace = acquired.value;
+    let marked = managed_execution_marker(state, &execution, engine.as_str(), true);
+    if not marked.is_ok() { cli_state_finish(state, &mut execution, "error")?; return string_result_err(marked.error); };
+    let spawned = managed_client_new(metadata, options.cwd.as_str());
+    if not spawned.is_ok() {
+        managed_execution_marker(state, &execution, engine.as_str(), false)?;
+        cli_state_finish(state, &mut execution, "error")?;
+        return string_result_err(spawned.error);
+    };
+    let mut client = spawned.value;
+    let tools: Vec<ManagedText> = vec_new();
+    let result = engine_managed_active(state, &execution, options, metadata, prompt, &mut client, &tools, terminal);
+    let closed = managed_transport_close(&client.transport);
+    if not closed.is_ok() { return string_result_err(closed.error); };
+    managed_tools_quiescent(state, &execution, &tools)?;
+    managed_execution_marker(state, &execution, engine.as_str(), false)?;
+    turn_metrics_save(state, &execution, started, if result.is_ok() { "completed" } else { if result.error == 19 { "cancelled" } else { "stopped" } })?;
+    cli_state_finish(state, &mut execution, if result.is_ok() { "idle" } else { if result.error == 19 { "interrupted" } else { "error" } })?;
+    workspace.close()?;
+    result
+}

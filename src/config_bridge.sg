@@ -1,0 +1,90 @@
+import state;
+import http;
+import config_probe;
+import config_catalog;
+
+// Private app-local JSON pipe. Only metadata is returned, never credentials.
+def config_text_ok(value: &String, maximum: i64) -> bool {
+    value.len() <= maximum and value.as_str().len() == value.len() and not str_contains(value.as_str(), "\r") and not str_contains(value.as_str(), "\n")
+}
+
+def config_save(state:&CliState,request:JsonValue)->Result<bool,i64>{
+    let id=cli_json_string(request,"id")?;let name=cli_json_string(request,"name")?;
+    let base=cli_json_string(request,"base_url")?;let protocol=cli_json_string(request,"protocol")?;
+    let model=cli_json_string(request,"model")?;let key=cli_json_string(request,"api_key")?;
+    let existing=request.object_get("existing")?.bool_value()?;
+    if not state_connection_id_valid(id.as_str()) or not config_text_ok(&name,128) or name.len()==0 or not config_model_id_valid(&model) or not config_text_ok(&base,2048) or not config_text_ok(&key,8192){return state_bool_error(2);};
+    let chosen=request.object_get("enabled_models")?;let candidates=request.object_get("discovered_model_ids")?;
+    if chosen.kind()?!=JSON_KIND_ARRAY() or chosen.array_len()?==0 or chosen.array_len()?>256 or candidates.kind()?!=JSON_KIND_ARRAY() or candidates.array_len()?>256{return state_bool_error(2);};
+    let mut matched=false;let mut mi=0;
+    while mi<chosen.array_len()?{let entry=chosen.array_get(mi)?;let mid=cli_json_string(entry,"id")?;if not config_model_id_valid(&mid){return state_bool_error(2);};if mid.as_str()==model.as_str(){matched=true;};
+        let label=cli_json_optional_string(entry,"label");if not config_text_ok(&label,256){return state_bool_error(2);};
+        entry.object_get("capabilities")?.object_get("visionSupported")?.bool_value()?;
+        let mut prior=0;while prior<mi{if cli_json_string(chosen.array_get(prior)?,"id")?.as_str()==mid.as_str(){return state_bool_error(2);};prior=prior+1;};mi=mi+1;
+    };if not matched{return state_bool_error(2);};
+    mi=0;while mi<candidates.array_len()?{if not config_model_id_valid(&candidates.array_get(mi)?.string_value()?){return state_bool_error(2);};mi=mi+1;};
+    if protocol.as_str()!="chatCompletions" and protocol.as_str()!="responses" and protocol.as_str()!="messages"{return state_bool_error(2);};
+    http_endpoint(base.as_str(),"")?;
+    let lock_path=state_lock_path(state.path.as_str(),"connection",id.as_str())?;let lock=file_lock(lock_path.as_str())?;
+    let config={let mut row=state.db.prepare("SELECT kind,config_json FROM connection_configs WHERE id=?")?;row.bind_text(1,id.as_str())?;
+        if row.step()? {if not existing or row.text(0)?.as_str()!="customApi"{return state_bool_error(8);};json_parse(row.text(1)?.as_str())?}
+        else{if existing{return state_bool_error(5);};json_doc_object()?}
+    };
+    let target=cli_join("Sencode/connection/",id.as_str())?;
+    let previous=credential_read(target.as_str());
+    if key.len()==0 and not previous.is_ok(){return state_bool_error(5);};
+    let root=config.root();cli_put_i64(&config,root,"version",2)?;
+    cli_put_string(&config,root,"baseUrl",base.as_str())?;cli_put_string(&config,root,"protocol",protocol.as_str())?;
+    cli_put_string(&config,root,"successfulProtocol",protocol.as_str())?;
+    cli_put_string(&config,root,"selectedModelId",model.as_str())?;
+    cli_put_string(&config,root,"credentialRef",target.as_str())?;cli_put_string(&config,root,"apiKeyMasked","[stored]")?;
+    let old_models=if root.object_has("enabledModels") and root.object_get("enabledModels")?.kind()?==JSON_KIND_ARRAY(){root.object_get("enabledModels")?}else{config.new_array()?};
+    let enabled=config.new_array()?;mi=0;
+    while mi<chosen.array_len()?{let incoming=chosen.array_get(mi)?;let mid=cli_json_string(incoming,"id")?;let mut item=config.new_object()?;let mut old_index=0;
+        while old_index<old_models.array_len()?{if cli_json_optional_string(old_models.array_get(old_index)?,"id").as_str()==mid.as_str(){item=config.copy(old_models.array_get(old_index)?)?;};old_index=old_index+1;};
+        cli_put_string(&config,item,"id",mid.as_str())?;let label=cli_json_optional_string(incoming,"label");cli_put_string(&config,item,"label",if label.len()>0{label.as_str()}else{mid.as_str()})?;
+        let capabilities=if item.object_has("capabilities") and item.object_get("capabilities")?.kind()?==JSON_KIND_OBJECT(){item.object_get("capabilities")?}else{config.new_object()?};
+        cli_put_bool(&config,capabilities,"visionSupported",incoming.object_get("capabilities")?.object_get("visionSupported")?.bool_value()?)?;
+        item.object_set("capabilities",capabilities)?;enabled.array_push(item)?;mi=mi+1;
+    };root.object_set("enabledModels",enabled)?;root.object_set("discoveredModelIds",config.copy(candidates)?)?;
+    let encoded=config.serialize_string()?;let now=time_unix_ms();
+    let mut write=state.db.prepare("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES(?,'customApi','managed',?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,config_json=excluded.config_json,selected_model_id=excluded.selected_model_id,updated_at=excluded.updated_at")?;
+    write.bind_text(1,id.as_str())?;write.bind_text(2,name.as_str())?;write.bind_text(3,encoded.as_str())?;
+    write.bind_text(4,model.as_str())?;write.bind_i64(5,now)?;write.bind_i64(6,now)?;
+    if key.len()>0{credential_write(target.as_str(),key.as_str())?; ();};
+    let saved=write.step();if not saved.is_ok(){
+        if key.len()>0{if previous.is_ok(){credential_write(target.as_str(),previous.value.as_str())?; ();}else{credential_delete(target.as_str())?; ();};};
+        return state_bool_error(saved.error);
+    };Result{is_ok:true,value:true,error:0}
+}
+
+def config_run()->Result<JsonDoc,i64>{
+    let bytes=ffi_buffer_new(65536)?;let count=io_stdin_read_line(bytes)?;
+    if count<=0 or count>=65536{return Result{is_ok:false,value:JsonDoc{handle:0},error:2};};
+    // Raw stdin writes do not alter Buffer.used_len; use its explicit byte span.
+    let raw=string_from_bytes_raw(bytes.ptr(),count)?;let request=json_parse(raw.as_str())?;
+    let action=cli_json_string(request.root(),"action")?;
+    if action.as_str()!="snapshot" and action.as_str()!="save" and action.as_str()!="select" and action.as_str()!="remove" and action.as_str()!="probe"{return Result{is_ok:false,value:JsonDoc{handle:0},error:2};};
+    let database=cli_json_optional_string(request.root(),"database");
+    let path=if database.len()==0{cli_state_default_path()?}else{database};
+    let state=cli_state_open(path.as_str())?;
+    if action.as_str()=="probe"{return config_probe(&state,request.root().object_get("input")?);};
+    if action.as_str()=="save"{config_save(&state,request.root().object_get("input")?)?; ();};
+    if action.as_str()=="select" or action.as_str()=="remove"{
+        let id=cli_json_string(request.root(),"id")?;
+        if id.len()==0 or not config_text_ok(&id,256){return Result{is_ok:false,value:JsonDoc{handle:0},error:2};};
+        if action.as_str()=="select"{cli_state_set_default_connection(&state,id.as_str())?; ();}
+        else{let mut check=state.db.prepare("SELECT kind FROM connection_configs WHERE id=?")?;check.bind_text(1,id.as_str())?;
+            if not check.step()? or check.text(0)?.as_str()!="customApi"{return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};
+            cli_state_connection_remove(&state,id.as_str())?; ();
+        };
+    };config_snapshot(&state)
+}
+
+def main()->i64{
+    let result=config_run();let response=json_doc_object().unwrap_or(JsonDoc{handle:0});
+    if result.is_ok(){cli_put_bool(&response,response.root(),"ok",true);response.root().object_set("data",response.copy(result.value.root()).unwrap_or(JsonValue{doc_handle:0,node_id:0}));}
+    else{cli_put_bool(&response,response.root(),"ok",false);cli_put_i64(&response,response.root(),"code",result.error);};
+    let output=response.serialize_string();if not output.is_ok(){return 1;};io_stdout_write(output.value.as_str());io_stdout_write("\n");
+    if result.is_ok(){0}else{1}
+}

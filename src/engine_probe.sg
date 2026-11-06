@@ -1,0 +1,30 @@
+import engine;
+import command_line;
+
+// Isolated integration entry point. Production startup remains in main.sg.
+def engine_probe_main() -> Result<i64, i64> {
+    let args = cli_arguments()?;
+    let database = cli_option(&args, "database", "")?;
+    let cwd = cli_option(&args, "cwd", ".")?;
+    if database.len() == 0 { return cli_fail(2); };
+    let state = cli_state_open(database.as_str())?;
+    let positionals = args.root().object_get("positionals")?;
+    let mut session = string_new();
+    if positionals.array_len()? >= 2 and positionals.array_get(0)?.string_value()?.as_str() == "resume" { session = positionals.array_get(1)?.string_value()?; };
+    if session.len() == 0 { session = cli_state_create_session(&state, cwd.as_str())?; };
+    let directory = path_join_string(cwd.as_str(), ".sencode/plans")?;
+    dir_create_all(directory.as_str())?;
+    let filename = cli_join(session.as_str(), ".md")?;
+    let plan = path_join_string(directory.as_str(), filename.as_str())?;
+    let connection = cli_option(&args, "connection", "")?;
+    let input: Vec<TerminalEvent> = vec_new();
+    let mut options = AgentOptions { cwd: cwd, session: session, connection: connection, model: string_new(), effort: string_new(), format: cli_text("host-json"), policy: policy_default(), allow_commands: false, plan_path: plan, goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let terminal = terminal_open()?;
+    engine_stdio(&state, &mut options, 50, 0, &terminal)
+}
+
+def main() -> i64 {
+    let result = engine_probe_main();
+    if not result.is_ok() { println(result.error); return 1; };
+    result.value
+}

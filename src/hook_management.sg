@@ -1,0 +1,38 @@
+import hook_store;
+import terminal;
+import engine_control;
+
+def hook_management_empty()->Result<JsonDoc,i64>{json_parse("{\"schema\":1,\"workers\":[]}")}
+
+def hook_management_inspect(store:&HookStore,id:&str)->Result<JsonDoc,i64>{
+    let manifest=hook_store_manifest(store,id,false)?;let document=json_doc_object()?;
+    cli_put_i64(&document,document.root(),"schema",1)?;cli_put_string(&document,document.root(),"id",manifest.id.as_str())?;
+    cli_put_string(&document,document.root(),"path",manifest.path.as_str())?;cli_put_string(&document,document.root(),"executable",manifest.executable.as_str())?;
+    cli_put_string(&document,document.root(),"manifest_sha256",manifest.digest.as_str())?;cli_put_string(&document,document.root(),"executable_sha256",manifest.executable_digest.as_str())?;
+    let mut row=store.db.prepare("SELECT enabled FROM cli_workers WHERE id=?")?;row.bind_text(1,id)?;if not row.step()?{return hook_error(5);};
+    cli_put_bool(&document,document.root(),"enabled",row.integer(0)?==1)?;document.root().object_set("manifest",document.copy(manifest.document.root())?)?;
+    Result{is_ok:true,value:document,error:0}
+}
+
+// An explicit management review records fingerprints only. Every later hook
+// invocation still needs a different, fresh launch approval.
+def hook_management(state:&CliState,action:&str,target:&str,reviewed:bool,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<JsonDoc,i64>{
+    if action!="list" and action!="inspect" and action!="add" and action!="enable" and action!="disable" and action!="remove"{return hook_error(2);};
+    let path=hook_store_path(state)?;
+    if not file_exists(path.as_str()) and action!="add"{if action=="list"{return hook_management_empty();};return hook_error(5);};
+    if action!="list" and target.len()==0{return hook_error(2);};
+    let store=hook_store_open(state)?;
+    if action=="list"{return hook_store_list(&store);};
+    if action=="inspect"{return hook_management_inspect(&store,target);};
+    if action=="add"{let manifest=hook_manifest_load(target)?;hook_store_add(&store,&manifest)?;return hook_management_inspect(&store,manifest.id.as_str());};
+    if not hook_identifier(target){return hook_error(2);};
+    if action=="disable" or action=="remove"{hook_store_disable(&store,target,action=="remove")?;return hook_store_list(&store);};
+    let manifest=hook_store_manifest(&store,target,false)?;
+    let preview=cli_text("Trust this native Sengoo worker fingerprint? This does not grant execution permission. Each launch requires a fresh approval.\n");
+    preview.push_str(hook_management_inspect(&store,target)?.serialize_string()?.as_str())?;
+    let accepted=if reviewed{true}else{if engine_control_enabled(input){engine_control_confirm(terminal,input,"internal:extension_trust",preview.as_str())?}else{ui_confirm(terminal,preview.as_str())?}};
+    if not accepted{let refused=json_doc_object()?;cli_put_string(&refused,refused.root(),"status","refused")?;cli_put_bool(&refused,refused.root(),"permission_required",true)?;return Result{is_ok:true,value:refused,error:0};};
+    let current=hook_store_manifest(&store,target,false)?;
+    if current.digest.as_str()!=manifest.digest.as_str() or current.executable_digest.as_str()!=manifest.executable_digest.as_str(){return hook_error(8);};
+    hook_store_enable(&store,&current)?;hook_management_inspect(&store,target)
+}

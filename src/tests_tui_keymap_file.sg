@@ -1,0 +1,13 @@
+import tui_keys;
+
+// Read-only process fixture. The Python owner supplies an isolated user profile
+// and explicit keymap paths; no application state or credentials are opened.
+def main() -> i64 {
+    let map = keys_load(); let report = json_doc_object(); if not report.is_ok { return 1; };
+    let document = report.value; let root = document.root();
+    let mode = cli_put_string(&document, root, "mode", map.mode.as_str()); if not mode.is_ok { return 1; };
+    let source = cli_put_string(&document, root, "source", map.source.as_str()); if not source.is_ok { return 1; };
+    let warning = cli_put_bool(&document, root, "warning", map.warning.len() > 0); if not warning.is_ok { return 1; };
+    let count = cli_put_i64(&document, root, "bindings", map.bindings.len()); if not count.is_ok { return 1; };
+    let text = document.serialize_string(); if not text.is_ok { return 1; }; println(text.value.as_str()); 0
+}

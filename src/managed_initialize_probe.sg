@@ -1,0 +1,30 @@
+import managed_client;
+import command_line;
+
+// Offline public-protocol integration only. No account, thread or turn method
+// is sent, and the caller supplies an isolated newly-created empty profile.
+def managed_initialize_probe() -> Result<bool, i64> {
+    let arguments = cli_arguments()?;
+    let positionals = arguments.root().object_get("positionals")?;
+    if positionals.array_len()? != 2 { return Result { is_ok: false, value: false, error: 2 }; };
+    let executable = positionals.array_get(0)?.string_value()?;
+    let profile = positionals.array_get(1)?.string_value()?;
+    if executable.len() == 0 or profile.len() == 0 or not path_is_absolute(profile.as_str()) { return Result { is_ok: false, value: false, error: 2 }; };
+    let metadata = json_parse("{\"engine\":\"codex-app-server\",\"runtime_version\":\"0.144.4\",\"protocol_version\":\"0.144.4\",\"profile_env_name\":\"CODEX_HOME\",\"arguments\":[]}")?;
+    cli_put_string(&metadata, metadata.root(), "executable", executable.as_str())?;
+    cli_put_string(&metadata, metadata.root(), "profile_directory", profile.as_str())?;
+    let mut client = managed_client_new(&metadata, profile.as_str())?;
+    let terminal = terminal_open()?;
+    let input: Vec<TerminalEvent> = vec_new();
+    let initialized = managed_client_initialize(&mut client, &metadata, &terminal, &input);
+    managed_transport_close(&client.transport)?;
+    initialized?;
+    io_stdout_write("{\"engine\":\"codex-app-server\",\"runtime_version\":\"0.144.4\",\"protocol_version\":\"0.144.4\",\"profile_verified\":true,\"initialized\":true,\"thread_created\":false,\"model_requested\":false}\n")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let result = managed_initialize_probe();
+    if not result.is_ok() { cli_diagnostic("Pinned public runtime initialize probe failed"); println(result.error); return 1; };
+    0
+}

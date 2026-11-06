@@ -1,0 +1,85 @@
+import policy;
+import question;
+
+struct ToolSpec {
+    known: bool,
+    read_only: bool,
+    exclusive: bool,
+    process: bool,
+    coordinator: bool,
+    interruptible: bool,
+    max_result_bytes: i64,
+}
+
+def tool_spec(name: &str) -> ToolSpec {
+    let read = name == "read_file" or name == "list_directory" or name == "search" or name == "find_files" or name == "git_status" or name == "git_diff";
+    let write = name == "write_file" or name == "apply_patch" or name == "write_plan";
+    let process = name == "run_command" or name == "mcp__list_tools" or name == "mcp__call";
+    let coordinator = name == "spawn_agent" or name == "list_agents" or name == "wait_agents" or name == "cancel_agent" or name == "finish_goal" or name == "ask_user";
+    ToolSpec { known: read or write or process or coordinator, read_only: read or name == "list_agents" or name == "wait_agents", exclusive: write or process or name == "finish_goal", process: process, coordinator: coordinator, interruptible: true, max_result_bytes: 2097152 }
+}
+
+def tool_spec_decision(policy: &AgentPolicy, name: &str, exact_plan_file: bool) -> i64 {
+    let spec = tool_spec(name);
+    if not spec.known { return 2; };
+    policy_decision(policy, name, exact_plan_file)
+}
+
+def tool_spec_string(arguments: &JsonDoc, name: &str) -> bool {
+    if not arguments.root().object_has(name) { return false; };
+    let value = arguments.root().object_get(name);
+    if not value.is_ok() { return false; };
+    let text = value.value.string_value();
+    text.is_ok() and text.value.len() == text.value.as_str().len()
+}
+
+def tool_spec_integer(arguments: &JsonDoc, name: &str, minimum: i64, maximum: i64) -> bool {
+    if not arguments.root().object_has(name) { return true; };
+    let node = arguments.root().object_get(name);
+    if not node.is_ok() { return false; };
+    let value = node.value.number_i64();
+    value.is_ok() and value.value >= minimum and value.value <= maximum
+}
+
+def tool_spec_valid(name: &str, arguments: &JsonDoc) -> bool {
+    let spec = tool_spec(name);
+    if not spec.known { return false; };
+    let kind = arguments.root().kind();
+    if not kind.is_ok() or kind.value != JSON_KIND_OBJECT() { return false; };
+    if name == "read_file" or name == "list_directory" or name == "write_file" or name == "apply_patch" { if not tool_spec_string(arguments, "path") { return false; }; };
+    if name == "write_file" or name == "write_plan" { if not tool_spec_string(arguments, "content") { return false; }; };
+    if name == "write_file" and arguments.root().object_has("expected_content") { if not tool_spec_string(arguments, "expected_content") { return false; }; };
+    if name == "apply_patch" { return tool_spec_string(arguments, "old") and tool_spec_string(arguments, "new"); };
+    if name == "search" or name == "find_files" { return tool_spec_string(arguments, "query"); };
+    if name == "run_command" {
+        if not tool_spec_string(arguments, "command") or not tool_spec_integer(arguments, "timeout_ms", 1, 600000) { return false; };
+        if arguments.root().object_has("shell") {
+            if not tool_spec_string(arguments, "shell") { return false; };
+            let shell = cli_json_optional_string(arguments.root(), "shell");
+            if shell.as_str() != "bash" and shell.as_str() != "powershell" and shell.as_str() != "cmd" { return false; };
+        };
+        return true;
+    };
+    if name == "wait_agents" { return tool_spec_integer(arguments, "timeout_ms", 0, 1000); };
+    if name == "spawn_agent" {
+        if not tool_spec_string(arguments, "prompt") or not tool_spec_string(arguments, "role") { return false; };
+        let role = cli_json_optional_string(arguments.root(), "role");
+        let prompt = cli_json_optional_string(arguments.root(), "prompt");
+        if prompt.len() == 0 or prompt.len() > 131072 { return false; };
+        if role.as_str() != "explore" and role.as_str() != "plan" and role.as_str() != "general" { return false; };
+        if arguments.root().object_has("connection_id") and not tool_spec_string(arguments, "connection_id") { return false; };
+        if arguments.root().object_has("model") and not tool_spec_string(arguments, "model") { return false; };
+    };
+    if name == "cancel_agent" { return arguments.root().object_has("id") and tool_spec_integer(arguments, "id", 1, 9223372036854775807); };
+    if name == "ask_user" { return question_arguments_valid(arguments); };
+    if name == "finish_goal" { return tool_spec_string(arguments, "summary"); };
+    if name == "mcp__list_tools" or name == "mcp__call" { if not tool_spec_string(arguments, "server") { return false; }; };
+    if name == "mcp__call" {
+        if not tool_spec_string(arguments, "tool") or not arguments.root().object_has("arguments") { return false; };
+        let payload = arguments.root().object_get("arguments");
+        if not payload.is_ok() { return false; };
+        let payload_kind = payload.value.kind();
+        return payload_kind.is_ok() and payload_kind.value == JSON_KIND_OBJECT();
+    };
+    true
+}

@@ -1,0 +1,113 @@
+import model_selection;
+import provider;
+
+def model_assert(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return Result { is_ok: false, value: false, error: 99 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def model_fixture() -> Result<JsonDoc, i64> {
+    json_parse("{\"connections\":[{\"id\":\"a\",\"name\":\"渠道甲\",\"kind\":\"customApi\",\"protocol\":\"responses\",\"status\":\"ready\",\"capabilities\":{\"reasoningEffort\":true},\"enabled_models\":[{\"id\":\"shared\",\"label\":\"共享一😀\",\"capabilities\":{\"visionSupported\":true}},{\"id\":\"second\",\"label\":\"Second\",\"capabilities\":{\"visionSupported\":false},\"supportedReasoningEfforts\":[\"low\",\"high\",\"max\"]},{\"id\":\"text-only\",\"capabilities\":{\"reasoningEffort\":false}}],\"models\":[\"discovery-only\"],\"discovered_model_ids\":[\"discovery-only\"]},{\"id\":\"b\",\"displayName\":\"渠道乙\",\"kind\":\"customApi\",\"protocol\":\"chatCompletions\",\"status\":\"ready\",\"capabilities\":{\"reasoningEffort\":true},\"enabledModels\":[{\"id\":\"shared\",\"capabilities\":{\"visionSupported\":false},\"reasoningEfforts\":[{\"id\":\"medium\",\"value\":\"medium\"},{\"id\":\"xhigh\",\"value\":\"xhigh\"}]}]},{\"id\":\"account\",\"name\":\"Managed\",\"kind\":\"codex\",\"status\":\"ready\",\"capabilities\":{\"reasoningEffort\":false},\"enabled_models\":[{\"id\":\"official\",\"reasoningEfforts\":[\"low\",\"high\"]}]},{\"id\":\"blocked\",\"name\":\"Not ready\",\"kind\":\"customApi\",\"status\":\"blocked\",\"capabilities\":{\"reasoningEffort\":true},\"enabled_models\":[{\"id\":\"blocked-model\"}]}]}")
+}
+
+def model_selection_tests() -> Result<bool, i64> {
+    let source = model_fixture()?;
+    let before = source.serialize_string()?;
+    let catalog = model_selection_snapshot(&source, "b", "shared", "xhigh")?;
+    let channels = catalog.root().object_get("connections")?;
+    model_assert(channels.array_len()? == 4, "all channels retained for paired-column navigation")?;
+    let a = channels.array_get(0)?; let b = channels.array_get(1)?;
+    model_assert(cli_json_string(a, "label")?.as_str() == "渠道甲" and cli_json_string(b, "label")?.as_str() == "渠道乙", "Unicode and desktop displayName labels retained")?;
+    model_assert(a.object_get("models")?.array_len()? == 3 and b.object_get("models")?.array_len()? == 1, "all enabled models shown and discovered-only model absent")?;
+    model_assert(cli_json_string(a.object_get("models")?.array_get(0)?, "label")?.as_str() == "共享一😀", "model label Unicode kept")?;
+    model_assert(a.object_get("models")?.array_get(0)?.object_get("capabilities")?.object_get("visionSupported")?.bool_value()?, "model capability metadata preserved")?;
+    model_assert(not a.object_get("models")?.array_get(0)?.object_get("selected")?.bool_value()? and b.object_get("models")?.array_get(0)?.object_get("selected")?.bool_value()?, "same model id keeps channel identity")?;
+    model_assert(a.object_get("models")?.array_get(0)?.object_get("efforts")?.array_len()? == 5, "native advertised effort has all five desktop levels")?;
+    model_assert(a.object_get("models")?.array_get(1)?.object_get("efforts")?.array_len()? == 3, "model effort subset retained")?;
+    model_assert(a.object_get("models")?.array_get(2)?.object_get("efforts")?.array_len()? == 0, "model capability denial narrows channel capability")?;
+    model_assert(channels.array_get(2)?.object_get("models")?.array_get(0)?.object_get("efforts")?.array_len()? == 0, "account capability denial overrides configured effort list")?;
+    model_assert(not channels.array_get(3)?.object_get("selectable")?.bool_value()?, "blocked channel remains visible but unselectable")?;
+    model_assert(source.serialize_string()?.as_str() == before.as_str(), "building catalog does not mutate public source snapshot")?;
+    let selected = model_selection_target(&source, "b", "shared", "xhigh")?;
+    model_assert(cli_json_string(selected.root(), "connection_id")?.as_str() == "b" and cli_json_string(selected.root(), "model")?.as_str() == "shared" and cli_json_string(selected.root(), "effort")?.as_str() == "xhigh", "final selection returns complete tuple")?;
+    let chosen_again = model_selection_target(&catalog, "b", "shared", "xhigh")?;
+    model_assert(cli_json_string(chosen_again.root(), "connection_label")?.as_str() == "渠道乙", "normalized catalog can validate final selection")?;
+    let default_target = model_selection_target(&source, "b", "shared", "")?;
+    model_assert(cli_json_string(default_target.root(), "effort")?.as_str() == "medium", "native default is resolved to medium in the immutable request target")?;
+    let default_catalog = model_selection_snapshot(&source, "b", "shared", "")?;
+    model_assert(cli_json_string(default_catalog.root().object_get("selected")?, "effort")?.as_str() == "medium", "catalog selection reports the same effective medium")?;
+    let no_medium = model_selection_target(&source, "a", "second", "")?;
+    model_assert(cli_json_string(no_medium.root(), "effort")?.len() == 0, "model subset without medium keeps provider default instead of inventing support")?;
+    let unsupported_catalog = model_selection_snapshot(&source, "a", "second", "medium")?;
+    model_assert(cli_json_string(unsupported_catalog.root().object_get("selected")?, "effort")?.len() == 0 and not unsupported_catalog.root().object_get("selected")?.object_get("effort_available")?.bool_value()?, "catalog never echoes an unsupported effort as an actual current setting")?;
+    let manual_catalog = model_selection_snapshot(&source, "a", "manual-model-not-enabled", "")?;
+    model_assert(cli_json_string(manual_catalog.root().object_get("selected")?, "effort")?.as_str() == "medium", "manual model header uses connection-level default without enabling a catalog row")?;
+    model_assert(not model_selection_target(&catalog, "a", "second", "medium").is_ok(), "normalized catalog retains model subset restrictions")?;
+    let denied_default = model_selection_target(&source, "a", "text-only", "")?;
+    model_assert(cli_json_string(denied_default.root(), "effort")?.len() == 0, "explicit unsupported model never displays or sends medium")?;
+    model_assert(not model_selection_target(&source, "b", "shared", "high").is_ok(), "unsupported model effort refused")?;
+    model_assert(not model_selection_target(&source, "a", "discovery-only", "").is_ok(), "discovery never grants enablement")?;
+    model_assert(not model_selection_target(&source, "blocked", "blocked-model", "low").is_ok(), "blocked target refused")?;
+    model_assert(not model_selection_target(&source, "account", "official", "high").is_ok(), "managed unsupported effort refused")?;
+    model_assert(model_selection_target(&source, "account", "official", "").is_ok(), "managed provider default remains a distinct supported selection")?;
+    model_assert(not model_selection_target(&source, "a", "shared", "ultra").is_ok(), "unknown effort refused")?;
+    model_assert(not model_selection_target(&source, "missing", "shared", "medium").is_ok(), "missing connection cannot borrow same-name model")?;
+    model_assert(model_selection_effort_count() == 5 and model_selection_effort_at(3) == "xhigh" and model_selection_effort_at(4) == "max", "desktop xhigh and max remain distinct")?;
+    let raw = json_parse("{\"id\":\"api-a\",\"base_url\":\"https://example.invalid/v1\",\"protocol\":\"responses\",\"model\":\"one\"}")?;
+    let captured = connection_with_effort(&raw, "chosen", "max")?;
+    cli_put_string(&raw, raw.root(), "model", "changed")?;
+    model_assert(captured.connection_id() == "api-a" and captured.model_id() == "chosen" and captured.effort_id() == "max", "connection target owns immutable model and effort bytes")?;
+    model_assert(connection_normalize(&raw, "").value.effort_id() == "medium", "native connection normalization captures medium by default")?;
+    model_assert(not connection_with_effort(&raw, "chosen", "ultra").is_ok(), "connection boundary rejects invalid effort")?;
+    let history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"hello 世界😀\"}]}")?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    let mut protocol = 0;
+    while protocol < 3 {
+        let original = provider_build_request(protocol, "model", &history, &tools)?;
+        let empty = provider_build_request_with_effort(protocol, "model", "", &history, &tools)?;
+        model_assert(original.as_str() == empty.as_str(), "empty effort retains exact legacy body")?;
+        let mut index = 0;
+        while index < model_selection_effort_count() {
+            let effort = model_selection_effort_at(index);
+            let request = provider_build_request_with_effort(protocol, "model", effort, &history, &tools)?;
+            let parsed = json_parse(request.as_str())?; let root = parsed.root();
+            if protocol == 0 { model_assert(cli_json_string(root, "reasoning_effort")?.as_str() == if effort == "max" { "xhigh" } else { effort }, "Chat native effort map")?; (); };
+            if protocol == 1 { model_assert(cli_json_string(root.object_get("reasoning")?, "effort")?.as_str() == if effort == "max" { "xhigh" } else { effort }, "Responses native effort map")?; (); };
+            if protocol == 2 {
+                model_assert(cli_json_string(root.object_get("thinking")?, "type")?.as_str() == "adaptive" and cli_json_string(root.object_get("thinking")?, "display")?.as_str() == "summarized", "Messages desktop adaptive thinking")?;
+                model_assert(cli_json_string(root.object_get("output_config")?, "effort")?.as_str() == if effort == "xhigh" { "high" } else { effort }, "Messages xhigh/max map")?; ();
+            };
+            index = index + 1;
+        };
+        model_assert(not provider_build_request_with_effort(protocol, "model", "ultra", &history, &tools).is_ok(), "invalid effort fails before request")?;
+        protocol = protocol + 1;
+    };
+    let configured = json_parse("{\"id\":\"default-fixture\",\"baseUrl\":\"https://fixture.invalid/v1\",\"protocol\":\"responses\",\"model\":\"medium-model\",\"enabledModels\":[{\"id\":\"medium-model\",\"supportedReasoningEfforts\":[\"low\",\"medium\",\"xhigh\"]},{\"id\":\"narrow\",\"reasoningEfforts\":[\"low\",\"high\"]},{\"id\":\"off\",\"capabilities\":{\"supportsReasoningEffort\":false}}]}")?;
+    let default_connection = connection_normalize(&configured, "medium-model")?;
+    model_assert(default_connection.effort_id() == "medium", "exact enabled model default is captured in connection")?;
+    model_assert(connection_normalize(&configured, "narrow").value.effort_id() == "", "connection and picker share subset-without-medium fallback")?;
+    model_assert(connection_normalize(&configured, "off").value.effort_id() == "", "connection model denial prevents default effort")?;
+    model_assert(not connection_with_effort(&configured, "narrow", "medium").is_ok(), "connection request boundary refuses explicitly unsupported medium")?;
+    cli_put_string(&configured, configured.root(), "protocol", "messages")?;
+    let after_selection = connection_with_effort(&configured, "medium-model", "xhigh")?;
+    model_assert(default_connection.protocol_id() == 1 and default_connection.effort_id() == "medium" and after_selection.protocol_id() == 2 and after_selection.effort_id() == "xhigh", "later connection and effort changes cannot mutate a captured request")?;
+    let denied = json_parse("{\"id\":\"denied\",\"baseUrl\":\"https://fixture.invalid/v1\",\"protocol\":\"responses\",\"model\":\"one\",\"capabilities\":{\"supportsReasoningEffort\":false}}")?;
+    model_assert(connection_normalize(&denied, "").value.effort_id() == "", "connection capability denial prevents inferred native medium")?;
+    let subset = json_parse("{\"id\":\"subset\",\"baseUrl\":\"https://fixture.invalid/v1\",\"protocol\":\"responses\",\"model\":\"one\",\"capabilities\":{\"supportedReasoningEfforts\":[\"low\",\"high\"]}}")?;
+    model_assert(connection_normalize(&subset, "").value.effort_id() == "", "connection subset without medium keeps provider default")?;
+    let detected = json_parse("{\"id\":\"auto-detected\",\"baseUrl\":\"https://fixture.invalid/v1\",\"protocol\":\"auto\",\"successfulProtocol\":\"responses\",\"model\":\"one\"}")?;
+    model_assert(connection_normalize(&detected, "").value.effort_id() == "medium", "successfully detected native protocol uses the same medium default")?;
+    protocol = 0;
+    while protocol < 3 {
+        let encoded = provider_build_request_with_effort(protocol, default_connection.model_id(), default_connection.effort_id(), &history, &tools)?;
+        let document = json_parse(encoded.as_str())?;
+        if protocol == 0 { model_assert(cli_json_string(document.root(), "reasoning_effort")?.as_str() == "medium", "default medium is really encoded in Chat requests")?; (); };
+        if protocol == 1 { model_assert(cli_json_string(document.root().object_get("reasoning")?, "effort")?.as_str() == "medium", "default medium is really encoded in Responses requests")?; (); };
+        if protocol == 2 { model_assert(cli_json_string(document.root().object_get("output_config")?, "effort")?.as_str() == "medium", "default medium is really encoded in Messages requests")?; (); };
+        protocol = protocol + 1;
+    };
+    println("model selection: enabled catalog, channel identities, runtime restrictions, immutable effort and three desktop wire maps passed");
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 { let result = model_selection_tests(); if not result.is_ok() { println(result.error); return 1; }; 0 }

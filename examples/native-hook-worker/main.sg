@@ -1,0 +1,11 @@
+import hook_sdk;
+
+// A deliberately small precompiled worker: no host calls, shell or network.
+def worker()->Result<i64,i64>{
+    let initialize=hook_sdk_read()?;hook_sdk_ready(&initialize)?;let event=hook_sdk_read()?;
+    let path=cli_json_optional_string(event.root().object_get("input")?,"path");
+    let blocked=str_contains(path.as_str(),".protected");
+    hook_sdk_write(&hook_sdk_result(&event,if blocked{"block"}else{"continue"},if blocked{"This example refuses native edits of .protected paths"}else{""},"Example worker completed")?)?;
+    cli_ok(0)
+}
+def main()->i64{let result=worker();if result.is_ok(){result.value}else{1}}

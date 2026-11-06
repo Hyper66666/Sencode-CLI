@@ -1,0 +1,57 @@
+import frontend_worktree;
+import command_line;
+
+def fw_assert(value: bool, name: &str) -> Result<bool, i64> { if not value { println(name); return state_bool_error(99); }; tui_true() }
+def fw_poll(flow: &mut FrontWorktree, state: &CliState, policy: &AgentPolicy, app: &mut UiApp, terminal: &Terminal) -> Result<bool, i64> {
+    let until = time_unix_ms() + 20000;
+    while flow.active and time_unix_ms() < until { front_worktree_tick(flow, state, policy, app, terminal)?; time_sleep_ms(1); };
+    fw_assert(not flow.active and not flow.blocked, "job reaches a verified terminal or fresh approval")
+}
+def fw_tests(state: &CliState, cwd: &str) -> Result<bool, i64> {
+    let mut app = tui_new(cwd, "", "", "fixture"); let mut flow = front_worktree_new(); let mut policy = policy_default(); policy.interactive = true;
+    let terminal = terminal_open()?; fw_assert(terminal.is_tty(), "native approval test requires its owned real console")?;
+    let target = path_join_string(path_parent_string(cwd)?.as_str(), "detached 子 workspace")?;
+    let create = cli_join("create ", target.as_str())?;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, create.as_str(), false)?;
+    fw_assert(not front_worktree_owns(&flow), "busy host refuses without a job")?;
+    policy.plan = true; front_worktree_request(&mut flow, cwd, &policy, &mut app, create.as_str(), true)?;
+    fw_assert(not front_worktree_owns(&flow) and not dir_exists(target.as_str()), "Plan cannot create a job or target")?;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, "list", true)?; fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    fw_assert(not flow.pending and app.queue_paused and not app.busy, "Plan list completes while retaining paused queue")?;
+    policy.plan = false;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, create.as_str(), true)?; fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    fw_assert(flow.pending and app.picker.as_str() == "worktree-confirm" and app.picker_selected == 0 and not dir_exists(target.as_str()), "creation preview defaults to cancel without mutation")?;
+    front_worktree_approve(&mut flow, state, &policy, &mut app, false, true)?; tui_close_picker(&mut app)?;
+    fw_assert(not front_worktree_owns(&flow) and app.queue_paused, "default cancel clears pending and holds queued tasks")?;
+    front_worktree_approve(&mut flow, state, &policy, &mut app, true, true)?;
+    fw_assert(not front_worktree_owns(&flow) and not dir_exists(target.as_str()), "a consumed confirmation cannot be reused")?;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, create.as_str(), true)?; fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    policy.plan = true; front_worktree_approve(&mut flow, state, &policy, &mut app, true, true)?; tui_close_picker(&mut app)?;
+    fw_assert(not front_worktree_owns(&flow) and not dir_exists(target.as_str()), "policy changed since preview invalidates approval")?;
+    policy.plan = false;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, create.as_str(), true)?; fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    tui_close_picker(&mut app)?; front_worktree_approve(&mut flow, state, &policy, &mut app, true, true)?;
+    fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    fw_assert(dir_exists(target.as_str()) and not front_worktree_owns(&flow) and app.queue_paused, "fresh approved create completes under paused queue")?;
+    let remove = cli_join("remove ", target.as_str())?;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, remove.as_str(), true)?; fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    tui_close_picker(&mut app)?; front_worktree_approve(&mut flow, state, &policy, &mut app, true, true)?;
+    fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    fw_assert(not dir_exists(target.as_str()) and not flow.blocked, "clean removal drains and releases its writer reservation")?;
+    front_worktree_request(&mut flow, cwd, &policy, &mut app, "list", true)?; front_worktree_cancel(&mut flow, &mut app)?; fw_poll(&mut flow, state, &policy, &mut app, &terminal)?;
+    fw_assert(flow.job.cancelled and not flow.job.running and not flow.blocked and flow.job.transaction.handle == 0, "cancellation waits for cleanup and releases reservation")?;
+    front_worktree_close(&mut flow)?;
+    let mut unknown = front_worktree_new(); unknown.job.cleanup_unknown = true;
+    front_worktree_failure(&mut unknown, &mut app, "synthetic unknown cleanup", 12)?;
+    fw_assert(unknown.blocked and app.busy and front_worktree_owns(&unknown), "unknown process cleanup latches a blocked interface")?;
+    front_worktree_cancel(&mut unknown, &mut app)?; front_worktree_close(&mut unknown);
+    fw_assert(unknown.blocked and front_worktree_owns(&unknown), "cancel and close cannot clear unknown cleanup")?;
+    println("frontend worktree state: idle, Plan, list, default deny, consumed approval, stale policy, fresh create/remove, paused queue, cancel cleanup and sticky unknown cleanup passed"); tui_true()
+}
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok { return 2; };
+    let database = cli_option(&args.value, "database", ""); if not database.is_ok { return 2; };
+    let cwd = cli_option(&args.value, "cwd", ""); if not cwd.is_ok { return 2; };
+    let state = cli_state_open(database.value.as_str()); if not state.is_ok { return state.error; };
+    let result = fw_tests(&state.value, cwd.value.as_str()); if not result.is_ok { return result.error; }; 0
+}

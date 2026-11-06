@@ -1,0 +1,442 @@
+import common;
+import std::terminal;
+import std::env;
+import std::unicode;
+import commands;
+import engine_control;
+
+struct InputHistory { text: String }
+impl InputHistory { def recalled(&self) -> Result<String, i64> { self.text.clone() } }
+struct UiSpan { start: i64, end: i64, style: i64 }
+struct UiLine { text: String, cells: i64, style: i64, message_id: i64, spans: Vec<UiSpan> }
+struct UiLayout { lines: Vec<UiLine>, cursor_row: i64, cursor_column: i64 }
+struct UiPaint { rows: i64, cursor_row: i64, cursor_column: i64, columns: i64 }
+struct UiCluster { text: String, cells: i64, offset: i64, end: i64, newline: bool }
+
+def ui_spans_empty() -> Vec<UiSpan> { let spans: Vec<UiSpan> = vec_new(); spans }
+def ui_ids_empty() -> Vec<i64> { let ids: Vec<i64> = vec_new(); ids }
+def ui_history_empty() -> Vec<InputHistory> { let rows: Vec<InputHistory> = vec_new(); rows }
+
+def ui_spans_copy(source: &Vec<UiSpan>, shift: i64, limit: i64) -> Vec<UiSpan> {
+    let spans: Vec<UiSpan> = vec_new(); let mut index = 0;
+    while index < source.len() { let span: &UiSpan = source.get(index); let start = span.start + shift; let end = if span.end + shift > limit { limit } else { span.end + shift };
+        if start >= 0 and start < end { spans.push(UiSpan { start: start, end: end, style: span.style }); (); }; index = index + 1;
+    }; spans
+}
+
+def ui_span(spans: &Vec<UiSpan>, start: i64, end: i64, style: i64) {
+    if start >= 0 and end > start { spans.push(UiSpan { start: start, end: end, style: style }); (); }; ()
+}
+
+def ui_spans_key(spans: &Vec<UiSpan>) -> Result<String, i64> {
+    let key = string_new(); let mut index = 0;
+    while index < spans.len() { let span: &UiSpan = spans.get(index); key.push_i64(span.start)?; key.push_str(":")?; key.push_i64(span.end)?; key.push_str(":")?; key.push_i64(span.style)?; key.push_str(";")?; index = index + 1; };
+    Result { is_ok: true, value: key, error: 0 }
+}
+
+def ui_output(text: &str) -> Result<bool, i64> {
+    let safe = cli_terminal_safe(text)?;
+    io_stdout_write(safe.as_str())?;
+    io_stdout_flush()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def ui_env(name: &str) -> Result<String, i64> {
+    let size = env_var_len(name)?;
+    if size > 65536 { return string_result_err(13); };
+    let bytes = ffi_buffer_new(size + 1)?;
+    let copied = env_var_copy(name, bytes)?;
+    string_from_buffer(bytes, copied)
+}
+
+def ui_ansi(terminal: &Terminal) -> bool {
+    if not terminal.is_tty() { return false; };
+    let term = ui_env("TERM");
+    if term.is_ok and term.value.as_str() == "dumb" { return false; };
+    true
+}
+
+def ui_colors(terminal: &Terminal) -> bool { ui_ansi(terminal) and not env_has_var("NO_COLOR") }
+def ui_style(terminal: &Terminal, value: &str) -> Result<bool, i64> {
+    if ui_colors(terminal) { return terminal.write(value); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+def ui_columns(terminal: &Terminal) -> i64 {
+    let width = terminal.width();
+    if width < 2 { return 79; };
+    if width > 121 { return 120; };
+    width - 1
+}
+
+// Unicode 17 defines editor boundaries and deterministic terminal widths.
+// Grapheme clusters stay intact during fitting, wrapping and cursor movement.
+def ui_scalar_cells(code: i64) -> i64 {
+    unicode_scalar_cells(code).unwrap_or(0)
+}
+def ui_cells(text: &str) -> Result<i64, i64> {
+    let source = cli_text(text); unicode_display_width(&source)
+}
+def ui_clusters(text: &str) -> Result<Vec<UiCluster>, i64> {
+    let source = cli_text(text); let iter = source.chars(); let clusters: Vec<UiCluster> = vec_new();
+    let mut state = unicode_grapheme_state(); let mut cluster = string_new(); let mut offset = 0; let mut start = 0; let mut newline = false; let mut started = false;
+    loop {
+        let next = iter.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?;
+        if state.push(cp)? and started {
+            let cells = unicode_display_width(&cluster)?;
+            clusters.push(UiCluster { text: cluster, cells: cells, offset: start, end: offset, newline: newline });
+            cluster = string_new(); start = offset; newline = false;
+        };
+        started = true;
+        if cp == 10 { newline = true; } else {
+            if cp == 9 { cluster.push_str(" ")?; (); } else { if cp >= 32 and (cp < 127 or cp > 159) { cluster.push_char(next.value)?; (); }; };
+        };
+        offset = offset + ui_scalar_bytes(cp);
+    };
+    iter.free();
+    if started { let cells = unicode_display_width(&cluster)?; clusters.push(UiCluster { text: cluster, cells: cells, offset: start, end: offset, newline: newline }); (); };
+    Result { is_ok: true, value: clusters, error: 0 }
+}
+def ui_repeat(text: &str, count: i64) -> Result<String, i64> {
+    let out = string_new(); let mut index = 0;
+    while index < count { out.push_str(text)?; index = index + 1; };
+    Result { is_ok: true, value: out, error: 0 }
+}
+// One-line fitting always sanitizes untrusted path/model/tool content.
+def ui_fit(text: &str, maximum: i64) -> Result<String, i64> {
+    let safe = cli_terminal_safe(text)?; let iter = safe.chars(); let source = string_new();
+    loop {
+        let item = iter.next(); if not item.is_some { break; }; let cp = char_codepoint(item.value)?;
+        if cp == 9 or cp == 10 { source.push_str(" ")?; (); } else { if cp == 183 { source.push_str("|")?; (); } else { source.push_char(item.value)?; (); }; };
+    };
+    iter.free();
+    let clusters = ui_clusters(source.as_str())?; let out = string_new(); let mut cells = 0; let mut index = 0;
+    while index < clusters.len() { let cluster: &UiCluster = clusters.get(index); if cells + cluster.cells > maximum { break; }; out.push_str(cluster.text.as_str())?; cells = cells + cluster.cells; index = index + 1; };
+    Result { is_ok: true, value: out, error: 0 }
+}
+def ui_header_line(terminal: &Terminal, label: &str, value: &str) -> Result<bool, i64> {
+    let text = cli_text(label); text.push_str(value)?;
+    let fitted = ui_fit(text.as_str(), ui_columns(terminal) - 2)?;
+    ui_style(terminal, "\x1b[90m")?; terminal.write("  ")?; terminal.write(fitted.as_str())?;
+    ui_style(terminal, "\x1b[0m")?; terminal.write("\r\n")
+}
+def ui_welcome(terminal: &Terminal, cwd: &str, connection: &str, model: &str, session: &str) -> Result<bool, i64> {
+    if not terminal.is_tty() { return Result { is_ok: true, value: true, error: 0 }; };
+    terminal.write("\r\n")?; ui_style(terminal, "\x1b[1;36m")?; terminal.write("  S E N C O D E")?;
+    ui_style(terminal, "\x1b[0;90m")?; terminal.write("  /  Sengoo native\r\n")?; ui_style(terminal, "\x1b[0m")?;
+    ui_header_line(terminal, "workspace  ", cwd)?;
+    let target = if model.len() == 0 { cli_text("Select a connection with /connections") } else { cli_text(model) };
+    if connection.len() > 0 { target.push_str("  /  ")?; target.push_str(connection)?; (); };
+    ui_header_line(terminal, "model      ", target.as_str())?; ui_header_line(terminal, "session    ", session)?;
+    terminal.write("\r\n")?; ui_header_line(terminal, "", "/help commands   /resume history   /plan   /goal")?; terminal.write("\r\n")
+}
+def ui_section(terminal: &Terminal, label: &str, detail: &str) -> Result<bool, i64> {
+    if not terminal.is_tty() { return Result { is_ok: true, value: true, error: 0 }; };
+    ui_style(terminal, "\x1b[36m")?; terminal.write("\r\n  ")?;
+    let safe_label = ui_fit(label, ui_columns(terminal) - 3)?; terminal.write(safe_label.as_str())?;
+    ui_style(terminal, "\x1b[0m")?;
+    if detail.len() > 0 { terminal.write("  ")?; terminal.write(ui_fit(detail, ui_columns(terminal) - ui_cells(safe_label.as_str())? - 5)?.as_str())?; (); };
+    terminal.write("\r\n")
+}
+def ui_turn_start(terminal: &Terminal, model: &str) -> Result<bool, i64> { ui_section(terminal, "Sencode", model) }
+def ui_turn_end(terminal: &Terminal, success: bool) -> Result<bool, i64> {
+    if not terminal.is_tty() { return Result { is_ok: true, value: true, error: 0 }; };
+    ui_style(terminal, if success { "\x1b[90m" } else { "\x1b[33m" })?;
+    terminal.write(if success { "\r\n  finished\r\n\r\n" } else { "\r\n  paused / check the message above\r\n\r\n" })?; ui_style(terminal, "\x1b[0m")
+}
+def ui_notice(terminal: &Terminal, text: &str) -> Result<bool, i64> {
+    if not terminal.is_tty() { return ui_output(text); };
+    ui_section(terminal, "Notice", text)
+}
+def ui_mode(terminal: &Terminal, label: &str) -> Result<bool, i64> { ui_section(terminal, "Mode", label) }
+
+// Busy typing is queued for the next prompt, never used for approvals.
+def ui_poll_busy(terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    if engine_control_enabled(pending) { return engine_control_poll(terminal, pending); };
+    if not terminal.is_tty() { return Result { is_ok: true, value: false, error: 0 }; };
+    let event = terminal.read_event(0)?;
+    if event.kind == 4 or event.kind == 5 { return Result { is_ok: true, value: true, error: 0 }; };
+    if event.kind == 1 or event.kind == 2 {
+        let mut bytes = event.data.len(); let mut index = 0;
+        while index < pending.len() { let queued: &TerminalEvent = pending.get(index); bytes = bytes + queued.data.len(); index = index + 1; };
+        if pending.len() >= 256 or bytes > 65536 { return Result { is_ok: false, value: false, error: 13 }; };
+        pending.push(event); ();
+    };
+    Result { is_ok: true, value: false, error: 0 }
+}
+def ui_previous_boundary(text: &str, cursor: i64) -> i64 {
+    let source = cli_text(text); unicode_previous_grapheme(&source, cursor).unwrap_or(0)
+}
+def ui_next_boundary(text: &str, cursor: i64) -> i64 {
+    let source = cli_text(text); unicode_next_grapheme(&source, cursor).unwrap_or(text.len())
+}
+// An insertion can join its right-hand combining mark/ZWJ sequence. Keep the
+// post-edit cursor on a boundary of the new text, including that joined tail.
+def ui_cursor_boundary(text: &str, cursor: i64) -> Result<i64, i64> {
+    if cursor <= 0 { return cli_ok(0); };
+    let source = cli_text(text); let iter = source.chars(); let mut state = unicode_grapheme_state(); let mut offset = 0;
+    loop {
+        let next = iter.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?;
+        if state.push(cp)? and offset >= cursor { iter.free(); return cli_ok(offset); };
+        offset = offset + ui_scalar_bytes(cp);
+    };
+    iter.free(); cli_ok(offset)
+}
+def ui_word_boundary(text: &str, cursor: i64) -> Result<i64, i64> {
+    let source = cli_text(text); let iter = source.chars(); let mut offset = 0; let mut start = 0; let mut word = false;
+    loop {
+        let item = iter.next(); if not item.is_some or offset >= cursor { break; };
+        let code = char_codepoint(item.value)?;
+        if code == 32 or code == 9 or code == 10 { word = false; } else { if not word { start = offset; }; word = true; };
+        offset = offset + ui_scalar_bytes(code);
+    };
+    iter.free();
+    cli_ok(start)
+}
+def ui_scalar_bytes(code: i64) -> i64 { if code < 128 { 1 } else { if code < 2048 { 2 } else { if code < 65536 { 3 } else { 4 } } } }
+def ui_vertical_cursor(text: &str, cursor: i64, width: i64, direction: i64) -> Result<i64, i64> {
+    let layout = ui_layout(text, cursor, width)?; let target = layout.cursor_row + direction;
+    if target < 0 or target >= layout.lines.len() { return cli_ok(cursor); };
+    let limit = if width < 2 { 2 } else { width };
+    let clusters = ui_clusters(text)?; let mut offset = 0; let mut row = 0; let mut column = 0; let mut candidate = cursor; let mut index = 0;
+    while index < clusters.len() {
+        let cluster: &UiCluster = clusters.get(index);
+        if not cluster.newline and column + cluster.cells > limit { row = row + 1; column = 0; };
+        if row > target { break; };
+        if row == target { if column <= layout.cursor_column { candidate = cluster.offset; }; if column >= layout.cursor_column { break; }; };
+        if cluster.newline { row = row + 1; column = 0; } else { column = column + cluster.cells; };
+        offset = cluster.end; index = index + 1;
+    };
+    if index == clusters.len() and row == target and column <= layout.cursor_column { candidate = offset; };
+    cli_ok(candidate)
+}
+def ui_replace_range(text: &str, start: i64, end: i64, replacement: &str) -> Result<String, i64> {
+    let out = cli_byte_slice(text, 0, start)?; out.push_str(replacement)?; out.push_str(cli_byte_slice(text, end, text.len())?.as_str())?;
+    Result { is_ok: true, value: out, error: 0 }
+}
+def ui_commands() -> String { let registry = commands_registry(); commands_names(&registry).unwrap_or(string_new()) }
+def ui_complete(text: &str) -> Result<String, i64> {
+    if not str_starts_with(text, "/") or str_contains(text, " ") or str_contains(text, "\n") { return Result { is_ok: true, value: cli_text(text), error: 0 }; };
+    let commands = ui_commands(); let iter = commands.split(" "); let mut matched = false; let mut common = string_new();
+    loop {
+        let item = iter.next(); if not item.is_some { break; };
+        if str_starts_with(item.value.as_str(), text) {
+            if not matched { common = item.value.clone()?; matched = true; } else {
+                let mut limit = if common.len() < item.value.len() { common.len() } else { item.value.len() }; let mut index = 0;
+                while index < limit { if cli_byte_slice(common.as_str(), index, index + 1)?.as_str() != cli_byte_slice(item.value.as_str(), index, index + 1)?.as_str() { limit = index; break; }; index = index + 1; };
+                common = cli_byte_slice(common.as_str(), 0, limit)?;
+            };
+        };
+    };
+    iter.free();
+    if matched { return Result { is_ok: true, value: common.clone()?, error: 0 }; };
+    Result { is_ok: true, value: cli_text(text), error: 0 }
+}
+def ui_command_hint(text: &str, fallback: &str) -> Result<String, i64> {
+    if not str_starts_with(text, "/") or str_contains(text, " ") or str_contains(text, "\n") { return Result { is_ok: true, value: cli_text(fallback), error: 0 }; };
+    let commands = ui_commands(); let iter = commands.split(" "); let out = cli_text("Tab complete:"); let mut matches = 0;
+    loop { let item = iter.next(); if not item.is_some { break; }; if str_starts_with(item.value.as_str(), text) { out.push_str(" ")?; out.push_str(item.value.as_str())?; matches = matches + 1; (); }; };
+    iter.free();
+    if matches == 0 { return Result { is_ok: true, value: cli_text("Unknown command · /help lists commands"), error: 0 }; };
+    Result { is_ok: true, value: out, error: 0 }
+}
+def ui_layout(text: &str, cursor: i64, width: i64) -> Result<UiLayout, i64> {
+    let limit = if width < 2 { 2 } else { width };
+    let lines: Vec<UiLine> = vec_new(); let clusters = ui_clusters(text)?;
+    let mut line = string_new(); let mut cells = 0; let mut offset = 0; let mut row = 0; let mut column = 0; let mut index = 0;
+    while index < clusters.len() {
+        let cluster: &UiCluster = clusters.get(index);
+        if not cluster.newline and cells + cluster.cells > limit { lines.push(UiLine { text: line, cells: cells, style: 0, message_id: 0 , spans: ui_spans_empty() }); line = string_new(); cells = 0; };
+        if cluster.offset <= cursor and cursor < cluster.end { row = lines.len(); column = cells; };
+        if cluster.newline { lines.push(UiLine { text: line, cells: cells, style: 0, message_id: 0 , spans: ui_spans_empty() }); line = string_new(); cells = 0; } else { line.push_str(cluster.text.as_str())?; cells = cells + cluster.cells; };
+        offset = cluster.end; index = index + 1;
+    };
+    if cursor >= offset { row = lines.len(); column = cells; };
+    lines.push(UiLine { text: line, cells: cells, style: 0, message_id: 0 , spans: ui_spans_empty() });
+    Result { is_ok: true, value: UiLayout { lines: lines, cursor_row: row, cursor_column: column }, error: 0 }
+}
+def ui_move(out: &String, count: i64, direction: &str) -> Result<bool, i64> {
+    if count > 0 { out.push_str("\x1b[")?; out.push_i64(count)?; out.push_str(direction)?; (); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+def ui_frame(layout: &UiLayout, columns: i64, height: i64, status: &str, colored: bool) -> Result<String, i64> {
+    let out = string_new(); let visible = if height < 1 { 1 } else { height };
+    let start = if layout.cursor_row >= visible { layout.cursor_row - visible + 1 } else { 0 };
+    let end = if layout.lines.len() < start + visible { layout.lines.len() } else { start + visible };
+    if colored { out.push_str("\x1b[36m")?; (); };
+    if columns >= 20 { out.push_str("╭─ Message ")?; out.push_str(ui_repeat("─", columns - 12)?.as_str())?; out.push_str("╮\r\n")?; } else { out.push_str(ui_repeat("─", columns)?.as_str())?; out.push_str("\r\n")?; };
+    if colored { out.push_str("\x1b[0m")?; (); };
+    let mut index = start;
+    while index < end {
+        let row: &UiLine = layout.lines.get(index);
+        if colored { out.push_str("\x1b[36m")?; (); };
+        out.push_str(if index == 0 { "│ > " } else { "│   " })?;
+        if colored { out.push_str("\x1b[0m")?; (); };
+        out.push_str(row.text.as_str())?; out.push_str(ui_repeat(" ", columns - 6 - row.cells)?.as_str())?;
+        if colored { out.push_str("\x1b[36m")?; (); };
+        out.push_str(" │\r\n")?;
+        if colored { out.push_str("\x1b[0m")?; (); };
+        index = index + 1;
+    };
+    if colored { out.push_str("\x1b[36m")?; (); };
+    out.push_str("╰")?; out.push_str(ui_repeat("─", columns - 2)?.as_str())?; out.push_str("╯\r\n")?;
+    if colored { out.push_str("\x1b[90m")?; (); };
+    let footer = cli_text("  Ready · ask a question or describe a change");
+    if status.len() > 0 { footer.clear(); footer.push_str("  ")?; footer.push_str(status)?; (); };
+    out.push_str(ui_fit(footer.as_str(), columns)?.as_str())?;
+    out.push_str("\r\n")?;
+    out.push_str(ui_fit("  Enter send · Shift+Enter newline · /help · Ctrl+C cancel", columns)?.as_str())?;
+    if colored { out.push_str("\x1b[0m")?; (); };
+    Result { is_ok: true, value: out, error: 0 }
+}
+def ui_paint(terminal: &Terminal, text: &str, cursor: i64, status: &str, paint: &mut UiPaint) -> Result<bool, i64> {
+    // Windows can briefly report a one-cell viewport while a host changes the
+    // screen buffer size. Keep the previous anchor until a usable size arrives.
+    if terminal.width() > 0 and terminal.width() < 10 { return Result { is_ok: true, value: true, error: 0 }; };
+    let columns = ui_columns(terminal);
+    if not ui_ansi(terminal) or columns < 10 {
+        let fitted = ui_fit(text, columns - 2)?; let prefix = ui_fit(cli_byte_slice(text, 0, cursor)?.as_str(), columns - 2)?;
+        terminal.write("\r")?; terminal.write(ui_repeat(" ", columns)?.as_str())?;
+        terminal.write("\r> ")?; terminal.write(fitted.as_str())?; terminal.write("\r> ")?; return terminal.write(prefix.as_str());
+    };
+    let layout = ui_layout(text, cursor, columns - 6)?;
+    let maximum = if terminal.height() >= 8 { terminal.height() - 6 } else { 1 }; let visible = if maximum > 8 { 8 } else { maximum };
+    let start = if layout.cursor_row >= visible { layout.cursor_row - visible + 1 } else { 0 };
+    let end = if layout.lines.len() < start + visible { layout.lines.len() } else { start + visible };
+    let out = cli_text("\x1b[?25l\r");
+    if paint.rows > 0 {
+        // The host reflows each preceding fixed-width composer row on shrink.
+        // Derive the new offset from our own frame; never inspect scrollback.
+        let physical_width = if terminal.width() > 0 { terminal.width() } else { columns + 1 };
+        let wrap = (paint.columns + physical_width - 1) / physical_width;
+        let above = if columns < paint.columns { paint.cursor_row * wrap + paint.cursor_column / physical_width } else { paint.cursor_row };
+        ui_move(&out, above, "A")?; ();
+    };
+    let hint = ui_command_hint(text, status)?;
+    let rows = end - start + 4; let row = 1 + layout.cursor_row - start;
+    if paint.rows > 0 and (columns != paint.columns or rows < paint.rows) {
+        // A host can reflow the previous frame below the visible viewport.
+        // Clear precisely from our derived anchor through the output tail,
+        // without reading console text or touching any preceding transcript.
+        terminal.write(out.as_str())?;
+        terminal.clear_after_cursor()?;
+        out.clear();
+        ();
+    } else { out.push_str("\x1b[J")?; (); };
+    out.push_str(ui_frame(&layout, columns, visible, hint.as_str(), ui_colors(terminal))?.as_str())?;
+    out.push_str("\r")?; ui_move(&out, rows - 1 - row, "A")?; ui_move(&out, 4 + layout.cursor_column, "C")?; out.push_str("\x1b[?25h")?;
+    terminal.write(out.as_str())?; paint.rows = rows; paint.cursor_row = row; paint.cursor_column = 4 + layout.cursor_column; paint.columns = columns;
+    Result { is_ok: true, value: true, error: 0 }
+}
+def ui_redraw(terminal: &Terminal, text: &str, cursor: i64) -> Result<bool, i64> {
+    let mut paint = UiPaint { rows: 0, cursor_row: 0, cursor_column: 0, columns: 0 }; ui_paint(terminal, text, cursor, "", &mut paint)
+}
+def ui_finish_prompt(terminal: &Terminal, paint: &UiPaint) -> Result<bool, i64> {
+    if not terminal.is_tty() { return Result { is_ok: true, value: true, error: 0 }; };
+    if ui_ansi(terminal) and paint.rows > 0 {
+        let out = cli_text("\r"); ui_move(&out, paint.rows - 2 - paint.cursor_row, "B")?; out.push_str("\x1b[J\r\n")?; return terminal.write(out.as_str());
+    };
+    terminal.write("\r\n")
+}
+def ui_read_line(terminal: &Terminal, history: &Vec<InputHistory>) -> Result<String, i64> {
+    let pending: Vec<TerminalEvent> = vec_new(); ui_read_line_pending(terminal, history, &pending)
+}
+def ui_read_line_pending(terminal: &Terminal, history: &Vec<InputHistory>, pending: &Vec<TerminalEvent>) -> Result<String, i64> {
+    ui_read_prompt(terminal, history, pending, "")
+}
+def ui_read_prompt(terminal: &Terminal, history: &Vec<InputHistory>, pending: &Vec<TerminalEvent>, status: &str) -> Result<String, i64> {
+    ui_read_prompt_mode(terminal, history, pending, status, true)
+}
+def ui_read_prompt_mode(terminal: &Terminal, history: &Vec<InputHistory>, pending: &Vec<TerminalEvent>, status: &str, decorated: bool) -> Result<String, i64> {
+    let mut text = string_new(); let mut draft = string_new(); let mut cursor = 0; let mut history_index = history.len();
+    let mut paint = UiPaint { rows: 0, cursor_row: 0, cursor_column: 0, columns: 0 };
+    if terminal.is_tty() and decorated { ui_paint(terminal, text.as_str(), cursor, status, &mut paint)?; (); };
+    loop {
+        let event = if pending.len() > 0 { let removed = pending.remove(0); if not removed.is_some { return string_result_err(3); }; removed.value } else { terminal.read_event(1000)? };
+        if event.kind == 0 or event.kind == 3 { if event.kind == 3 and terminal.is_tty() and decorated { ui_paint(terminal, text.as_str(), cursor, status, &mut paint)?; (); }; continue; };
+        if event.kind == 4 { if decorated { ui_finish_prompt(terminal, &paint)?; if terminal.is_tty() { terminal.write("  cancelled\r\n")?; (); }; }; return string_result_err(19); };
+        if event.kind == 5 { if decorated { ui_finish_prompt(terminal, &paint)?; (); }; if text.len() > 0 { return Result { is_ok: true, value: text, error: 0 }; }; return string_result_err(5); };
+        if event.kind == 2 {
+            let safe = cli_terminal_safe(event.data.as_str())?; if text.len() + safe.len() > 65536 { return string_result_err(13); };
+            text = ui_replace_range(text.as_str(), cursor, cursor, safe.as_str())?; cursor = cursor + safe.len();
+        };
+        if event.kind == 1 {
+            if event.code == 4 and text.len() == 0 { if decorated { ui_finish_prompt(terminal, &paint)?; (); }; return string_result_err(5); };
+            if event.code == 13 or event.code == 10 {
+                if event.modifiers == 1 or event.modifiers == 2 or event.code == 10 and event.modifiers == 4 {
+                    if text.len() >= 65536 { return string_result_err(13); };
+                    text = ui_replace_range(text.as_str(), cursor, cursor, "\n")?; cursor = cursor + 1;
+                } else { if decorated { ui_finish_prompt(terminal, &paint)?; (); }; return Result { is_ok: true, value: text, error: 0 }; };
+            } else {
+                if event.code == 8 or event.code == 127 { let previous = ui_previous_boundary(text.as_str(), cursor); text = ui_replace_range(text.as_str(), previous, cursor, "")?; cursor = previous; } else {
+                    if event.code == 21 { text = ui_replace_range(text.as_str(), 0, cursor, "")?; cursor = 0; };
+                    if event.code == 23 { let previous = ui_word_boundary(text.as_str(), cursor)?; text = ui_replace_range(text.as_str(), previous, cursor, "")?; cursor = previous; };
+                    if event.code == 4 { text = ui_replace_range(text.as_str(), cursor, ui_next_boundary(text.as_str(), cursor), "")?; };
+                    if event.code == 9 { text = ui_complete(text.as_str())?; cursor = text.len(); };
+                    if event.code == 1003 { cursor = ui_next_boundary(text.as_str(), cursor); };
+                    if event.code == 1004 { cursor = ui_previous_boundary(text.as_str(), cursor); };
+                    if event.code == 1005 { cursor = 0; };
+                    if event.code == 1006 { cursor = text.len(); };
+                    if event.code == 1007 { text = ui_replace_range(text.as_str(), cursor, ui_next_boundary(text.as_str(), cursor), "")?; };
+                    if event.code == 1001 {
+                        let layout = ui_layout(text.as_str(), cursor, ui_columns(terminal) - 6)?;
+                        if layout.cursor_row > 0 { cursor = ui_vertical_cursor(text.as_str(), cursor, ui_columns(terminal) - 6, -1)?; } else {
+                            if history_index > 0 { if history_index == history.len() { draft = text.clone()?; (); }; history_index = history_index - 1; text = history.get(history_index).recalled()?; cursor = text.len(); };
+                        };
+                    };
+                    if event.code == 1002 {
+                        let layout = ui_layout(text.as_str(), cursor, ui_columns(terminal) - 6)?;
+                        if layout.cursor_row + 1 < layout.lines.len() { cursor = ui_vertical_cursor(text.as_str(), cursor, ui_columns(terminal) - 6, 1)?; } else {
+                            if history_index < history.len() { if history_index + 1 < history.len() { history_index = history_index + 1; text = history.get(history_index).recalled()?; } else { history_index = history.len(); text = draft.clone()?; }; cursor = text.len(); };
+                        };
+                    };
+                    if event.code >= 32 and event.code < 1000 and event.data.len() > 0 or event.code > 1010 and event.data.len() > 0 {
+                        let safe = cli_terminal_safe(event.data.as_str())?; if text.len() + safe.len() > 65536 { return string_result_err(13); };
+                        text = ui_replace_range(text.as_str(), cursor, cursor, safe.as_str())?; cursor = cursor + safe.len();
+                    };
+                };
+            };
+        };
+        cursor = ui_cursor_boundary(text.as_str(), cursor)?;
+        if terminal.is_tty() and decorated { ui_paint(terminal, text.as_str(), cursor, status, &mut paint)?; (); };
+    };
+    string_result_err(5)
+}
+def ui_confirm(terminal: &Terminal, description: &str) -> Result<bool, i64> {
+    if not terminal.is_tty() { return Result { is_ok: true, value: false, error: 0 }; };
+    // Approval begins only after already available input has been discarded.
+    // Busy typing is not a decision; cancellation and discard errors fail closed.
+    if not ui_approval_barrier(terminal)? { return Result { is_ok: true, value: false, error: 0 }; };
+    ui_style(terminal, "\x1b[1;33m")?; terminal.write("\r\n  Permission required\r\n")?; ui_style(terminal, "\x1b[0m")?;
+    ui_output(description)?; terminal.write("\r\n  Type yes to approve. Any other answer declines.\r\n")?;
+    let history: Vec<InputHistory> = vec_new(); let pending: Vec<TerminalEvent> = vec_new();
+    let answer = ui_read_prompt(terminal, &history, &pending, "APPROVAL · yes / deny")?; let trimmed = str_trim(answer.as_str())?;
+    Result { is_ok: true, value: trimmed.as_str() == "yes", error: 0 }
+}
+def ui_approval_barrier(terminal: &Terminal) -> Result<bool, i64> {
+    let before = terminal.read_event(0)?;
+    if before.kind == 4 { return Result { is_ok: false, value: false, error: 19 }; };
+    if before.kind == 5 { return Result { is_ok: true, value: false, error: 0 }; };
+    // NONE can mean an ignored key-up record, not an empty OS queue. The
+    // generic terminal primitive clears both queued OS input and parser bytes.
+    terminal.discard_input()?;
+    let after = terminal.read_event(0)?;
+    if after.kind == 4 { return Result { is_ok: false, value: false, error: 19 }; };
+    if after.kind == 5 { return Result { is_ok: true, value: false, error: 0 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+def ui_read_secret(terminal: &Terminal) -> Result<String, i64> {
+    if not terminal.is_tty() { return string_result_err(7); };
+    terminal.write("API key (hidden; Windows Credential Manager): ")?; let mut value = string_new();
+    loop {
+        let event = terminal.read_event(1000)?;
+        if event.kind == 4 or event.kind == 5 { return string_result_err(19); };
+        if event.kind == 1 and (event.code == 13 or event.code == 10) { terminal.write("\r\n")?; return Result { is_ok: true, value: value, error: 0 }; };
+        if event.kind == 1 and (event.code == 8 or event.code == 127) { value = cli_byte_slice(value.as_str(), 0, ui_previous_boundary(value.as_str(), value.len()))?; } else {
+            if event.kind == 2 or event.kind == 1 and event.data.len() > 0 {
+                if str_contains(event.data.as_str(), "\r") or str_contains(event.data.as_str(), "\n") { return string_result_err(2); };
+                value.push_str(event.data.as_str())?; if value.len() > 8192 { return string_result_err(13); };
+            };
+        };
+    };
+    string_result_err(19)
+}

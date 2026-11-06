@@ -1,0 +1,34 @@
+import diagnostics;
+import command_line;
+
+def diagnostics_verify(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    state.db.exec("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES('diagnostics-fixture','customApi','managed','诊断 fixture','{\"private_field\":\"do-not-emit-raw-config\"}','model-a',1,1)")?;
+    cli_state_set_default_connection(&state, "diagnostics-fixture")?;
+    let session = cli_state_create_session(&state, cwd)?;
+    let input: Vec<TerminalEvent> = vec_new();
+    let mut options = AgentOptions { cwd: cli_text(cwd), session: session, connection: string_new(), model: string_new(), effort: string_new(), format: cli_text("text"), policy: policy_default(), allow_commands: false, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let inherited = diagnostics_config(&state, &options, "strict")?;
+    if cli_json_string(inherited.root().object_get("target")?, "id")?.as_str() != "diagnostics-fixture" { return state_bool_error(91); };
+    if str_contains(inherited.serialize_string()?.as_str(), "do-not-emit-raw-config") { return state_bool_error(92); };
+    options.connection = cli_text("diagnostics-fixture"); options.model = cli_text("explicit-model"); options.policy.plan = true;
+    let explicit = diagnostics_config(&state, &options, "strict")?;
+    if cli_json_string(explicit.root(), "model_source")?.as_str() != "explicit current CLI model" or not explicit.root().object_get("plan")?.bool_value()? { return state_bool_error(93); };
+    if cli_json_string(explicit.root().object_get("target")?, "model")?.as_str() != "explicit-model" { return state_bool_error(94); };
+    let doctor = diagnostics_doctor(&state, cwd, false)?;
+    if cli_json_optional_i64(doctor.root(), "schema", 0) != 1 or doctor.root().object_get("terminal")?.bool_value()? { return state_bool_error(95); };
+    if str_contains(doctor.serialize_string()?.as_str(), "do-not-emit-raw-config") { return state_bool_error(96); };
+    let reopen = cli_state_open(database)?;
+    if cli_state_default_connection(&reopen)?.as_str() != "diagnostics-fixture" { return state_bool_error(97); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", "").unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let cwd = path_parent_string(database.as_str()).unwrap_or(string_new());
+    let result = diagnostics_verify(database.as_str(), cwd.as_str());
+    if not result.is_ok() { println(result.error); return 1; };
+    println("diagnostics effective policy/provenance/allowlisted metadata passed"); 0
+}

@@ -1,0 +1,102 @@
+{
+  "recorded_at": "2026-11-04T14:12:08.050992+00:00",
+  "host": "DESKTOP-FUAQMFB",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "sencode_head": "a468086401a0d19077b5cf0b6aea3ecff0f04c9a",
+  "sengoo_head": "d46b3f6cd8d6e770734f98edc57aa67cb931e26a",
+  "compiler_sha256": "cf52f7a8ea6bdad280844a327beb9452980ee2f723324a3dd6155626f08f093b",
+  "sources": {
+    "examples/native-hook-worker/main.sg": "5091c43cbdcac4ec12fe944f7c0a1dbe9c5935e1ada5729564d85372d2bd721d",
+    "src/controller.sg": "9c172f8adf050d8c7afb45dd6eee45bf62dc9d8b3ff375d6ee58db7cc544048a",
+    "src/engine_control.sg": "18dd0fc35c5ee345b5475ce835ad8d4d619fdcb59fcdb1f674085200b971f41e",
+    "src/hook_client.sg": "4712ee2ce963adc421d48184f9407a475a9143aeb01ee45125a735c34a76e51f",
+    "src/hook_contract.sg": "8129e12b271a444afd8c4064564be8bd793e269952928fc8659048aeb6dbff03",
+    "src/hook_host.sg": "e1ff5ac519a3cb6afe5fdec111a7193fe4c6c7d5cb9ba3200967863a89d12e22",
+    "src/hook_host_probe.sg": "85492eec749218acd238d237cab98bdf097ef45bda6c50bbdede5a93271732e0",
+    "src/hook_management.sg": "7a55a6b2275c6a9b8f707c212509d335a323d9458a92fff8c8706d6612b25a6c",
+    "src/hook_probe.sg": "340fff044fa258ab4fb4023a2e133b1ff7aaa0a1220cfc71c3a307572abde003",
+    "src/hook_sdk.sg": "db2809bbcbb31f00dc81ec2830df6da50e83e1481a37f5e9e7ce0adaf93977d2",
+    "src/hook_store.sg": "84f4dd270ee858c4af3b806d8465451461c3cb46401b2f1bf55d74d1abe2e95a",
+    "src/tests_approval_nonce.sg": "bdd255bf6b999dd88dfc7f94273562a02b624b1a335c0923075f5afae94cad17",
+    "src/tests_hooks.sg": "ef64650c9861ad317e72de27aab2defc592c9cf5d9a6af70c08d692335153c8a",
+    "tests/hook_example_fixture.py": "733ad814ed9f768344e910235d7eee7a85c824b27429da5bf4fa013d723a906b",
+    "tests/hook_fixture.py": "6aa2001b9cf47b1d5563b87997bb73a75bb46085e01d43e47ddd39a697e504a9",
+    "tests/hook_host_fixture.py": "1c7db134264542a7cb42a5c2e476335369f3b22b5b296dc37fe95dc9e3588e78",
+    "tests/hook_worker_fixture.sg": "e58bf10998f608a44c853e1834c4d871b0080071d944a2c426da08d3e836b4b7"
+  },
+  "binaries": {
+    "hook-host-probe-final.exe": "06acbebc8d76a4c54b019e62b9369b8811c053ca6e9d6942d4c1a20e984a300a",
+    "hook-probe.exe": "4383a62f2f3c83b9df0dfe5a16c2a39710f55fcf28752eb11c31158a240b9392",
+    "hook-worker-fixture.exe": "4b98f993941d4c90665016827b5f61004f9ddb8bf44a70c65d5a63776caee4fa",
+    "tests-hooks-final.exe": "a267c71938da8bd7b4c48c9e937a5d689380366296281fd1945ac3137778382f",
+    "tests-approval-nonce.exe": "70baef7b0dec47f55423d15064b2aa2b47711695bd4bbf0acaa804a905617043",
+    "protected-paths-example.exe": "f2e5c202db8fb1ba15968cc50d79516d88209458805f598206a7614db8fdaf55"
+  },
+  "build_cache_evidence": {
+    "hook_host_probe": {
+      "compiler_identity": "sha256:cf52f7a8ea6bdad280844a327beb9452980ee2f723324a3dd6155626f08f093b",
+      "source_hash": 6618013860972451551,
+      "runtime_c_fingerprint": 1326250742048368812,
+      "runtime_provenance": {
+        "artifact_provenance": "source-cargo-development",
+        "build_manifest_id": null,
+        "release_eligible": false,
+        "runtime_mode": "source-development",
+        "senline_pin_evidence": false
+      },
+      "root_implementation_hash": 6618013860972451551,
+      "root_interface_hash": 9011416013982105787,
+      "opt_level": 0,
+      "manifest_sha256": "c927dfcd7f9c7f333b60f95c84ad7ff22b8cd348ebd9cb24466e00d34b809650"
+    },
+    "hook_probe": {
+      "compiler_identity": "sha256:cf52f7a8ea6bdad280844a327beb9452980ee2f723324a3dd6155626f08f093b",
+      "source_hash": 15676157954170072739,
+      "runtime_c_fingerprint": 1326250742048368812,
+      "runtime_provenance": {
+        "artifact_provenance": "source-cargo-development",
+        "build_manifest_id": null,
+        "release_eligible": false,
+        "runtime_mode": "source-development",
+        "senline_pin_evidence": false
+      },
+      "root_implementation_hash": 15676157954170072739,
+      "root_interface_hash": 1491652472427979723,
+      "opt_level": 0,
+      "manifest_sha256": "494ddf4854fdae157aa5d8837cfbca0343dead026c4f69d8410af8ff88b07c24"
+    },
+    "tests_hooks": {
+      "compiler_identity": "sha256:cf52f7a8ea6bdad280844a327beb9452980ee2f723324a3dd6155626f08f093b",
+      "source_hash": 9381124657490319213,
+      "runtime_c_fingerprint": 1326250742048368812,
+      "runtime_provenance": {
+        "artifact_provenance": "source-cargo-development",
+        "build_manifest_id": null,
+        "release_eligible": false,
+        "runtime_mode": "source-development",
+        "senline_pin_evidence": false
+      },
+      "root_implementation_hash": 9381124657490319213,
+      "root_interface_hash": 4297220471255258221,
+      "opt_level": 0,
+      "manifest_sha256": "52196d37cefc8214d466e1ad2c549f7d608f5a1a79c595437fe1364c23733afa"
+    },
+    "tests_approval_nonce": {
+      "compiler_identity": "sha256:cf52f7a8ea6bdad280844a327beb9452980ee2f723324a3dd6155626f08f093b",
+      "source_hash": 14323594718304932138,
+      "runtime_c_fingerprint": 5413310701803585392,
+      "runtime_provenance": {
+        "artifact_provenance": "source-cargo-development",
+        "build_manifest_id": null,
+        "release_eligible": false,
+        "runtime_mode": "source-development",
+        "senline_pin_evidence": false
+      },
+      "root_implementation_hash": 14323594718304932138,
+      "root_interface_hash": 1987484896939408124,
+      "opt_level": 0,
+      "manifest_sha256": "eb27139446dde75ba522d66c834e3d20195985166d318e3943522d1c13e039fe"
+    }
+  },
+  "scope": "Private isolated fixtures only; no installed/public-route/live-provider acceptance. Concurrent sibling changes are not asserted to match this probe dependency snapshot."
+}

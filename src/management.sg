@@ -1,0 +1,167 @@
+import state;
+import command_line;
+import output;
+import mcp;
+import skills;
+import policy;
+
+def management_positional(options: &JsonDoc, index: i64) -> String {
+    let items = options.root().object_get("positionals");
+    if not items.is_ok() { return string_new(); };
+    let item = items.value.array_get(index);
+    if not item.is_ok() { return string_new(); };
+    item.value.string_value().unwrap_or(string_new())
+}
+
+def management_connections(state: &CliState, options: &JsonDoc, terminal: &Terminal) -> Result<i64, i64> {
+    let action = management_positional(options, 1);
+    if action.len() == 0 or action.as_str() == "list" { let items = management_connection_list(state)?; output_document(&items)?; return cli_ok(0); };
+    let id = management_positional(options, 2);
+    if id.len() == 0 { cli_diagnostic("Usage: sen connections add|edit|remove custom-ID [--base-url URL --protocol NAME --model MODEL --label NAME]"); return cli_ok(2); };
+    if action.as_str() == "select" { cli_state_set_default_connection(state, id.as_str())?; return cli_ok(0); };
+    if action.as_str() == "remove" { cli_state_connection_remove(state, id.as_str())?; return cli_ok(0); };
+    if action.as_str() != "add" and action.as_str() != "edit" { return cli_ok(2); };
+    let mut base = cli_option(options, "base-url", "")?;
+    let mut model = cli_option(options, "model", "")?;
+    let mut label = cli_option(options, "label", id.as_str())?;
+    let mut protocol = cli_option(options, "protocol", "chatCompletions")?;
+    if action.as_str() == "edit" {
+        let old = cli_state_connection(state, id.as_str())?;
+        if base.len() == 0 { base = cli_json_string(old.root(), "base_url")?; };
+        if model.len() == 0 { model = cli_json_string(old.root(), "model")?; };
+        if not options.root().object_has("protocol") { protocol = cli_json_string(old.root(), "protocol")?; };
+        if not options.root().object_has("label") { label = cli_json_optional_string(old.root(), "name"); };
+    };
+    if base.len() == 0 or model.len() == 0 { cli_diagnostic("A base URL and model are required."); return cli_ok(2); };
+    let secret = ui_read_secret(terminal)?;
+    cli_state_connection_save(state, id.as_str(), label.as_str(), base.as_str(), protocol.as_str(), model.as_str(), secret.as_str())?;
+    cli_ok(0)
+}
+
+def management_connection_list(state: &CliState) -> Result<JsonDoc, i64> {
+    let items = cli_state_connections(state)?;
+    cli_put_string(&items, items.root(), "current", cli_state_default_connection(state)?.as_str())?;
+    Result { is_ok: true, value: items, error: 0 }
+}
+
+def management_mcp_path(cwd: &str) -> Result<String, i64> {
+    let directory = workspace_path(cwd, ".sencode")?;
+    dir_create_all(directory.as_str())?;
+    path_join_string(directory.as_str(), "mcp.json")
+}
+
+def management_mcp_config(cwd: &str) -> Result<JsonDoc, i64> {
+    // Listing and discovery do not create a workspace configuration directory.
+    let path = workspace_path(cwd, ".sencode/mcp.json")?;
+    if not file_exists(path.as_str()) { return json_parse("{\"servers\":[]}"); };
+    let text = workspace_read(path.as_str(), 262144)?;
+    json_parse(text.as_str())
+}
+
+def management_mcp_server(config: &JsonDoc, name: &str) -> Result<JsonDoc, i64> {
+    let servers = config.root().object_get("servers")?;
+    let mut index = 0;
+    while index < servers.array_len()? {
+        let server = servers.array_get(index)?;
+        if cli_json_string(server, "name")?.as_str() == name {
+            let result = json_doc_object()?;
+            result.root().object_set("server", result.copy(server)?)?;
+            return Result { is_ok: true, value: result, error: 0 };
+        };
+        index = index + 1;
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }
+}
+
+def management_mcp(cwd: &str, options: &JsonDoc, terminal: &Terminal) -> Result<i64, i64> {
+    let action = management_positional(options, 1);
+    let config = management_mcp_config(cwd)?;
+    let count = options.root().object_get("positionals")?.array_len()?;
+    if action.len() == 0 or action.as_str() == "list" { if count > 2 { return cli_ok(2); }; output_document(&config)?; return cli_ok(0); };
+    if cli_flag(options, "plan") { cli_diagnostic("MCP process launch and configuration changes are disabled in Plan."); return cli_ok(7); };
+    let name = management_positional(options, 2);
+    if name.len() == 0 or not skill_valid_name(name.as_str()) { return cli_ok(2); };
+    if (action.as_str() == "doctor" or action.as_str() == "remove") and count != 3 { return cli_ok(2); };
+    if action.as_str() == "doctor" {
+        let record = management_mcp_server(&config, name.as_str())?;
+        let preview = cli_text("Start this MCP server to initialize and discover tools? The process runs with your OS privileges.\n");
+        preview.push_str(record.serialize_string()?.as_str())?;
+        if terminal.is_tty() { terminal.enter_raw()?; (); };
+        if not ui_confirm(terminal, preview.as_str())? { cli_diagnostic("MCP process execution was not approved."); return cli_ok(7); };
+        let refreshed = management_mcp_config(cwd)?;
+        let current = management_mcp_server(&refreshed, name.as_str())?;
+        if current.serialize_string()?.as_str() != record.serialize_string()?.as_str() { cli_diagnostic("MCP configuration changed after approval; run doctor again."); return cli_ok(8); };
+        let server = current.root().object_get("server")?;
+        let command = cli_json_string(server, "command")?;
+        let mut client = mcp_start(command.as_str(), server.object_get("args")?, cwd)?;
+        client.initialize(terminal)?;
+        let tools = client.tools(terminal)?;
+        let diagnostic = client.diagnostic_report()?;
+        tools.root().object_set("diagnostics", tools.copy(diagnostic.root())?)?;
+        output_document(&tools)?;
+        return cli_ok(0);
+    };
+    if action.as_str() != "add" and action.as_str() != "remove" { return cli_ok(2); };
+    let next = json_parse("{\"servers\":[]}")?;
+    let target = next.root().object_get("servers")?;
+    let source = config.root().object_get("servers")?;
+    let mut index = 0;
+    while index < source.array_len()? {
+        let item = source.array_get(index)?;
+        if cli_json_string(item, "name")?.as_str() != name.as_str() { target.array_push(next.copy(item)?)?; (); };
+        index = index + 1;
+    };
+    if action.as_str() == "add" {
+        let command = management_positional(options, 3);
+        if command.len() == 0 { return cli_ok(2); };
+        let server = next.new_object()?;
+        cli_put_string(&next, server, "name", name.as_str())?;
+        cli_put_string(&next, server, "command", command.as_str())?;
+        let args = next.new_array()?;
+        let positionals = options.root().object_get("positionals")?;
+        index = 4;
+        while index < positionals.array_len()? { args.array_push(next.copy(positionals.array_get(index)?)?)?; index = index + 1; };
+        server.object_set("args", args)?;
+        target.array_push(server)?;
+        ();
+    };
+    let path = management_mcp_path(cwd)?;
+    let text = next.serialize_string()?;
+    workspace_atomic_write(path.as_str(), text.as_str())?;
+    cli_ok(0)
+}
+
+def management_mcp_tool(cwd: &str, name: &str, args: &JsonDoc, policy: &AgentPolicy, terminal: &Terminal) -> Result<JsonDoc, i64> {
+    let pending: Vec<TerminalEvent> = vec_new();
+    management_mcp_tool_pending(cwd, name, args, policy, terminal, &pending)
+}
+
+def management_mcp_tool_pending(cwd: &str, name: &str, args: &JsonDoc, policy: &AgentPolicy, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    if policy.plan or policy.depth > 0 { return workspace_result("MCP is disabled in Plan and child modes", true); };
+    if name != "mcp__list_tools" and name != "mcp__call" { return workspace_result("Unknown MCP operation", true); };
+    let server_name = cli_json_string(args.root(), "server")?;
+    let config = management_mcp_config(cwd)?;
+    let record = management_mcp_server(&config, server_name.as_str())?;
+    let server = record.root().object_get("server")?;
+    let text = record.serialize_string()?;
+    let approved = if policy.full_access { true } else { if policy.interactive {
+        if engine_control_enabled(pending) { engine_control_confirm(terminal, pending, name, text.as_str())? } else { ui_confirm(terminal, text.as_str())? }
+    } else { false } };
+    if not approved {
+        let required = workspace_result("MCP process execution was not approved", true)?;
+        cli_put_bool(&required, required.root(), "permission_required", true)?;
+        return Result { is_ok: true, value: required, error: 0 };
+    };
+    let command = cli_json_string(server, "command")?;
+    let tool = if name == "mcp__list_tools" { string_new() } else { cli_json_string(args.root(), "tool")? };
+    let mut client = mcp_start(command.as_str(), server.object_get("args")?, cwd)?;
+    let initialized = client.initialize_pending(terminal, pending);
+    let result = if not initialized.is_ok() { Result { is_ok: false, value: JsonDoc { handle: 0 }, error: initialized.error } } else {
+        if name == "mcp__list_tools" { client.tools_pending(terminal, pending) } else { client.call_tool_pending(tool.as_str(), args.root().object_get("arguments")?, terminal, pending) }
+    };
+    // A server is scoped to this admitted call. Do not release the writer's
+    // lease merely because its direct process or JSON-RPC response finished.
+    client.cancel();
+    loop { let quiet = client.process.tree_quiescent(); if quiet.is_ok() and quiet.value { break; }; client.process.terminate_tree(); time_sleep_ms(1); };
+    result
+}

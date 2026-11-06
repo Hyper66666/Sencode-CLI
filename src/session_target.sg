@@ -1,0 +1,70 @@
+import sessions;
+import views;
+import config_catalog;
+import model_selection;
+
+// Public selection metadata only. No credentials, policies or native sessions.
+def session_target_sanitize(value: JsonValue) -> Result<JsonDoc, i64> {
+    if value.kind()? != JSON_KIND_OBJECT() or cli_json_optional_i64(value, "schema", 0) != 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let connection = cli_json_string(value, "connection")?; let model = cli_json_string(value, "model")?; let effort = cli_json_string(value, "effort")?;
+    if connection.len() == 0 or connection.len() > 512 or model.len() == 0 or model.len() > 1024 or not connection_effort_valid(effort.as_str()) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    if cli_terminal_safe(connection.as_str())?.as_str() != connection.as_str() or cli_terminal_safe(model.as_str())?.as_str() != model.as_str() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let result = json_doc_object()?;
+    cli_put_i64(&result, result.root(), "schema", 1)?;
+    cli_put_string(&result, result.root(), "connection", connection.as_str())?; cli_put_string(&result, result.root(), "model", model.as_str())?; cli_put_string(&result, result.root(), "effort", effort.as_str())?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def session_target_load(state: &CliState, session: &str) -> Result<JsonDoc, i64> {
+    let modes = cli_state_modes(state, session)?;
+    if modes.root().object_has("cli_target") { return session_target_sanitize(modes.root().object_get("cli_target")?); };
+    let mut query = state.db.prepare("SELECT COALESCE(selected_connection_id,''),COALESCE(selected_model_id,'') FROM sessions WHERE id=?")?;
+    query.bind_text(1, session)?; if not query.step()? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }; };
+    let result = json_doc_object()?; let connection = query.text(0)?; let model = query.text(1)?;
+    if connection.len() > 0 and model.len() > 0 {
+        cli_put_i64(&result, result.root(), "schema", 1)?; cli_put_string(&result, result.root(), "connection", connection.as_str())?;
+        cli_put_string(&result, result.root(), "model", model.as_str())?; cli_put_string(&result, result.root(), "effort", "")?; ();
+    };
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+// Explicit supplier replaces the complete saved tuple; explicit model keeps
+// its supplier but resets saved effort. An explicit effort wins last.
+def session_target_restore(state: &CliState, session: &str, connection: &str, model: &str, effort: &str) -> Result<JsonDoc, i64> {
+    let saved = session_target_load(state, session)?; let result = json_doc_object()?;
+    let inherited = connection.len() == 0 and saved.root().object_has("connection");
+    cli_put_string(&result, result.root(), "connection", if inherited { cli_json_string(saved.root(), "connection")?.as_str() } else { connection })?;
+    cli_put_string(&result, result.root(), "model", if inherited and model.len() == 0 { cli_json_string(saved.root(), "model")?.as_str() } else { model })?;
+    cli_put_string(&result, result.root(), "effort", if inherited and model.len() == 0 and effort.len() == 0 { cli_json_string(saved.root(), "effort")?.as_str() } else { effort })?;
+    cli_put_bool(&result, result.root(), "restored", inherited)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def session_target_save(state: &CliState, session: &str, connection: &str, model: &str, effort: &str) -> Result<bool, i64> {
+    let selected = view_selection(state, connection, model)?;
+    let id = cli_json_string(selected.root(), "id")?; let active_model = cli_json_string(selected.root(), "model")?;
+    if id.len() == 0 or active_model.len() == 0 or active_model.as_str() == "not configured" { return Result { is_ok: true, value: true, error: 0 }; };
+    let catalog = config_snapshot(state)?; let normalized = model_selection_snapshot(&catalog, id.as_str(), active_model.as_str(), effort)?;
+    let mut effective = cli_json_string(normalized.root().object_get("selected")?, "effort")?;
+    let metadata = cli_state_connection_metadata(state, id.as_str());
+    // Missing or temporarily unavailable suppliers retain their saved target.
+    // A later request must fail explicitly rather than use the global default.
+    if not metadata.is_ok() or effort.len() > 0 and effective.len() == 0 { effective = cli_text(effort); };
+    let value = json_doc_object()?; cli_put_i64(&value, value.root(), "schema", 1)?;
+    cli_put_string(&value, value.root(), "connection", id.as_str())?; cli_put_string(&value, value.root(), "model", active_model.as_str())?; cli_put_string(&value, value.root(), "effort", effective.as_str())?;
+    let safe = session_target_sanitize(value.root())?; let raw = safe.serialize_string()?;
+    let path = state_lock_path(state.path.as_str(), "session", session)?; let lease = file_lock(path.as_str())?;
+    session_idle(state, session)?;
+    let mut tx = state.db.transaction()?;
+    let mut unchanged = tx.prepare("SELECT 1 FROM shared_modes m JOIN sessions s ON s.id=m.session_id WHERE m.session_id=? AND json_extract(m.mode_json,'$.cli_target')=json(?) AND s.selected_connection_id=? AND s.selected_model_id=?")?;
+    unchanged.bind_text(1, session)?; unchanged.bind_text(2, raw.as_str())?; unchanged.bind_text(3, id.as_str())?; unchanged.bind_text(4, active_model.as_str())?;
+    if unchanged.step()? { tx.commit()?; return Result { is_ok: true, value: true, error: 0 }; };
+    let now = time_unix_ms();
+    // Update one JSON member in the transaction, preserving Plan, Goal and
+    // usage state. The session lock/idle check forbids writes during execution.
+    let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,json_object('cli_target',json(?)),?) ON CONFLICT(session_id) DO UPDATE SET mode_json=json_set(shared_modes.mode_json,'$.cli_target',json(?)),updated_at=excluded.updated_at")?;
+    save.bind_text(1, session)?; save.bind_text(2, raw.as_str())?; save.bind_i64(3, now)?; save.bind_text(4, raw.as_str())?; save.step()?;
+    let mut update = tx.prepare("UPDATE sessions SET selected_connection_id=?,selected_model_id=?,updated_at=? WHERE id=?")?;
+    update.bind_text(1, id.as_str())?; update.bind_text(2, active_model.as_str())?; update.bind_i64(3, now)?; update.bind_text(4, session)?; update.step()?;
+    tx.commit()?; Result { is_ok: true, value: true, error: 0 }
+}

@@ -1,0 +1,88 @@
+import state;
+
+// Local prompt recall is a read-only catalog projection. Resolve the current
+// directory to its retained project identity rather than recomputing a path
+// hash, so a project-history rebind after a directory rename keeps its scope.
+def local_prompt_history(state: &CliState, cwd: &str, query: &str) -> Result<JsonDoc, i64> {
+    let document = json_doc_object_bounded(4194304)?;
+    if query.len() > 512 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let canonical = canonical_path_string(cwd)?;
+    let prompts = document.new_array()?;
+    document.root().object_set("prompts", prompts)?;
+    let sql=cli_text(session_children_sql());
+    sql.push_str(" SELECT m.id,m.session_id,m.text,m.revision,m.created_at FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.project_id=(SELECT id FROM projects WHERE directory=?) AND s.archived=0 AND s.id NOT IN(SELECT id FROM child_sessions) AND m.role='user' AND m.cancelled=0 AND typeof(m.text)='text' AND length(CAST(m.text AS BLOB)) BETWEEN 1 AND 65536 AND length(CAST(m.id AS BLOB)) BETWEEN 1 AND 256 AND length(CAST(m.session_id AS BLOB)) BETWEEN 1 AND 256 AND (?='' OR instr(lower(m.text),lower(?))>0) ORDER BY m.created_at DESC,m.revision DESC,m.id DESC LIMIT 100")?;
+    let mut rows = state.db.prepare(sql.as_str())?;
+    rows.bind_text(1, canonical.as_str())?; rows.bind_text(2, query)?; rows.bind_text(3, query)?;
+    let mut total = 0; let mut limited = false;
+    while rows.step()? {
+        let text = rows.text(2)?;
+        if text.len() != text.as_str().len() { limited = true; continue; };
+        if total + text.len() > 524288 { limited = true; break; };
+        let item = document.new_object()?;
+        cli_put_string(&document, item, "id", rows.text(0)?.as_str())?;
+        cli_put_string(&document, item, "session_id", rows.text(1)?.as_str())?;
+        cli_put_string(&document, item, "text", text.as_str())?;
+        cli_put_i64(&document, item, "revision", rows.integer(3)?)?;
+        cli_put_i64(&document, item, "created_at", rows.integer(4)?)?;
+        prompts.array_push(item)?; total = total + text.len();
+    };
+    if prompts.array_len()? == 100 { limited = true; };
+    cli_put_bool(&document, document.root(), "limited", limited)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+struct LocalCodeFence { marker: i64, length: i64, info: String }
+
+// Accept CommonMark-style fenced blocks with at most three leading spaces.
+// A fence closes only with the same marker, at least the original length and
+// whitespace afterward. The actual code is sliced from the original bytes.
+def local_code_fence(line: &str) -> Result<LocalCodeFence, i64> {
+    let source = cli_text(line); let bytes = source.bytes();
+    let mut offset = 0; let mut next = bytes.next();
+    while next.is_some and next.value == 32 and offset < 4 { offset = offset + 1; next = bytes.next(); };
+    if offset > 3 or not next.is_some or next.value != 96 and next.value != 126 { bytes.free(); return Result { is_ok: true, value: LocalCodeFence { marker: 0, length: 0, info: string_new() }, error: 0 }; };
+    let marker = next.value; let mut length = 0;
+    while next.is_some and next.value == marker { length = length + 1; offset = offset + 1; next = bytes.next(); };
+    bytes.free();
+    if length < 3 { return Result { is_ok: true, value: LocalCodeFence { marker: 0, length: 0, info: string_new() }, error: 0 }; };
+    let tail = cli_byte_slice(line, offset, line.len())?;
+    let info = str_trim(tail.as_str())?;
+    Result { is_ok: true, value: LocalCodeFence { marker: marker, length: length, info: info }, error: 0 }
+}
+
+// Only completed blocks can be copied. An unclosed streamed tail is signaled
+// separately and never returned as a selectable code block.
+def local_code_blocks(markdown: &str) -> Result<JsonDoc, i64> {
+    let document = json_doc_object_bounded(4194304)?;
+    if markdown.len() > 2097152 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    let blocks = document.new_array()?; document.root().object_set("blocks", blocks)?;
+    let source = cli_text(markdown); let lines = source.split("\n");
+    let mut marker = 0; let mut length = 0; let mut language = string_new();
+    let mut start = 0; let mut offset = 0; let mut total = 0;
+    loop {
+        let next = lines.next(); if not next.is_some { break; };
+        let line = next.value; let fence = local_code_fence(line.as_str())?;
+        let line_end = offset + line.len();
+        if marker == 0 {
+            if fence.marker != 0 and not (fence.marker == 96 and str_contains(fence.info.as_str(), "`")) {
+                marker = fence.marker; length = fence.length;
+                language = if fence.info.len() <= 128 { fence.info.clone()? } else { string_new() };
+                start = if line_end < markdown.len() { line_end + 1 } else { line_end };
+            };
+        } else {
+            if fence.marker == marker and fence.length >= length and fence.info.len() == 0 {
+                let size = offset - start;
+                if size > 262144 or total + size > 524288 or blocks.array_len()? >= 32 { lines.free(); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+                let code = cli_byte_slice(markdown, start, offset)?;
+                let item = document.new_object()?;
+                cli_put_string(&document, item, "language", language.as_str())?;
+                cli_put_string(&document, item, "code", code.as_str())?;
+                blocks.array_push(item)?; total = total + size; marker = 0; length = 0; language.clear(); ();
+            };
+        };
+        offset = line_end + 1;
+    };
+    lines.free();
+    cli_put_bool(&document, document.root(), "incomplete", marker != 0)?;
+    Result { is_ok: true, value: document, error: 0 }
+}

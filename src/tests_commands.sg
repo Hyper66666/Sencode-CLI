@@ -1,0 +1,33 @@
+import commands;
+
+def main() -> i64 {
+    let registry = commands_registry();
+    let alias = commands_resolve(&registry, "/exit");
+    if not alias.is_ok or alias.value.as_str() != "/quit" { return 1; };
+    let matches = commands_matches(&registry, "/mod");
+    if not matches.is_ok or matches.value.len() == 0 { return 2; };
+    let first: &UiCommandMatch = matches.value.get(0); let command: &UiCommand = registry.get(first.index);
+    if command.name.as_str() != "/model" { return 3; };
+    let terminal = commands_resolve(&registry, "/term");
+    if not terminal.is_ok or terminal.value.as_str() != "/terminal" { return 4; };
+    let enabled = commands_names(&registry).unwrap_or(string_new());
+    if str_contains(enabled.as_str(), "/terminal") or commands_immediate(&registry, "/terminal cmd").unwrap_or(true) { return 5; };
+    let shells = commands_arguments("/terminal");
+    if shells.len() != 2 or shells.get(0).value.as_str() != "powershell" or shells.get(1).value.as_str() != "cmd" { return 6; };
+    let worktree = commands_resolve(&registry, "/worktrees");
+    if not worktree.is_ok or worktree.value.as_str() != "/worktree" { return 7; };
+    if str_contains(enabled.as_str(), "/worktree") or commands_immediate(&registry, "/worktree cancel").unwrap_or(true) { return 8; };
+    commands_enable(&registry, "/worktree", true, "").unwrap_or(false);
+    if not commands_immediate(&registry, "/worktree cancel").unwrap_or(false) or commands_immediate(&registry, "/worktree create D:/fixture").unwrap_or(true) { return 9; };
+    let scrolling = commands_scrolling_registry(); let help = commands_help(&scrolling, false).unwrap_or(string_new());
+    if not str_contains(help.as_str(), "/model [MODEL]") or not str_contains(help.as_str(), "/quit") or str_contains(help.as_str(), "/terminal") or str_contains(help.as_str(), "/worktree") or str_contains(help.as_str(), "/copy") or str_contains(help.as_str(), "推理等级") { return 10; };
+    let full = commands_help(&registry, true).unwrap_or(string_new());
+    if not str_contains(full.as_str(), "/worktree [list|create PATH|remove PATH|cancel]") { return 11; };
+    if str_contains(help.as_str(), "/history") or str_contains(help.as_str(), "/stash") { return 12; };
+    commands_enable(&registry, "/history", true, "").unwrap_or(false);
+    commands_enable(&registry, "/stash", true, "").unwrap_or(false);
+    if not commands_immediate(&registry, "/history 中文").unwrap_or(false) or not commands_immediate(&registry, "/stash").unwrap_or(false) { return 13; };
+    let copy_args = commands_arguments("/copy");
+    if copy_args.len() != 1 or copy_args.get(0).value.as_str() != "code" { return 14; };
+    println("command registry aliases and matching passed"); 0
+}

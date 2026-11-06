@@ -1,0 +1,52 @@
+import context_compaction;
+
+def context_check(ok: bool) -> Result<bool, i64> { Result { is_ok: ok, value: ok, error: if ok { 0 } else { 99 } } }
+
+def context_tests() -> Result<bool, i64> {
+    let settings = json_parse("{\"schema\":1,\"context_window_tokens\":262144,\"models\":[{\"connection\":\"one\",\"model\":\"small\",\"context_window_tokens\":4096,\"threshold_percent\":80}]}")?;
+    let selected = context_limits_document(&settings, "one", "small")?;
+    let other = context_limits_document(&settings, "two", "small")?;
+    context_check(selected.window_tokens == 4096 and other.window_tokens == 262144)?;
+    let invalid = json_parse("{\"schema\":1,\"context_window_tokens\":1}")?;
+    context_check(not context_limits_document(&invalid, "one", "small").is_ok())?;
+    let duplicate = json_parse("{\"schema\":1,\"models\":[{\"connection\":\"one\",\"model\":\"small\"},{\"connection\":\"one\",\"model\":\"small\"}]}")?;
+    context_check(not context_limits_document(&duplicate, "one", "small").is_ok())?;
+    let history = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":\"Preserve authority 中文😀\"}]}")?;
+    let messages = history.root().object_get("messages")?;
+    let mut index = 0;
+    while index < 16 {
+        let message = history.new_object()?; cli_put_string(&history, message, "role", if index % 2 == 0 { "user" } else { "assistant" })?;
+        let content = string_new(); let mut fragment = 0; while fragment < 40 { content.push_str("historical evidence 中文😀; ")?; fragment = fragment + 1; };
+        cli_put_string(&history, message, "content", content.as_str())?; messages.array_push(message)?; index = index + 1;
+    };
+    let call = json_parse("{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"stable-call\",\"name\":\"read_file\",\"arguments\":\"{}\"}]}")?;
+    messages.array_push(history.copy(call.root())?)?;
+    let unresolved = context_units(&history)?;
+    context_check(cli_json_optional_i64(unresolved.root(), "pending", 0) == 1)?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    context_check(not context_plan(&history, &tools, &selected, false).is_ok())?;
+    let result = json_parse("{\"role\":\"tool\",\"tool_call_id\":\"stable-call\",\"content\":\"exact tool result 中文😀\"}")?;
+    messages.array_push(history.copy(result.root())?)?;
+    let units = context_units(&history)?;
+    context_check(cli_json_optional_i64(units.root(), "pending", -1) == 0)?;
+    let plan = context_plan(&history, &tools, &selected, false)?;
+    context_check(plan.root().object_get("needed")?.bool_value()?)?;
+    let prefix = context_prefix(&history, &plan)?;
+    context_units(&prefix)?;
+    let summary = cli_text("1. User goal: continue the requested implementation and preserve all constraints.\n");
+    let mut item = 0;
+    while item < 8 { summary.push_str("Verified prior file changes and exact tool evidence remain recorded in the complete public transcript. Continue the pending work without replaying uncertain side effects.\n")?; item = item + 1; };
+    let compacted = context_compacted(&history, summary.as_str(), &plan)?;
+    let serialized = compacted.serialize_string()?;
+    context_check(str_contains(serialized.as_str(), "stable-call") and str_contains(serialized.as_str(), "exact tool result 中文😀"))?;
+    context_check(history.root().object_get("messages")?.array_len()? == 19)?;
+    context_check(not context_compacted(&history, "   ", &plan).is_ok())?;
+    let bad = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":\"safe\"},{\"role\":\"tool\",\"tool_call_id\":\"orphan\",\"content\":\"must not be discarded\"}]}")?;
+    context_check(not context_units(&bad).is_ok())?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let result = context_tests(); if not result.is_ok() { println(result.error); return 1; };
+    println("model-scoped context limits, complete tool units and preserved tail acceptance passed"); 0
+}

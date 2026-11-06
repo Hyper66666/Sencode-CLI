@@ -1,0 +1,53 @@
+import tui;
+
+def markdown_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; tui_true() }
+
+def markdown_test_rows(rows: &Vec<UiLine>, width: i64, id: i64) -> Result<bool, i64> {
+    let mut index = 0;
+    while index < rows.len() { let row: &UiLine = rows.get(index); markdown_assert(row.message_id == id and row.cells <= width and not str_contains(row.text.as_str(), "\x1b"), "Markdown rows retain safe width, identity and text")?; index = index + 1; };
+    tui_true()
+}
+
+def markdown_tests() -> Result<i64, i64> {
+    let greeting: Vec<UiLine> = vec_new(); md_render(&greeting, "你好！我是 Sencode。\n😀 继续。\n#中文\n## 中文标题\n######😀\n####### text", 50, 90)?;
+    markdown_test_rows(&greeting, 50, 90)?;
+    markdown_assert(greeting.len() == 6 and greeting.get(0).style == 0 and greeting.get(2).style == 0 and greeting.get(3).style == 1 and greeting.get(4).style == 0 and greeting.get(5).style == 0, "Unicode line starts and non-heading hash prefixes are valid UTF-8")?;
+    markdown_assert(md_inline("**bold** and `code` with name_part")?.as_str() == "bold and code with name_part", "paired inline formatting")?;
+    markdown_assert(md_inline("**unfinished `code")?.as_str() == "**unfinished `code", "unpaired inline markers remain visible")?;
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "fixture");
+    tui_resize(&mut app, 52, 16)?; tui_begin(&mut app)?; let id = app.stream_id;
+    tui_delta(&mut app, "# Report\n\n```di")?;
+    markdown_assert(not app.stream_markdown.fenced and app.stream_lines.len() == 2, "partial fence cannot mutate stable parser state")?;
+    tui_delta(&mut app, "ff\n@@ -1 +1 @@\n-old\n")?;
+    markdown_assert(app.stream_markdown.fenced and app.stream_markdown.diff and app.stream_markdown.number == 2, "split fence and complete diff lines share parser state")?;
+    let stable = app.stream_lines.get(app.stream_lines.len() - 1).text.clone()?; let stable_count = app.stream_lines.len();
+    tui_delta(&mut app, "+ne")?; let preview = tui_stream_preview(&app)?;
+    markdown_assert(app.stream_lines.len() == stable_count and app.stream_lines.get(app.stream_lines.len() - 1).text.as_str() == stable.as_str() and preview.get(0).style == 5 and app.stream_markdown.number == 2, "growing tail preserves completed rows and code line numbers")?;
+    tui_delta(&mut app, "w\n```\n| kind | value |\n| --- | --- |\n| yes | 中文😀 |\n\nUse **bold** and `code`.")?;
+    let expected: Vec<UiLine> = vec_new(); md_render(&expected, app.streaming.as_str(), tui_content_width(&app), id)?;
+    let actual: Vec<UiLine> = vec_new(); tui_copy_rows(&actual, &app.stream_lines)?; let tail = tui_stream_preview(&app)?; tui_copy_rows(&actual, &tail)?;
+    markdown_assert(expected.len() == actual.len(), "streaming and completed Markdown row counts agree")?;
+    let mut index = 0; let mut added = false; let mut removed = false; let mut table = false;
+    while index < expected.len() {
+        let row: &UiLine = expected.get(index); let streamed: &UiLine = actual.get(index);
+        markdown_assert(row.text.as_str() == streamed.text.as_str() and row.style == streamed.style and streamed.message_id == id, "streaming Markdown equals final render")?;
+        if row.style == 5 { added = true; }; if row.style == 6 { removed = true; }; if row.style == 7 { table = true; };
+        index = index + 1;
+    };
+    markdown_assert(added and removed and table, "code diff and table semantic styles")?; markdown_test_rows(&expected, tui_content_width(&app), id)?;
+    tui_message(&mut app, "tool", "read_file / fixture")?; tui_finish(&mut app, true)?;
+    markdown_assert(app.messages.get(0).id == id and app.messages.get(1).id != id, "tool notifications seal the assistant in its original position and identity")?;
+    tui_resize(&mut app, 24, 12)?;
+    markdown_assert(app.messages.get(0).id == id and app.messages.get(1).id != id, "resize preserves chronological message identity")?;
+    let frame = tui_frame_rows(&app)?; markdown_assert(frame.len() == 12, "viewport renders a bounded visible window")?;
+    let narrow: Vec<UiLine> = vec_new(); md_render(&narrow, "```sg\n👨‍👩‍👧‍👦x\n```\n| a | b |\n| --- | --- |\n| 中文 | emoji |", 8, 91)?; markdown_test_rows(&narrow, 8, 91)?;
+    let injected: Vec<UiLine> = vec_new(); md_render(&injected, "# safe\x1b[2J\n```sg\n\x1b]0;title\x07\n```", 40, 92)?; markdown_test_rows(&injected, 40, 92)?;
+    markdown_assert(tui_style_sequence(5, true, true, false).len() == 0 and tui_style_sequence(4, false, false, false).len() == 0, "NO_COLOR omits all renderer SGR sequences")?;
+    markdown_assert(str_contains(tui_style_sequence(5, false, false, true).as_str(), "32m") and str_contains(tui_style_sequence(6, false, false, true).as_str(), "31m"), "diff uses renderer-owned green additions and red deletions")?;
+    let mut history = tui_new("fixture", "fixture", "fixture", "fixture"); tui_resize(&mut history, 40, 12)?; index = 0;
+    while index < 520 { tui_message(&mut history, "assistant", "bounded history row")?; index = index + 1; };
+    markdown_assert(history.messages.len() == 512 and history.messages.get(0).id == 9 and history.messages.get(511).id == 520 and tui_frame_rows(&history)?.len() == 12, "long history keeps stable IDs and paints only the visible frame")?;
+    println("Markdown: stable streaming rows, fenced code, diff, tables, safe widths, message IDs, resize and NO_COLOR passed"); cli_ok(0)
+}
+
+def main() -> i64 { let result = markdown_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

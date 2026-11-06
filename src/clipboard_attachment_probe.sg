@@ -1,0 +1,12 @@
+import clipboard_attachment;
+import command_line;
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let cwd = cli_option(&args.value, "cwd", ""); if not cwd.is_ok() or cwd.value.len() == 0 { return 2; };
+    let path = cli_option(&args.value, "prompt", ""); if not path.is_ok() { return 2; };
+    let result = if path.value.len() > 0 { attachment_parse_paths(cwd.value.as_str(), path.value.as_str()) } else { clipboard_attachment(cwd.value.as_str(), 65536) };
+    if not result.is_ok() { println(result.error); return 1; };
+    let encoded = result.value.serialize_string(); if not encoded.is_ok() { return 1; };
+    println(encoded.value.as_str()); 0
+}

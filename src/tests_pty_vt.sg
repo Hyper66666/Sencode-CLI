@@ -1,0 +1,40 @@
+import pty_vt;
+
+def check(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; vt_ok() }
+def feed(screen: &mut PtyVt, input: &str) -> Result<bool, i64> { let bytes = ffi_buffer_from_bytes(input)?; vt_feed(screen, &bytes, bytes.used_len()) }
+def main_tests() -> Result<bool, i64> {
+    let mut s = vt_new(12, 4);
+    feed(&mut s, "hello\rXY")?; check(vt_row(&s, 0)?.as_str() == "XYllo       ", "CR overwrites rather than leaking controls")?;
+    feed(&mut s, "\x1b[2J\x1b[H中文😀")?; check(s.x == 6 and vt_row(&s, 0)?.as_str() == "中文😀      ", "Unicode display cells")?;
+    feed(&mut s, "e")?; feed(&mut s, "́")?; check(vt_row(&s, 0)?.as_str() == "中文😀é     " and s.x == 7, "combining cluster across chunks")?;
+    let chinese = ffi_buffer_from_bytes("你")?; let part = ffi_buffer_new(1)?; let mut i = 0;
+    while i < 3 { part.clear(); part.append_copy(&chinese, i, 1)?; vt_feed(&mut s, &part, 1)?; i = i + 1; };
+    check(s.x == 9 and s.invalid == 0, "split UTF8 scalar")?;
+    feed(&mut s, "\x1b[2J\x1b[H1\r\n2\r\n3\r\n4\r\n5")?;
+    check(str_starts_with(vt_row(&s, 0)?.as_str(), "2") and str_starts_with(vt_row(&s, 3)?.as_str(), "5"), "bounded scroll")?;
+    feed(&mut s, "\x1b[2;3HX\x1b[K")?; check(vt_row(&s, 1)?.as_str() == "3 X         ", "position plus erase line")?;
+    feed(&mut s, "\x1b]52;c;ZXhmaWx0cmF0ZQ==\x07\x1b]0;fake title\x1b\\\x1bPmalicious\x1b\\\x1b[31mY\x1b[0m")?;
+    check(vt_row(&s, 1)?.as_str() == "3 XY        ", "OSC clipboard/title DCS suppressed and SGR harmless")?;
+    feed(&mut s, "\x1b[?2004h")?; check(s.bracketed_paste, "private bracketed paste mode")?; feed(&mut s, "\x1b[?2004l")?; check(not s.bracketed_paste, "private bracketed paste reset")?;
+    let invalid = ffi_buffer_new(6)?; invalid.push_u8(240)?; invalid.push_u8(128)?; invalid.push_u8(128)?; invalid.push_u8(128)?; invalid.push_u8(226)?; vt_feed(&mut s, &invalid, invalid.used_len())?; vt_finish(&mut s)?;
+    check(s.invalid == 2 and s.wanted == 0, "overlong and truncated UTF8 replaced")?;
+    let mut wide = vt_new(4, 2); feed(&mut wide, "中A\x1b[1;2HX")?; check(vt_row(&wide, 0)?.as_str() == " XA ", "wide continuation overwrite clears owner")?;
+    feed(&mut wide, "\x1b[H中\x1b[HX")?; check(vt_row(&wide, 0)?.as_str() == "X A ", "wide leading overwrite clears continuation")?;
+    feed(&mut wide, "\x1b[2J\x1b[H1234X")?; check(vt_row(&wide, 0)?.as_str() == "1234" and vt_row(&wide, 1)?.as_str() == "X   ", "deferred wrap")?;
+    let mut emoji = vt_new(12, 2); feed(&mut emoji, "👨")?; feed(&mut emoji, "‍👩‍👧‍👦!")?;
+    check(emoji.x == 3 and str_starts_with(vt_row(&emoji, 0)?.as_str(), "👨‍👩‍👧‍👦!"), "ZWJ cluster stays two cells")?;
+    let mut escape = vt_new(12, 2); feed(&mut escape, "\x1b[")?; let mut n = 0; while n < 300 { feed(&mut escape, "1;")?; n = n + 1; }; feed(&mut escape, "mOK")?;
+    check(escape.params.len() == 0 and escape.ignored == 1 and str_starts_with(vt_row(&escape, 0)?.as_str(), "OK"), "oversize CSI bounded and resynchronized")?;
+    feed(&mut escape, "\x1b[999999999;99999999H!")?; check(escape.x < escape.columns and escape.y < escape.rows, "bounded numeric cursor coordinates")?;
+    let mut resized = vt_new(6, 3); feed(&mut resized, "AB中Z\x1b[3;6H!")?;
+    vt_resize(&mut resized, 3, 2)?;
+    check(vt_row(&resized, 0)?.as_str() == "AB " and resized.x == 2 and resized.y == 1, "resize clips split wide glyph and cursor")?;
+    vt_resize(&mut resized, 8, 4)?;
+    check(vt_row(&resized, 0)?.as_str() == "AB      " and vt_row(&resized, 3)?.as_str() == "        ", "resize preserves retained cells and initializes new rows")?;
+    let prefix = ffi_buffer_new(2)?; prefix.push_u8(228)?; prefix.push_u8(189)?; vt_feed(&mut resized, &prefix, 2)?;
+    vt_resize(&mut resized, 9, 4)?; let suffix = ffi_buffer_new(1)?; suffix.push_u8(160)?; vt_feed(&mut resized, &suffix, 1)?;
+    check(resized.wanted == 0 and resized.invalid == 0 and str_contains(vt_row(&resized, 1)?.as_str(), "你"), "resize retains incremental UTF8 decoder state")?;
+    let mut row = 0; while row < s.rows { let value = vt_row(&s, row)?; check(not str_contains(value.as_str(), "\x1b") and not str_contains(value.as_str(), "\x07") and unicode_display_width(&value)? <= s.columns, "screen serialization contains only bounded printable text")?; row = row + 1; };
+    println("safe VT screen: Unicode chunks, clusters, controls, scroll, overwrite, bounds passed"); vt_ok()
+}
+def main() -> i64 { let result = main_tests(); if not result.is_ok { return result.error; }; 0 }

@@ -1,0 +1,43 @@
+import engine_request;
+import command_line;
+import std::time;
+
+def probe() -> Result<bool, i64> {
+    let args = cli_arguments()?;
+    let port = args.root().object_get("positionals")?.array_get(0)?.string_value()?;
+    let base = cli_join("http://127.0.0.1:", port.as_str())?;
+    let connection = ProviderConnection { id: cli_text("custom-fixture"), base: base, model: cli_text("fixture"), effort: string_new(), protocol: 0, images: false };
+    let history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"offline\"}]}")?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    let mut job = engine_request_start("offline-request", &connection, "fixture-only", &history, &tools)?;
+    let observed = json_doc_object()?;
+    let started = time_unix_ms();
+    loop {
+        let result = job.poll();
+        let a = cli_put_i64(&observed, observed.root(), "input_tokens", job.input_tokens());
+        if not a.is_ok() { println("input_tokens failed"); return a; };
+        let b = cli_put_i64(&observed, observed.root(), "output_tokens", job.output_tokens());
+        if not b.is_ok() { println("output_tokens failed"); return b; };
+        let c = cli_put_bool(&observed, observed.root(), "usage_reported", job.usage_reported());
+        if not c.is_ok() { println("usage_reported failed"); return c; };
+        let d = cli_put_i64(&observed, observed.root(), "status", job.status());
+        if not d.is_ok() { println("status failed"); return d; };
+        let e = cli_put_string(&observed, observed.root(), "retry_after", job.retry_after());
+        if not e.is_ok() { println("retry_after failed"); return e; };
+        let f = cli_put_bool(&observed, observed.root(), "request_started", job.request_started());
+        if not f.is_ok() { println("request_started failed"); return f; };
+        let g = cli_put_bool(&observed, observed.root(), "stream_observed", job.stream_observed());
+        if not g.is_ok() { println("stream_observed failed"); return g; };
+        if not result.is_ok() {
+            println("EngineRequest.poll failed"); println(result.error); println(job.job.error); println(job.status());
+            if job.request_started() { println("request emitted"); } else { println("no request emitted"); };
+            println(observed.serialize_string()?);
+            break;
+        };
+        if time_since_ms(started) > 35000 { return Result { is_ok: false, value: false, error: 11 }; };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 { let result = probe(); if not result.is_ok() { println(result.error); return 1; }; 0 }

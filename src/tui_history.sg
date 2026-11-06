@@ -1,0 +1,103 @@
+import tui;
+
+// Public conversation projection only: no database writes or tool execution.
+// Unknown, successful and failed are distinct. Invalid imported metadata must
+// not make an entire conversation unreadable or turn uncertainty into success.
+def tui_tool_outcome(value: JsonValue) -> i64 {
+    if not value.object_has("is_error") { return 0; };
+    let node = value.object_get("is_error"); if not node.is_ok() { return 0; };
+    let failed = node.value.bool_value(); if not failed.is_ok() { return 0; };
+    if value.object_has("outcome_unknown") {
+        let uncertain = value.object_get("outcome_unknown"); if not uncertain.is_ok() { return 0; };
+        let flag = uncertain.value.bool_value(); if not flag.is_ok() or flag.value { return 0; };
+    };
+    if failed.value { 2 } else { 1 }
+}
+
+def tui_tool_detail(arguments: JsonValue) -> Result<String, i64> {
+    let path = cli_json_optional_string(arguments, "path"); if path.len() > 0 { return pending_preview(path.as_str(), 160); };
+    let command = cli_json_optional_string(arguments, "command"); if command.len() > 0 { return pending_preview(command.as_str(), 160); };
+    let query = cli_json_optional_string(arguments, "query"); if query.len() > 0 { return pending_preview(query.as_str(), 160); };
+    Result { is_ok: true, value: string_new(), error: 0 }
+}
+
+// Command envelopes are storage/protocol values. Present the diagnostic first
+// rather than making a user read escaped JSON to discover an exit status.
+def tui_tool_flag(value: JsonValue, key: &str) -> bool {
+    if not value.object_has(key) { return false; };
+    let node = value.object_get(key); if not node.is_ok() { return false; };
+    let flag = node.value.bool_value(); flag.is_ok() and flag.value
+}
+
+def tui_tool_error_text(result: JsonValue) -> Result<String, i64> {
+    let content = cli_json_optional_string(result, "content");
+    let parsed = json_parse_bounded(content.as_str(), 131072);
+    if not parsed.is_ok() {
+        if content.len() > 131072 and str_starts_with(content.as_str(), "{") and str_contains(content.as_str(), "\"exit_code\"") { return string_from_str("Command failed; diagnostic output exceeds the preview limit. Inspect the saved tool result for complete output."); };
+        return tui_limit(content.as_str(), 8192);
+    };
+    let value = parsed.value.root();
+    if value.kind()? != JSON_KIND_OBJECT() or not value.object_has("exit_code") { return tui_limit(content.as_str(), 8192); };
+    let code = value.object_get("exit_code")?.number_i64();
+    if not code.is_ok() { return tui_limit(content.as_str(), 8192); };
+    let out = cli_text("Command exited with code "); out.push_i64(code.value)?;
+    if tui_tool_flag(value, "timed_out") { out.push_str(" (timed out)")?; (); };
+    if tui_tool_flag(value, "cancelled") { out.push_str(" (cancelled)")?; (); };
+    let errors = tui_limit(cli_json_optional_string(value, "stderr").as_str(), 6144)?;
+    let output = tui_limit(cli_json_optional_string(value, "stdout").as_str(), 2048)?;
+    if errors.len() > 0 { out.push_str("\n")?; out.push_str(errors.as_str())?; (); };
+    if output.len() > 0 { out.push_str("\nstdout:\n")?; out.push_str(output.as_str())?; (); };
+    if tui_tool_flag(value, "stdout_lossy") or tui_tool_flag(value, "stderr_lossy") { out.push_str("\nSome invalid UTF-8 bytes were replaced.")?; (); };
+    if tui_tool_flag(value, "truncated") { out.push_str("\nOutput reached its capture limit.")?; (); };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def tui_history_messages(app: &mut UiApp, history: &JsonDoc) -> Result<bool, i64> {
+    let messages = history.root().object_get("messages")?; let mut index = 0;
+    let offset = cli_json_optional_i64(history.root(), "offset", 0);
+    if offset > 0 {
+        let notice = cli_text("Latest history / "); notice.push_i64(cli_json_optional_i64(history.root(), "total_messages", offset + messages.array_len()?))?; notice.push_str(" saved")?;
+        app.history_window = notice; ();
+    };
+    while index < messages.array_len()? {
+        let message = messages.array_get(index)?; let role = cli_json_optional_string(message, "role");
+        let content = cli_json_optional_string(message, "content");
+        // Coordinator context is not a visible user turn. Turn metadata can
+        // still live on this final record when execution stops before a reply.
+        if not tui_tool_flag(message, "cli_internal") {
+        if role.as_str() == "user" or role.as_str() == "assistant" {
+            if content.len() > 0 { tui_message(app, role.as_str(), content.as_str())?; (); };
+            if role.as_str() == "assistant" and message.object_has("tool_calls") {
+                let calls = message.object_get("tool_calls")?; let mut call_index = 0;
+                while call_index < calls.array_len()? {
+                    let call = calls.array_get(call_index)?; let id = cli_json_optional_string(call, "id"); let name = cli_json_optional_string(call, "name");
+                    let arguments = json_parse(cli_json_optional_string(call, "arguments").as_str());
+                    let detail = if arguments.is_ok() { tui_tool_detail(arguments.value.root())? } else { string_new() };
+                    let key = cli_join("history/", id.as_str())?;
+                    if id.len() > 0 and name.len() > 0 { tui_tool(app, key.as_str(), name.as_str(), "running", detail.as_str(), "")?; (); };
+                    call_index = call_index + 1;
+                }; ();
+            };
+            ();
+        } else { if role.as_str() == "tool" {
+            let id = cli_json_optional_string(message, "tool_call_id"); let key = cli_join("history/", id.as_str())?;
+            let slot = tui_tool_slot(app, key.as_str());
+            if id.len() > 0 and slot >= 0 {
+                let result = json_parse(content.as_str());
+                let outcome = if result.is_ok() { tui_tool_outcome(result.value.root()) } else { 0 };
+                let failed = outcome == 2; let unknown = outcome == 0;
+                let error = if unknown { cli_text("Tool outcome is unavailable or uncertain; inspect before retrying.") } else { if failed and result.is_ok() { tui_tool_error_text(result.value.root())? } else { string_new() } };
+                let name = app.messages.get(slot).tool_name.clone()?;
+                tui_tool(app, key.as_str(), name.as_str(), if unknown { "interrupted" } else { if failed { "failed" } else { "completed" } }, "", error.as_str())?; ();
+            }; ();
+        }; }; };
+        if message.object_has("cli_turn_elapsed_ms") { let elapsed = cli_json_optional_i64(message, "cli_turn_elapsed_ms", -1); let outcome = cli_json_optional_string(message, "cli_turn_outcome"); if elapsed >= 0 { tui_elapsed_note(app, elapsed, outcome.as_str())?; (); }; };
+        index = index + 1;
+    };
+    // History is never an active job. Incomplete pairs remain visibly unknown.
+    index = 0;
+    while index < app.messages.len() {
+        let message: &UiMessage = app.messages.get(index);
+        if message.tool_status.as_str() == "running" { let key = message.tool_key.clone()?; let name = message.tool_name.clone()?; tui_tool(app, key.as_str(), name.as_str(), "interrupted", "", "No persisted terminal outcome; no automatic replay.")?; (); }; index = index + 1;
+    }; tui_true()
+}

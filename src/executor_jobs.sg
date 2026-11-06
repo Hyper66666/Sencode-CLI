@@ -1,0 +1,178 @@
+// This module is included by executor.sg. ExecutorOutput belongs to that
+// public compatibility facade; all job state has a single Sengoo owner.
+import std::process;
+
+struct ExecutorJob {
+    process: ProcessHandle,
+    output: ExecutorOutput,
+    stdout_chunk: Buffer,
+    stderr_chunk: Buffer,
+    // started, timeout, done, first error, stop requested, stop signaled
+    state: Vec<i64>,
+}
+
+struct ExecutorGitJob {
+    job: ExecutorJob,
+    executable: String,
+    cwd: String,
+    diff: bool,
+    // 0 filter configuration probe, 1 actual read, 2 settled
+    phase: i64,
+}
+
+def executor_job_start(builder: &ProcessCommand, timeout_ms: i64) -> Result<ExecutorJob, i64> {
+    // Allocate before creating a process so allocation errors never strand it.
+    let stdout_chunk = ffi_buffer_new(8192)?;
+    let stderr_chunk = ffi_buffer_new(8192)?;
+    let stdout = ffi_buffer_new(1048576)?;
+    let stderr = ffi_buffer_new(1048576)?;
+    let state: Vec<i64> = vec_new();
+    state.push(time_unix_ms()); state.push(timeout_ms);
+    state.push(0); state.push(0); state.push(0); state.push(0);
+    let process = builder.spawn_piped()?;
+    let output = ExecutorOutput { stdout: stdout, stderr: stderr, exit_code: -1, timed_out: false, cancelled: false, truncated: false };
+    let job = ExecutorJob { process: process, output: output, stdout_chunk: stdout_chunk, stderr_chunk: stderr_chunk, state: state };
+    let closed = job.process.close_stdin();
+    if not closed.is_ok() { job.state.set(3, closed.error); job.state.set(4, 1); (); };
+    Result { is_ok: true, value: job, error: 0 }
+}
+
+def executor_job_record_error(job: &ExecutorJob, code: i64) {
+    if job.state.get(3).unwrap_or(0) == 0 { job.state.set(3, code); (); };
+    job.state.set(4, 1);
+    ();
+}
+
+def executor_job_cancel(job: &mut ExecutorJob) {
+    if job.state.get(2).unwrap_or(0) != 0 { return; };
+    job.output.cancelled = true;
+    job.state.set(4, 1);
+    ();
+}
+
+def executor_job_poll_io(job: &mut ExecutorJob) -> Result<bool, i64> {
+    let count = job.process.read_stdout(&mut job.stdout_chunk)?;
+    if count > 0 {
+        if job.output.stdout.used_len() + count <= job.output.stdout.capacity() { job.output.stdout.append_copy(&job.stdout_chunk, 0, count)?; (); }
+        else { job.output.truncated = true; };
+    };
+    let errors = job.process.read_stderr(&mut job.stderr_chunk)?;
+    if errors > 0 {
+        if job.output.stderr.used_len() + errors <= job.output.stderr.capacity() { job.output.stderr.append_copy(&job.stderr_chunk, 0, errors)?; (); }
+        else { job.output.truncated = true; };
+    };
+    if not job.process.try_wait()? or not job.process.stdout_eof()? or not job.process.stderr_eof()? or not job.process.tree_quiescent()? {
+        return Result { is_ok: true, value: false, error: 0 };
+    };
+    job.output.exit_code = job.process.exit_code()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+// Never reports completion from a timeout, direct-child exit or cancellation
+// alone. I/O failures request termination and keep the owner polling. A failed
+// cleanup remains active; the host must retain its write/execution lease.
+def executor_job_poll(job: &mut ExecutorJob) -> bool {
+    if job.state.get(2).unwrap_or(0) != 0 { return true; };
+    if time_since_ms(job.state.get(0).unwrap_or(0)) >= job.state.get(1).unwrap_or(0) {
+        job.output.timed_out = true; job.state.set(4, 1); ();
+    };
+    if job.state.get(4).unwrap_or(0) != 0 and job.state.get(5).unwrap_or(0) == 0 {
+        let stopped = job.process.terminate_tree();
+        if stopped.is_ok() { job.state.set(5, 1); (); }
+        else { executor_job_record_error(job, stopped.error); };
+    };
+    let polled = executor_job_poll_io(job);
+    if not polled.is_ok() {
+        executor_job_record_error(job, polled.error);
+        // Even a broken pipe reader cannot certify process-tree exit. Try the
+        // independent liveness query and keep a failed query conservatively live.
+        let settled = job.process.tree_quiescent();
+        let waited = job.process.try_wait();
+        if settled.is_ok() and settled.value and waited.is_ok() and waited.value {
+            // Tree death is sufficient on an I/O failure: there is no process
+            // left to mutate workspace state. Buffered output is marked failed.
+            job.state.set(2, 1); return true;
+        };
+        return false;
+    };
+    if polled.value { job.state.set(2, 1); (); };
+    polled.value
+}
+
+def executor_job_result(job: &ExecutorJob) -> Result<JsonDoc, i64> {
+    if job.state.get(2).unwrap_or(0) == 0 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 6 }; };
+    let code = job.state.get(3).unwrap_or(0);
+    if code != 0 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: code }; };
+    executor_result(&job.output)
+}
+
+def executor_job_wait(job: &mut ExecutorJob, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    loop {
+        let interrupt = ui_poll_busy(terminal, pending);
+        if not interrupt.is_ok() { executor_job_record_error(job, interrupt.error); }
+        else { if interrupt.value { executor_job_cancel(job); }; };
+        if executor_job_poll(job) {
+            let code = job.state.get(3).unwrap_or(0);
+            return Result { is_ok: code == 0, value: true, error: code };
+        };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: false, value: false, error: 6 }
+}
+
+def executor_git_read_builder(executable: &str, cwd: &str, diff: bool, config: &ExecutorOutput) -> Result<ProcessCommand, i64> {
+    let builder = executor_git_builder(executable, cwd)?;
+    let mut offset = 0;
+    while offset < config.stdout.used_len() {
+        let mut end = offset;
+        while end < config.stdout.used_len() and config.stdout.get_u8(end)? != 0 { end = end + 1; };
+        if end == config.stdout.used_len() { return Result { is_ok: false, value: ProcessCommand { handle: 0 }, error: 2 }; };
+        let key = cli_bytes_text(&config.stdout, offset, end - offset)?;
+        if str_contains(key.as_str(), "=") { return Result { is_ok: false, value: ProcessCommand { handle: 0 }, error: 7 }; };
+        let override_key = cli_join(key.as_str(), "=")?;
+        if str_ends_with(key.as_str(), ".required") { override_key.push_str("false")?; (); };
+        builder.arg("-c")?; builder.arg(override_key.as_str())?;
+        offset = end + 1;
+    };
+    if diff {
+        builder.arg("diff")?; builder.arg("--no-ext-diff")?;
+        builder.arg("--no-textconv")?; builder.arg("--ignore-submodules=all")?;
+        ();
+    } else {
+        builder.arg("status")?; builder.arg("--short")?;
+        builder.arg("--ignore-submodules=all")?; ();
+    };
+    Result { is_ok: true, value: builder, error: 0 }
+}
+
+def executor_git_job_start(cwd: &str, diff: bool) -> Result<ExecutorGitJob, i64> {
+    let directory = string_from_str(cwd)?;
+    let executable = executor_git_executable(cwd)?;
+    let query = executor_git_builder(executable.as_str(), cwd)?;
+    query.arg("config")?; query.arg("--null")?; query.arg("--name-only")?;
+    query.arg("--get-regexp")?; query.arg("^filter\\..*\\.(clean|process|required)$")?;
+    let job = executor_job_start(&query, 10000)?;
+    Result { is_ok: true, value: ExecutorGitJob { job: job, executable: executable, cwd: directory, diff: diff, phase: 0 }, error: 0 }
+}
+
+def executor_git_job_cancel(git: &mut ExecutorGitJob) { executor_job_cancel(&mut git.job); }
+
+def executor_git_job_poll(git: &mut ExecutorGitJob) -> bool {
+    if git.phase == 2 { return true; };
+    if not executor_job_poll(&mut git.job) { return false; };
+    if git.phase == 1 or git.job.state.get(3).unwrap_or(0) != 0 or git.job.output.cancelled or git.job.output.timed_out or git.job.output.truncated or git.job.output.exit_code > 1 {
+        git.phase = 2; return true;
+    };
+    let prepared = executor_git_read_builder(git.executable.as_str(), git.cwd.as_str(), git.diff, &git.job.output);
+    if not prepared.is_ok() { git.job.state.set(3, prepared.error); git.phase = 2; return true; };
+    let started = executor_job_start(&prepared.value, 10000);
+    if not started.is_ok() { git.job.state.set(3, started.error); git.phase = 2; return true; };
+    git.job = started.value;
+    git.phase = 1;
+    false
+}
+
+def executor_git_job_result(git: &ExecutorGitJob) -> Result<JsonDoc, i64> {
+    if git.phase != 2 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 6 }; };
+    executor_job_result(&git.job)
+}

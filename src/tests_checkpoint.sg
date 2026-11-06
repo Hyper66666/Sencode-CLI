@@ -1,0 +1,73 @@
+import checkpoint;
+import command_line;
+
+def cp_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def cp_last(state: &CliState, session: &str) -> Result<String, i64> {
+    let journal = checkpoint_load(state, session)?;
+    let entries = journal.root().object_get("entries")?;
+    cli_json_string(entries.array_get(entries.array_len()? - 1)?, "id")
+}
+
+def cp_tests(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let session = cli_state_create_session(&state, cwd)?;
+    let path = workspace_path(cwd, "中文-checkpoint.txt")?;
+    file_write_str(path.as_str(), "original 世界")?;
+    let mut execution = cli_state_begin(&state, session.as_str(), "fixture", "model")?;
+    let patch = json_parse("{\"path\":\"中文-checkpoint.txt\",\"old\":\"original\",\"new\":\"changed\"}")?;
+    checkpoint_apply(&state, &execution, cwd, "apply_patch", &patch)?;
+    let id = cp_last(&state, session.as_str())?;
+    cp_expect(str_contains(workspace_read(path.as_str(), 1000)?.as_str(), "changed"), "native patch applies")?;
+    cp_expect(not checkpoint_rewind(&state, session.as_str(), cwd, id.as_str(), true).is_ok(), "rewind cannot race a live execution")?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    cp_expect(str_contains(checkpoint_preview(&state, session.as_str(), cwd, id.as_str())?.as_str(), "+original 世界"), "preview shows exact restored Unicode bytes")?;
+    cp_expect(not checkpoint_rewind(&state, session.as_str(), cwd, id.as_str(), false).is_ok(), "restore requires approval")?;
+    file_write_str(path.as_str(), "external edit")?;
+    cp_expect(not checkpoint_rewind(&state, session.as_str(), cwd, id.as_str(), true).is_ok(), "external edit conflicts")?;
+    cp_expect(workspace_read(path.as_str(), 1000)?.as_str() == "external edit", "conflict preserves external bytes")?;
+    file_write_str(path.as_str(), "changed 世界")?;
+    checkpoint_rewind(&state, session.as_str(), cwd, id.as_str(), true)?;
+    cp_expect(workspace_read(path.as_str(), 1000)?.as_str() == "original 世界", "approved restore succeeds")?;
+    let mut preserved = state.db.prepare("SELECT selected_connection_id,selected_model_id FROM sessions WHERE id=?")?;
+    preserved.bind_text(1, session.as_str())?;
+    cp_expect(preserved.step()? and preserved.text(0)?.as_str() == "fixture" and preserved.text(1)?.as_str() == "model", "rewind preserves selected connection and model")?;
+    cp_expect(not checkpoint_rewind(&state, session.as_str(), cwd, id.as_str(), true).is_ok(), "restore is not replayed")?;
+    let created = workspace_path(cwd, "new-checkpoint.txt")?;
+    let write = json_parse("{\"path\":\"new-checkpoint.txt\",\"content\":\"new bytes\"}")?;
+    let mut next = cli_state_begin(&state, session.as_str(), "fixture", "model")?;
+    checkpoint_apply(&state, &next, cwd, "write_file", &write)?;
+    let new_id = cp_last(&state, session.as_str())?;
+    // Simulate the crash window after file publication and before result commit.
+    let journal = checkpoint_load(&state, session.as_str())?;
+    let entry = checkpoint_find(&journal, new_id.as_str())?;
+    cli_put_string(&journal, entry, "status", "prepared")?;
+    checkpoint_save(&state, &next, &journal)?;
+    cli_state_finish(&state, &mut next, "idle")?;
+    let reopened = cli_state_open(database)?;
+    cp_expect(file_exists(created.as_str()), "reopening never automatically reverses an effect")?;
+    checkpoint_rewind(&reopened, session.as_str(), cwd, new_id.as_str(), true)?;
+    cp_expect(not file_exists(created.as_str()), "explicit recovery removes only the newly created file")?;
+    let bounded = json_parse("{\"schema\":1,\"entries\":[]}")?;
+    let rows = bounded.root().object_get("entries")?;
+    let mut index = 0;
+    while index < 34 { let row = bounded.new_object()?; cli_put_string(&bounded, row, "status", "complete")?; rows.array_push(row)?; index = index + 1; };
+    cp_expect(checkpoint_bounded(&bounded)?.root().object_get("entries")?.array_len()? == 32, "journal retains latest bounded edits")?;
+    cli_put_string(&bounded, rows.array_get(0)?, "status", "restoring")?;
+    cp_expect(not checkpoint_bounded(&bounded).is_ok(), "unknown recovery intent cannot be evicted")?;
+    cp_expect(file_remove(path.as_str()), "test file cleanup")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", "").unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let cwd = path_parent_string(database.as_str()).unwrap_or(string_new());
+    let result = cp_tests(database.as_str(), cwd.as_str());
+    if not result.is_ok() { println(result.error); return 1; };
+    println("checkpoint exact restore/conflict/crash-window passed"); 0
+}

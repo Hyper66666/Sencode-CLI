@@ -1,0 +1,10 @@
+import command_line;
+
+def main() -> i64 {
+    let result = cli_arguments();
+    if not result.is_ok() { return result.error; };
+    let encoded = result.value.serialize_string();
+    if not encoded.is_ok() { return 1; };
+    io_stdout_write(encoded.value.as_str());
+    0
+}

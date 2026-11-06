@@ -1,0 +1,97 @@
+import engine;
+import permissions;
+import command_line;
+
+def permission_expect(value: bool, message: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(message); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def permission_policy_tests() -> Result<bool, i64> {
+    let mut policy = policy_default();
+    permission_expect(permission_mode(&policy) == "manual" and permission_next(&policy) == "auto" and not policy.full_access, "manual is the default request policy")?;
+    permission_expect(policy_decision(&policy, "read_file", false) == 0 and policy_decision(&policy, "write_file", false) == 1 and policy_decision(&policy, "run_command", false) == 1 and policy_decision(&policy, "mcp__call", false) == 1, "manual asks for edits, commands and MCP")?;
+    let applied_auto = permission_apply(&mut policy, "auto");
+    permission_expect(applied_auto and permission_mode(&policy) == "auto" and permission_next(&policy) == "full", "manual cycles to automatic edit approval")?;
+    permission_expect(policy_decision(&policy, "apply_patch", false) == 0 and policy_decision(&policy, "run_command", false) == 1 and policy_decision(&policy, "mcp__call", false) == 1, "automatic mode authorizes edits but still asks for arbitrary commands and MCP")?;
+    let applied_full = permission_apply(&mut policy, "full");
+    permission_expect(applied_full and permission_mode(&policy) == "full" and permission_next(&policy) == "manual", "automatic mode cycles to explicit full access")?;
+    permission_expect(policy_decision(&policy, "write_file", false) == 0 and policy_decision(&policy, "run_command", false) == 0 and policy_decision(&policy, "mcp__list_tools", false) == 0 and policy_decision(&policy, "mcp__call", false) == 0, "full access authorizes known effectful tools")?;
+    permission_expect(policy_decision(&policy, "mcp__unknown", false) == 2 and tool_spec_decision(&policy, "unknown", false) == 2, "full access cannot invent tools")?;
+    let applied_invalid = permission_apply(&mut policy, "invalid");
+    permission_expect(not applied_invalid and policy.full_access, "invalid mode cannot mutate the current policy")?;
+    let general = policy_child(&policy, "general"); let explore = policy_child(&policy, "explore"); let planning = policy_child(&policy, "plan");
+    permission_expect(general.full_access and policy_decision(&general, "spawn_agent", false) == 2 and policy_decision(&general, "cancel_agent", false) == 2, "general child keeps only inherited capabilities and one-level depth")?;
+    permission_expect(explore.plan and planning.plan and not explore.full_access and not planning.full_access and not explore.auto_edit and policy_decision(&explore, "run_command", false) == 2 and policy_decision(&planning, "write_file", false) == 2, "read-only child roles cannot inherit automatic mutations")?;
+    policy.plan = true;
+    permission_expect(policy_decision(&policy, "run_command", false) == 2 and policy_decision(&policy, "mcp__call", false) == 2 and policy_decision(&policy, "write_file", false) == 2 and policy_decision(&policy, "write_plan", true) == 0 and policy_decision(&policy, "write_plan", false) == 2, "Plan overrides even full access and retains only its designated plan file")?;
+    let capabilities = runtime_native_capabilities(); let document = runtime_policy_document(&capabilities, &policy)?;
+    permission_expect(cli_json_string(document.root(), "permission_mode")?.as_str() == "plan" and not document.root().object_get("full_access")?.bool_value()?, "effective policy describes Plan rather than false full access")?;
+    policy.plan = false;
+    let full_document = runtime_policy_document(&capabilities, &policy)?;
+    permission_expect(cli_json_string(full_document.root(), "permission_mode")?.as_str() == "full" and full_document.root().object_get("full_access")?.bool_value()? and not full_document.root().object_get("requires_approval")?.bool_value()?, "native effective full policy reports no per-tool approvals")?;
+    let applied_manual = permission_apply(&mut policy, "manual");
+    permission_expect(applied_manual and not policy.full_access and not policy.auto_edit, "cycling back to manual drops automatic grants")?;
+    let omitted = json_parse("{\"type\":\"submit\",\"id\":\"old\",\"text\":\"legacy\"}")?;
+    let explicit = json_parse("{\"type\":\"submit\",\"id\":\"full\",\"text\":\"native\",\"full_access\":true}")?;
+    let invalid = json_parse("{\"type\":\"submit\",\"id\":\"bad\",\"text\":\"native\",\"full_access\":\"true\"}")?;
+    permission_expect(engine_submit_valid(&omitted).is_ok() and not engine_submit_full_access(&omitted)? and engine_submit_valid(&explicit).is_ok() and engine_submit_full_access(&explicit)? and not engine_submit_valid(&invalid).is_ok(), "legacy omitted full access is false and typed new wire field is validated")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def permission_execution_tests(cwd: &str) -> Result<bool, i64> {
+    let terminal = terminal_open()?; let pending: Vec<TerminalEvent> = vec_new();
+    let mut policy = policy_default(); policy.interactive = false;
+    let write_args = json_parse("{\"path\":\"permission-owned.txt\",\"content\":\"auto edit 中文\"}")?;
+    let command_args = json_parse("{\"shell\":\"powershell\",\"command\":\"[IO.File]::WriteAllText('full-command-owned.txt','full shell'); [Console]::Write('FULL_COMMAND_OK')\",\"timeout_ms\":10000}")?;
+    let mcp_args = json_parse("{\"server\":\"permission-fixture\"}")?;
+    permission_expect(not agent_approve_tool(cwd, "write_file", &write_args, &policy, false, &terminal, &pending)?, "manual noninteractive edit requires approval")?;
+    permission_apply(&mut policy, "auto");
+    let wrote = agent_execute_tool(cwd, "", "write_file", &write_args, &policy, false, &terminal, &pending)?;
+    permission_expect(not wrote.root().object_get("is_error")?.bool_value()? and file_exists(workspace_path(cwd, "permission-owned.txt")?.as_str()), "automatic mode really executes workspace editing")?;
+    permission_expect(not agent_approve_tool(cwd, "run_command", &command_args, &policy, false, &terminal, &pending)?, "automatic edits do not authorize shell execution")?;
+    let denied_mcp = management_mcp_tool_pending(cwd, "mcp__list_tools", &mcp_args, &policy, &terminal, &pending)?;
+    permission_expect(denied_mcp.root().object_get("permission_required")?.bool_value()?, "automatic edits still require MCP approval")?;
+    permission_apply(&mut policy, "full");
+    let command = agent_execute_tool(cwd, "", "run_command", &command_args, &policy, false, &terminal, &pending)?;
+    let output = json_parse(cli_json_string(command.root(), "content")?.as_str())?;
+    permission_expect(not command.root().object_get("is_error")?.bool_value()? and cli_json_string(output.root(), "stdout")?.as_str() == "FULL_COMMAND_OK" and file_exists(workspace_path(cwd, "full-command-owned.txt")?.as_str()), "full access really executes a known shell tool without a second prompt")?;
+    let tools = management_mcp_tool_pending(cwd, "mcp__list_tools", &mcp_args, &policy, &terminal, &pending)?;
+    permission_expect(tools.root().object_get("tools")?.array_len()? == 2, "full access really launches an owned MCP server and discovers both pages")?;
+    let mcp_call_args = json_parse("{\"server\":\"permission-fixture\",\"tool\":\"echo\",\"arguments\":{\"text\":\"full MCP 中文\"}}")?;
+    let called = management_mcp_tool_pending(cwd, "mcp__call", &mcp_call_args, &policy, &terminal, &pending)?;
+    permission_expect(str_contains(called.serialize_string()?.as_str(), "full MCP 中文"), "full access executes a typed MCP tool and captures its owned output")?;
+    policy.plan = true;
+    let plan_shell = agent_execute_tool(cwd, "", "run_command", &command_args, &policy, true, &terminal, &pending)?;
+    let plan_mcp = management_mcp_tool_pending(cwd, "mcp__list_tools", &mcp_args, &policy, &terminal, &pending)?;
+    permission_expect(plan_shell.root().object_get("is_error")?.bool_value()? and plan_mcp.root().object_get("is_error")?.bool_value()?, "Plan rejects full-access shell and MCP execution")?;
+    policy.plan = false; policy.depth = 1;
+    let child_mcp = management_mcp_tool_pending(cwd, "mcp__list_tools", &mcp_args, &policy, &terminal, &pending)?;
+    permission_expect(child_mcp.root().object_get("is_error")?.bool_value()?, "child MCP prohibition survives full access")?;
+    let unknown = management_mcp_tool_pending(cwd, "mcp__unknown", &mcp_args, &policy_default(), &terminal, &pending)?;
+    permission_expect(unknown.root().object_get("is_error")?.bool_value()?, "unknown MCP operation cannot spawn a configured server")?;
+    policy.depth = 0;
+    let input: Vec<TerminalEvent> = vec_new();
+    let mut options = AgentOptions { cwd: cli_text(cwd), session: cli_text("fixture"), connection: cli_text("fixture"), model: cli_text("fixture"), effort: string_new(), format: cli_text("json"), policy: policy, allow_commands: true, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let metadata = json_parse("{\"engine\":\"codex-app-server\"}")?;
+    permission_expect(not engine_selected_policy(&options, &metadata, "turn", 0, "backend").is_ok(), "managed account backends must reject unenforceable native full access")?;
+    let legacy = json_parse("{\"type\":\"submit\",\"id\":\"legacy\",\"text\":\"continue\"}")?;
+    engine_apply_submit_permissions(&mut options, &legacy)?;
+    permission_expect(not options.policy.full_access and not options.policy.auto_edit and not options.allow_commands, "a legacy submit after full access drops every implicit automatic grant")?;
+    let explicit = json_parse("{\"type\":\"submit\",\"id\":\"explicit\",\"text\":\"continue\",\"full_access\":true}")?;
+    engine_apply_submit_permissions(&mut options, &explicit)?;
+    let edit_only = json_parse("{\"type\":\"submit\",\"id\":\"edit\",\"text\":\"continue\",\"auto_edit\":true,\"allow_commands\":false}")?;
+    engine_apply_submit_permissions(&mut options, &edit_only)?;
+    permission_expect(not options.policy.full_access and options.policy.auto_edit and not options.allow_commands, "explicit automatic editing on the next submit narrows full access to edit-only")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let cwd = cli_option(&arguments.value, "cwd", "").unwrap_or(string_new());
+    if cwd.len() == 0 { return 2; };
+    let policy = permission_policy_tests(); if not policy.is_ok() { println(policy.error); return 1; };
+    let execution = permission_execution_tests(cwd.as_str()); if not execution.is_ok() { println(execution.error); return 1; };
+    if sengoo_process_live_resource_count() != 0 or sengoo_process_live_handle_count() != 0 { cli_diagnostic("Permission regression retained a process resource"); return 1; };
+    println("permission modes: defaults, edit-only automatic approval, full command/MCP execution, Plan/children/backend restrictions and no leaked processes passed"); 0
+}

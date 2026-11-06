@@ -1,0 +1,14 @@
+import config_catalog;
+import model_selection;
+import command_line;
+
+def model_catalog_probe() -> Result<i64, i64> {
+    let database = cli_argument(0)?;
+    let state = cli_state_open(database.as_str())?;
+    let catalog = config_snapshot(&state)?;
+    let selected = model_selection_snapshot(&catalog, "", "", "")?;
+    let encoded = selected.serialize_string()?;
+    println(encoded.as_str()); cli_ok(0)
+}
+
+def main() -> i64 { let result = model_catalog_probe(); if not result.is_ok() { println(result.error); return 1; }; result.value }

@@ -1,0 +1,48 @@
+import workspace;
+
+struct ReferenceDirectory { relative: String, depth: i64 }
+struct ReferenceCatalog { directories: Vec<ReferenceDirectory>, current: i64, entry: i64, scanned: i64, items: JsonDoc, done: bool }
+
+def references_new() -> Result<ReferenceCatalog, i64> {
+    let directories: Vec<ReferenceDirectory> = vec_new();
+    directories.push(ReferenceDirectory { relative: cli_text("."), depth: 0 });
+    let items = json_parse("{\"references\":[]}")?;
+    Result { is_ok: true, value: ReferenceCatalog { directories: directories, current: 0, entry: 0, scanned: 0, items: items, done: false }, error: 0 }
+}
+
+def references_skip(name: &str) -> bool {
+    name == ".git" or name == "node_modules" or name == "target" or name == ".sencode" or name == ".venv" or name == "__pycache__" or name == "." or name == ".."
+}
+
+// Eight directory entries per idle input tick, capped at 1024 visited entries,
+// 64 directories and 256 suggestions. No model request or file content read.
+def references_step(catalog: &mut ReferenceCatalog, cwd: &str) -> Result<bool, i64> {
+    if catalog.done { return Result { is_ok: true, value: false, error: 0 }; };
+    let mut processed = 0;
+    while processed < 8 and catalog.current < catalog.directories.len() {
+        if catalog.scanned >= 1024 or catalog.items.root().object_get("references")?.array_len()? >= 256 { catalog.done = true; break; };
+        let directory: &ReferenceDirectory = catalog.directories.get(catalog.current);
+        let relative_directory = directory.relative.clone()?; let depth = directory.depth;
+        let path = workspace_path(cwd, relative_directory.as_str())?;
+        let count = dir_entry_count(path.as_str()).unwrap_or(0);
+        if catalog.entry >= count { catalog.current = catalog.current + 1; catalog.entry = 0; continue; };
+        let name = dir_entry_name_string(path.as_str(), catalog.entry);
+        catalog.entry = catalog.entry + 1; catalog.scanned = catalog.scanned + 1; processed = processed + 1;
+        if not name.is_ok() { continue; };
+        if references_skip(name.value.as_str()) { continue; };
+        let relative = if relative_directory.as_str() == "." { name.value.clone()? } else { let text = cli_join(relative_directory.as_str(), "/")?; text.push_str(name.value.as_str())?; text };
+        if relative.len() > 1024 { continue; };
+        let checked = workspace_path(cwd, relative.as_str());
+        if not checked.is_ok() { continue; };
+        let kind = file_kind(checked.value.as_str()).unwrap_or(0);
+        if kind != PATH_KIND_FILE() and not dir_exists(checked.value.as_str()) { continue; };
+        let is_directory = dir_exists(checked.value.as_str());
+        let item = catalog.items.new_object()?;
+        cli_put_string(&catalog.items, item, "path", relative.as_str())?;
+        cli_put_string(&catalog.items, item, "kind", if is_directory { "directory" } else { "file" })?;
+        catalog.items.root().object_get("references")?.array_push(item)?;
+        if is_directory and depth < 5 and catalog.directories.len() < 64 { catalog.directories.push(ReferenceDirectory { relative: relative, depth: depth + 1 }); (); };
+    };
+    if catalog.current >= catalog.directories.len() { catalog.done = true; };
+    Result { is_ok: true, value: processed > 0, error: 0 }
+}

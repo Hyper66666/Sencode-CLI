@@ -1,0 +1,62 @@
+import job_host;
+import job_client;
+import command_line;
+import job_commands;
+
+def job_probe_engine()->Result<i64,i64>{
+    let args=cli_arguments()?;let database=cli_option(&args,"database","")?;let cwd=cli_option(&args,"cwd",".")?;
+    let state=job_open_state(database.as_str())?;let positionals=args.root().object_get("positionals")?;let session=positionals.array_get(1)?.string_value()?;
+    let directory=path_join_string(cwd.as_str(),".sencode/plans")?;dir_create_all(directory.as_str())?;let name=cli_join(session.as_str(),".md")?;
+    let input: Vec<TerminalEvent> = vec_new();
+    let mut options=AgentOptions{cwd:cwd,session:session,connection:string_new(),model:string_new(),format:cli_text("host-json"),policy:policy_default(),allow_commands:false,plan_path:path_join_string(directory.as_str(),name.as_str())?,goal_text:string_new(),checks:json_parse("{\"checks\":[]}")?,input:input};
+    let terminal=terminal_open()?;engine_stdio(&state,&mut options,50,0,&terminal)
+}
+
+def job_probe_read(path:&str)->Result<JsonDoc,i64>{let bytes=cli_bytes(262144);let count=file_read_into(path,bytes)?;json_parse(string_from_buffer(bytes,count)?.as_str())}
+
+def job_probe_bridge(state:&CliState,id:&str,role:&str)->Result<i64,i64>{
+    let store=job_store_open(state)?;let client=job_client_open(&store,id,role,0)?;
+    let ready=job_store_load(&store,id)?;cli_put_string(&ready,ready.root(),"type","ready")?;cli_put_string(&ready,ready.root(),"control_epoch",client.epoch.as_str())?;output_document(&ready)?;
+    let terminal=terminal_open()?;let line=cli_bytes(262144);
+    loop{
+        let mut read=0;
+        while read<8192{
+            let event=terminal.read_event(0)?;if event.kind==0{break;};if event.kind==5{return cli_ok(0);};
+            if event.kind==1{
+                if event.code==10{
+                    if line.used_len()>0{let raw=cli_bytes_text(&line,0,line.used_len())?;line.clear();let command=json_parse(raw.as_str())?;job_client_send(&client,&command)?; (); };
+                }else{if event.code!=13{if line.used_len()+event.data.len()>262144{return cli_fail(13);};line.append_str(event.data.as_str())?; (); };};
+            };
+            read=read+1;
+        };
+        let event=job_client_poll(&client);
+        if not event.is_ok(){if event.error==5{return cli_ok(0);};return cli_fail(event.error);};
+        if event.value.root().object_has("type"){output_document(&event.value)?; (); };
+        time_sleep_ms(2);
+    };
+    cli_ok(0)
+}
+
+def job_probe_main()->Result<i64,i64>{
+    let command=cli_argument(0)?;
+    if command.as_str()=="--engine-stdio"{return job_probe_engine();};
+    if command.as_str()=="agent"{let args=cli_arguments()?;let database=cli_option(&args,"database","")?;let cwd=cli_option(&args,"cwd",".")?;let state=job_open_state(database.as_str())?;let terminal=terminal_open()?;return job_commands(&state,&args,cwd.as_str(),&terminal);};
+    let image=current_executable_string()?;
+    if command.as_str()=="--background-host"{let id=cli_argument(1)?;let database=cli_argument(3)?;let state=job_open_state(database.as_str())?;return job_host_run(&state,id.as_str(),image.as_str());};
+    let database=cli_argument(1)?;let state=job_open_state(database.as_str())?;
+    if command.as_str()=="init"{return cli_ok(0);};
+    if command.as_str()=="start" or command.as_str()=="prepare"{
+        let cwd=cli_argument(2)?;let submit=job_probe_read(cli_argument(3)?.as_str())?;let session=cli_state_create_session(&state,cwd.as_str())?;
+        let job=if command.as_str()=="start"{job_start(&state,cwd.as_str(),session.as_str(),&submit,60000,image.as_str())?}else{job_prepare(&state,cwd.as_str(),session.as_str(),&submit,60000,image.as_str())?};output_document(&job)?;return cli_ok(0);
+    };
+    let store=job_store_open(&state)?;
+    if command.as_str()=="list"{output_document(&job_store_list(&store)?)?;return cli_ok(0);};
+    let id=cli_argument(2)?;
+    if command.as_str()=="logs"{let after=cli_parse_unsigned(cli_argument(3)?.as_str(),10)?;output_document(&job_store_logs(&store,id.as_str(),after,256)?)?;return cli_ok(0);};
+    if command.as_str()=="snapshot"{output_document(&job_snapshot(&state,&store,id.as_str())?)?;return cli_ok(0);};
+    if command.as_str()=="stop"{output_document(&job_stop(&state,id.as_str())?)?;return cli_ok(0);};
+    if command.as_str()=="bridge"{return job_probe_bridge(&state,id.as_str(),cli_argument(3)?.as_str());};
+    cli_fail(2)
+}
+
+def main()->i64{let result=job_probe_main();if not result.is_ok(){let text=cli_text("background probe failed: ");text.push_i64(result.error);cli_diagnostic(text.as_str());let detail=sqlite_error_message();if detail.is_ok(){cli_diagnostic(detail.value.as_str());};return 1;};result.value}

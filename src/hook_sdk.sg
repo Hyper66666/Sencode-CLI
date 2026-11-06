@@ -1,0 +1,12 @@
+import hook_contract;
+
+// Minimal synchronous worker wire helper. No tool, provider or policy authority.
+def hook_sdk_read()->Result<JsonDoc,i64>{let bytes=cli_bytes(262145);let count=io_stdin_read_line(bytes)?;if count<1 or count>262144{return hook_error(13);};if not bytes.is_utf8(){return hook_error(20);};let text=string_from_bytes_raw(bytes.ptr(),count)?;let raw=str_trim(text.as_str())?;let document=json_parse(raw.as_str())?;hook_unique_keys(raw.as_str())?;Result{is_ok:true,value:document,error:0}}
+def hook_sdk_write(document:&JsonDoc)->Result<bool,i64>{let text=document.serialize_string()?;if text.len()>262144{return Result{is_ok:false,value:false,error:13};};io_stdout_write(text.as_str())?;io_stdout_write("\n")?;io_stdout_flush()?;hook_true()}
+def hook_sdk_ready(initialize:&JsonDoc)->Result<bool,i64>{
+    hook_keys(initialize,"|schema|protocol|type|id|worker_id|manifest_sha256|")?;let id=cli_json_string(initialize.root(),"id")?;let worker=cli_json_string(initialize.root(),"worker_id")?;let digest=cli_json_string(initialize.root(),"manifest_sha256")?;hook_frame_identity(initialize,"initialize",id.as_str(),worker.as_str(),digest.as_str())?;hook_sdk_write(&hook_frame("ready",id.as_str(),worker.as_str(),digest.as_str())?)
+}
+def hook_sdk_result(event:&JsonDoc,decision:&str,reason:&str,notice:&str)->Result<JsonDoc,i64>{
+    let id=cli_json_string(event.root(),"id")?;let worker=cli_json_string(event.root(),"worker_id")?;let digest=cli_json_string(event.root(),"manifest_sha256")?;let phase=cli_json_string(event.root(),"event")?;let result=hook_frame("result",id.as_str(),worker.as_str(),digest.as_str())?;
+    cli_put_string(&result,result.root(),"event",phase.as_str())?;cli_put_string(&result,result.root(),"decision",decision)?;cli_put_string(&result,result.root(),"reason",reason)?;cli_put_string(&result,result.root(),"notice",notice)?;hook_frame_result(&result,id.as_str(),worker.as_str(),digest.as_str(),phase.as_str())?;Result{is_ok:true,value:result,error:0}
+}

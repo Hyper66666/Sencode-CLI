@@ -1,0 +1,79 @@
+import state;
+import hook_contract;
+
+struct HookStore{db:SqliteDb,path:String}
+def hook_store_path(state:&CliState)->Result<String,i64>{cli_join(state.path.as_str(),".extensions.sqlite3")}
+def hook_store_open(state:&CliState)->Result<HookStore,i64>{
+    let path=hook_store_path(state)?;let lock_path=state_lock_path(state.path.as_str(),"extension-migration","v1")?;let lock=file_lock(lock_path.as_str())?;
+    let db=sqlite_open(path.as_str())?;db.busy_timeout(2000)?;
+    let version={let mut query=db.prepare("PRAGMA user_version")?;query.step()?;query.integer(0)?};
+    if version!=0 and version!=1{return Result{is_ok:false,value:HookStore{db:SqliteDb{handle:0},path:string_new()},error:8};};
+    if version==0{let mut tx=db.transaction()?;tx.exec("CREATE TABLE cli_workers(id TEXT PRIMARY KEY,path TEXT NOT NULL UNIQUE,manifest_sha256 TEXT NOT NULL,executable_sha256 TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL); CREATE TABLE cli_hook_invocations(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,parent_call_id TEXT NOT NULL,worker_id TEXT NOT NULL,phase TEXT NOT NULL,execution_id TEXT NOT NULL,fence INTEGER NOT NULL,manifest_sha256 TEXT NOT NULL,state TEXT NOT NULL,result_json TEXT NOT NULL DEFAULT '{}',updated_at INTEGER NOT NULL); PRAGMA user_version=1")?;tx.commit()?; ();};
+    db.exec("PRAGMA journal_mode=WAL")?;Result{is_ok:true,value:HookStore{db:db,path:path},error:0}
+}
+def hook_store_add(store:&HookStore,manifest:&HookManifest)->Result<bool,i64>{
+    let mut tx=store.db.transaction()?;let mut check=tx.prepare("SELECT path FROM cli_workers WHERE id=?")?;check.bind_text(1,manifest.id.as_str())?;
+    if check.step()? and check.text(0)?.as_str()!=manifest.path.as_str(){return Result{is_ok:false,value:false,error:7};};
+    let mut count=tx.prepare("SELECT COUNT(*) FROM cli_workers WHERE id<>?")?;count.bind_text(1,manifest.id.as_str())?;count.step()?;if count.integer(0)?>=64{return Result{is_ok:false,value:false,error:13};};
+    let mut insert=tx.prepare("INSERT INTO cli_workers(id,path,manifest_sha256,executable_sha256,enabled,updated_at) VALUES(?,?,?,?,0,?) ON CONFLICT(id) DO UPDATE SET manifest_sha256=excluded.manifest_sha256,executable_sha256=excluded.executable_sha256,enabled=0,updated_at=excluded.updated_at")?;
+    insert.bind_text(1,manifest.id.as_str())?;insert.bind_text(2,manifest.path.as_str())?;insert.bind_text(3,manifest.digest.as_str())?;insert.bind_text(4,manifest.executable_digest.as_str())?;insert.bind_i64(5,time_unix_ms())?;insert.step()?;tx.commit()?;hook_true()
+}
+// Called only after an explicit management review; this is not execution permission.
+def hook_store_enable(store:&HookStore,manifest:&HookManifest)->Result<bool,i64>{
+    let mut row=store.db.prepare("UPDATE cli_workers SET enabled=1,updated_at=? WHERE id=? AND path=? AND manifest_sha256=? AND executable_sha256=?")?;row.bind_i64(1,time_unix_ms())?;row.bind_text(2,manifest.id.as_str())?;row.bind_text(3,manifest.path.as_str())?;row.bind_text(4,manifest.digest.as_str())?;row.bind_text(5,manifest.executable_digest.as_str())?;row.step()?;if store.db.changes()?!=1{return Result{is_ok:false,value:false,error:7};};hook_true()
+}
+def hook_store_disable(store:&HookStore,id:&str,remove:bool)->Result<bool,i64>{
+    let mut row=store.db.prepare(if remove{"DELETE FROM cli_workers WHERE id=?"}else{"UPDATE cli_workers SET enabled=0 WHERE id=?"})?;row.bind_text(1,id)?;row.step()?;if store.db.changes()?!=1{return Result{is_ok:false,value:false,error:5};};hook_true()
+}
+def hook_store_list(store:&HookStore)->Result<JsonDoc,i64>{
+    let document=json_parse("{\"schema\":1,\"workers\":[]}")?;let mut row=store.db.prepare("SELECT id,path,manifest_sha256,executable_sha256,enabled FROM cli_workers ORDER BY id LIMIT 65")?;let mut count=0;
+    while row.step()?{count=count+1;if count>64{return hook_error(13);};let item=document.new_object()?;cli_put_string(&document,item,"id",row.text(0)?.as_str())?;cli_put_string(&document,item,"path",row.text(1)?.as_str())?;cli_put_string(&document,item,"manifest_sha256",row.text(2)?.as_str())?;cli_put_string(&document,item,"executable_sha256",row.text(3)?.as_str())?;cli_put_bool(&document,item,"enabled",row.integer(4)?!=0)?;document.root().object_get("workers")?.array_push(item)?; ();};Result{is_ok:true,value:document,error:0}
+}
+def hook_store_manifest(store:&HookStore,id:&str,require_enabled:bool)->Result<HookManifest,i64>{
+    let mut row=store.db.prepare("SELECT path,manifest_sha256,executable_sha256,enabled FROM cli_workers WHERE id=?")?;row.bind_text(1,id)?;if not row.step()?{return hook_manifest_error(5);};if require_enabled and row.integer(3)?!=1{return hook_manifest_error(7);};
+    let manifest=hook_manifest_load(row.text(0)?.as_str())?;if manifest.id.as_str()!=id or manifest.digest.as_str()!=row.text(1)?.as_str() or manifest.executable_digest.as_str()!=row.text(2)?.as_str(){return hook_manifest_error(8);};Result{is_ok:true,value:manifest,error:0}
+}
+def hook_invocation_id(session:&str,parent:&str,worker:&str,phase:&str)->Result<String,i64>{
+    let key=json_parse("[]")?;key.root().array_push(key.new_string(session)?)?;key.root().array_push(key.new_string(parent)?)?;key.root().array_push(key.new_string(worker)?)?;key.root().array_push(key.new_string(phase)?)?;cli_join("hook-",state_digest(key.serialize_string()?.as_str())?.as_str())
+}
+def hook_store_claim(store:&HookStore,state:&CliState,execution:&CliExecution,id:&str,parent:&str,manifest:&HookManifest,phase:&str)->Result<bool,i64>{
+    state_exec_valid(state,execution)?;
+    let mut count=store.db.prepare("SELECT COUNT(*) FROM cli_hook_invocations")?;count.step()?;if count.integer(0)?>=100000{return Result{is_ok:false,value:false,error:13};};
+    // The shared fenced ledger is authoritative. A sidecar failure afterwards
+    // still leaves a non-replayable shared admission, never a second launch.
+    let metadata=json_doc_object()?;cli_put_string(&metadata,metadata.root(),"worker_id",manifest.id.as_str())?;cli_put_string(&metadata,metadata.root(),"manifest_sha256",manifest.digest.as_str())?;cli_put_string(&metadata,metadata.root(),"phase",phase)?;
+    if not cli_state_tool_claim(state,execution,id,"internal:extension_worker",metadata.serialize_string()?.as_str())?{return Result{is_ok:true,value:false,error:0};};
+    let mut insert=store.db.prepare("INSERT INTO cli_hook_invocations VALUES(?,?,?,?,?,?,?,?, 'running','{}',?) ON CONFLICT(id) DO NOTHING")?;insert.bind_text(1,id)?;insert.bind_text(2,execution.session.as_str())?;insert.bind_text(3,parent)?;insert.bind_text(4,manifest.id.as_str())?;insert.bind_text(5,phase)?;insert.bind_text(6,execution.id.as_str())?;insert.bind_i64(7,execution.fence)?;insert.bind_text(8,manifest.digest.as_str())?;insert.bind_i64(9,time_unix_ms())?;insert.step()?;
+    Result{is_ok:true,value:store.db.changes()?==1,error:0}
+}
+def hook_store_finish(store:&HookStore,state:&CliState,execution:&CliExecution,id:&str,result:&JsonDoc)->Result<bool,i64>{
+    state_exec_valid(state,execution)?;let raw=result.serialize_string()?;if raw.len()>32768{return Result{is_ok:false,value:false,error:13};};
+    cli_state_tool_complete(state,execution,id,raw.as_str())?;
+    let mut row=store.db.prepare("UPDATE cli_hook_invocations SET state='complete',result_json=?,updated_at=? WHERE id=? AND execution_id=? AND fence=? AND state='running'")?;row.bind_text(1,raw.as_str())?;row.bind_i64(2,time_unix_ms())?;row.bind_text(3,id)?;row.bind_text(4,execution.id.as_str())?;row.bind_i64(5,execution.fence)?;row.step()?;if store.db.changes()?!=1{return Result{is_ok:false,value:false,error:7};};hook_true()
+}
+
+def hook_store_cleanup_unknown(state:&CliState,execution:&CliExecution)->Result<bool,i64>{
+    hook_store_cleanup_state(state,execution,true)
+}
+def hook_store_cleanup_state(state:&CliState,execution:&CliExecution,required:bool)->Result<bool,i64>{
+    state_exec_valid(state,execution)?;let mut tx=state.db.transaction()?;state_tx_exec_valid(&tx,state,execution)?;
+    let mut row=tx.prepare("UPDATE shared_executions SET cleanup_required=? WHERE session_id=? AND execution_id=? AND fence=?")?;
+    row.bind_i64(1,if required{1}else{0})?;row.bind_text(2,execution.session.as_str())?;row.bind_text(3,execution.id.as_str())?;row.bind_i64(4,execution.fence)?;row.step()?;tx.commit()?;hook_true()
+}
+
+// Existing admission is never a license to execute again, even if a previous
+// before hook continued just before a crash. Refusals are inspectable too.
+def hook_store_previous(store:&HookStore,state:&CliState,execution:&CliExecution,id:&str)->Result<JsonDoc,i64>{
+    state_exec_valid(state,execution)?;let mut row=store.db.prepare("SELECT state,result_json FROM cli_hook_invocations WHERE id=?")?;row.bind_text(1,id)?;
+    if row.step()?{
+        let saved=json_parse(row.text(1)?.as_str())?;let status=cli_json_optional_string(saved.root(),"status");
+        if row.text(0)?.as_str()=="refused" or status.as_str()=="blocked"{return Result{is_ok:true,value:saved,error:0};};
+        return json_parse("{\"status\":\"interrupted\",\"reason\":\"Worker invocation was already admitted; inspect prior side effects before a new user request\",\"cleanup_confirmed\":false}");
+    };
+    let mut shared=state.db.prepare("SELECT state FROM shared_tool_ledger WHERE session_id=? AND call_id=?")?;shared.bind_text(1,execution.session.as_str())?;shared.bind_text(2,id)?;
+    if shared.step()?{return json_parse("{\"status\":\"interrupted\",\"reason\":\"Shared admission already exists; no automatic worker replay is allowed\",\"cleanup_confirmed\":false}");};json_doc_object()
+}
+def hook_store_refused(store:&HookStore,state:&CliState,execution:&CliExecution,id:&str,parent:&str,manifest:&HookManifest,phase:&str,result:&JsonDoc)->Result<bool,i64>{
+    state_exec_valid(state,execution)?;let mut count=store.db.prepare("SELECT COUNT(*) FROM cli_hook_invocations")?;count.step()?;if count.integer(0)?>=100000{return Result{is_ok:false,value:false,error:13};};
+    let mut row=store.db.prepare("INSERT INTO cli_hook_invocations VALUES(?,?,?,?,?,?,?,?,'refused',?,?) ON CONFLICT(id) DO NOTHING")?;row.bind_text(1,id)?;row.bind_text(2,execution.session.as_str())?;row.bind_text(3,parent)?;row.bind_text(4,manifest.id.as_str())?;row.bind_text(5,phase)?;row.bind_text(6,execution.id.as_str())?;row.bind_i64(7,execution.fence)?;row.bind_text(8,manifest.digest.as_str())?;row.bind_text(9,result.serialize_string()?.as_str())?;row.bind_i64(10,time_unix_ms())?;row.step()?;hook_true()
+}

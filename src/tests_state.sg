@@ -1,0 +1,141 @@
+import state;
+import command_line;
+
+extern "C" {
+    fn sgsqlite_live_connections() -> i64;
+    fn sengoo_string_live_handle_count() -> i64;
+}
+
+def state_incompatible_rejection(database: &str) -> Result<bool,i64> {
+    let path = cli_join(database,".incompatible")?;
+    { let old = sqlite_open(path.as_str())?; old.exec("PRAGMA user_version=28")?; (); };
+    let connections_before = sgsqlite_live_connections();
+    let locks_before = sengoo_file_lock_live_count();
+    let strings_before = sengoo_string_live_handle_count();
+    let mut index = 0;
+    while index<5 {
+        let rejected = cli_state_open(path.as_str());
+        state_expect(not rejected.is_ok() and rejected.error==8,"CLI must reject uncoordinated legacy schema")?;
+        index=index+1;
+    };
+    state_expect(sgsqlite_live_connections()==connections_before,"schema rejection releases database handles")?;
+    state_expect(sengoo_file_lock_live_count()==locks_before,"schema rejection releases migration locks")?;
+    state_expect(sengoo_string_live_handle_count()==strings_before,"schema rejection releases owned path strings")?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def state_expect(value: bool, label: &str) -> Result<bool,i64> {
+    if not value { cli_diagnostic(label); return state_bool_error(99); };
+    Result {is_ok:true,value:true,error:0}
+}
+
+def state_acceptance(database: &str,cwd: &str) -> Result<bool,i64> {
+    state_incompatible_rejection(database)?;
+    let state = cli_state_open(database)?;
+    state_expect(cli_state_default_connection(&state)?.len()==0,"new store has no implicit preferred provider")?;
+    state.db.exec("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES('custom-default','customApi','managed','Default fixture','{}','model-a',1,1)")?;
+    state.db.exec("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,created_at,updated_at) VALUES('account-fixture','codex','managed','Account fixture','{}',1,1)")?;
+    let unsupported = cli_state_connection(&state,"account-fixture");
+    state_expect(not unsupported.is_ok() and unsupported.error==8,"account connections fail explicitly without service failover")?;
+    cli_state_set_default_connection(&state,"custom-default")?;
+    state_expect(not cli_state_set_default_connection(&state,"custom-missing").is_ok(),"unknown default provider is rejected")?;
+    let session = cli_state_create_session(&state,cwd)?;
+    let mut first = cli_state_begin(&state,session.as_str(),"custom-fixture","model-a")?;
+    let second = cli_state_open(database)?;
+    state_expect(cli_state_default_connection(&second)?.as_str()=="custom-default","preferred connection is shared across clients")?;
+    cli_state_set_default_connection(&second,"")?;
+    state_expect(cli_state_default_connection(&state)?.len()==0,"cleared preference refreshes across clients")?;
+    let busy = cli_state_begin(&second,session.as_str(),"custom-other","model-b");
+    state_expect(not busy.is_ok(),"another client must not claim an active session")?;
+    state_exec_valid(&state,&first)?;
+    let user = json_parse("{\"role\":\"user\",\"content\":\"你好😀\"}")?;
+    cli_state_append(&state,&first,&user)?;
+    let streaming = cli_state_stream_start(&state,&first)?;
+    cli_state_stream_delta(&state,&first,streaming.as_str(),"partial中文")?;
+    let streaming_result = json_parse("{\"role\":\"assistant\",\"content\":\"partial中文 done\",\"tool_calls\":[]}")?;
+    cli_state_stream_finish(&state,&first,streaming.as_str(),&streaming_result)?;
+    state_expect(not cli_state_stream_delta(&state,&first,streaming.as_str(),"late").is_ok(),"completed stream refuses delayed delta")?;
+    state_expect(cli_state_tool_claim(&state,&first,"call-1","write_file","{}")?,"first tool claim")?;
+    state_expect(not cli_state_tool_claim(&state,&first,"call-1","write_file","{}")?,"duplicate tool cannot rerun")?;
+    cli_state_tool_complete(&state,&first,"call-1","done")?;
+    let result = cli_state_tool_result(&state,session.as_str(),"call-1")?;
+    state_expect(result.as_str()=="done","tool result persists")?;
+    let mode = json_parse("{\"status\":\"paused\",\"requests\":7,\"nested\":{\"text\":\"中文\"}}")?;
+    cli_state_mode_save(&state,&first,"goal",&mode)?;
+    cli_state_usage(&state,&first,"request-1","custom-fixture","model-a",20,30)?;
+    cli_state_usage(&state,&first,"request-1","custom-fixture","model-a",20,30)?;
+    cli_state_finish(&state,&mut first,"idle")?;
+    state_expect(not state_exec_valid(&state,&first).is_ok(),"finished execution loses authority")?;
+    let mut next = cli_state_begin(&second,session.as_str(),"custom-other","model-b")?;
+    state_expect(next.fence>first.fence,"handoff increments fence")?;
+    first.active=true;
+    state_expect(not cli_state_append(&state,&first,&user).is_ok(),"obsolete execution cannot append even with a locally active flag")?;
+    state_expect(not cli_state_finish(&state,&mut first,"idle").is_ok(),"obsolete terminal cannot release the next execution")?;
+    first.active=false;
+    state_exec_valid(&second,&next)?;
+    let history = cli_state_history(&second,session.as_str())?;
+    let message = history.root().object_get("messages")?.array_get(0)?;
+    let content = cli_json_string(message,"content")?;
+    state_expect(content.as_str()=="你好😀","portable history preserves Unicode")?;
+    let restored = cli_state_mode_load(&second,session.as_str(),"goal")?;
+    let goal = restored.root().object_get("value")?;
+    state_expect(cli_json_optional_i64(goal,"requests",0)==7,"mode budget survives reload")?;
+    let mut usage = second.db.prepare("SELECT COUNT(*),SUM(input_tokens) FROM shared_usage")?;
+    usage.step()?;
+    state_expect(usage.integer(0)?==1 and usage.integer(1)?==20,"usage deduplicates by request")?;
+    let summary = cli_state_usage_summary(&second)?;
+    let totals = summary.root().object_get("usage")?.array_get(0)?;
+    state_expect(cli_json_optional_i64(totals,"input_tokens",0)==20 and cli_json_optional_i64(totals,"output_tokens",0)==30,"usage stays attributed to captured connection and model")?;
+    cli_state_finish(&second,&mut next,"idle")?;
+    // A dropped desktop owner has an anonymous Job Object. Acquiring its
+    // released file lock cannot prove the descendants have exited.
+    second.db.exec("UPDATE shared_executions SET engine='desktop',active=1 WHERE active=0")?;
+    let locks_before = sengoo_file_lock_live_count();
+    state_expect(not cli_state_begin(&second,session.as_str(),"custom-other","model-b").is_ok(),"orphan desktop execution requires verified tool cleanup")?;
+    state_expect(sengoo_file_lock_live_count()==locks_before,"failed takeover releases its acquired lock")?;
+    second.db.exec("UPDATE shared_executions SET active=0,cleanup_required=1")?;
+    state_expect(not cli_state_begin(&second,session.as_str(),"custom-other","model-b").is_ok(),"recovery marker remains enforced after observation")?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def state_hold(database: &str,cwd: &str) -> Result<bool,i64> {
+    let state = cli_state_open(database)?;
+    let session = cli_state_create_session(&state,cwd)?;
+    let mut execution = cli_state_begin(&state,session.as_str(),"custom-fixture","model-a")?;
+    let user = json_parse("{\"role\":\"user\",\"content\":\"CLI 共享会话😀\"}")?;
+    cli_state_append(&state,&execution,&user)?;
+    io_stdout_write(session.as_str())?;
+    io_stdout_write("\n")?;
+    io_stdout_flush()?;
+    let input = ffi_buffer_new(16)?;
+    io_stdin_read_line(input)?;
+    cli_state_finish(&state,&mut execution,"idle")?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def state_inspect(database: &str,session: &str) -> Result<bool,i64> {
+    let state = cli_state_open(database)?;
+    let history = cli_state_history(&state,session)?;
+    let text = history.serialize_string()?;
+    io_stdout_write(text.as_str())?;
+    io_stdout_write("\n")?;
+    io_stdout_flush()?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments();
+    if not arguments.is_ok() { cli_diagnostic("argument parser failed"); println(arguments.error); return 2; };
+    let database = cli_option(&arguments.value,"database","");
+    let cwd = cli_current_directory();
+    if not database.is_ok() or not cwd.is_ok() or database.value.len()==0 { cli_diagnostic("database argument/current directory unavailable"); println(args_len()); println(database.error); println(cwd.error); return 2; };
+    let mode = cli_option(&arguments.value,"prompt","").unwrap_or(string_new());
+    let mut result = Result {is_ok:true,value:true,error:0};
+    if mode.as_str()=="hold" { result=state_hold(database.value.as_str(),cwd.value.as_str()); } else {
+        if mode.as_str()=="inspect" { let id = cli_option(&arguments.value,"label","").unwrap_or(string_new()); result=state_inspect(database.value.as_str(),id.as_str()); }
+        else { result=state_acceptance(database.value.as_str(),cwd.value.as_str()); };
+    };
+    if not result.is_ok() { println(result.error); let detail = sqlite_error_message(); if detail.is_ok() { cli_diagnostic(detail.value.as_str()); }; return 1; };
+    if mode.len()==0 { println("shared state native acceptance passed"); };
+    0
+}

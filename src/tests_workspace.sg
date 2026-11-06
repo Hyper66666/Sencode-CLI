@@ -1,0 +1,44 @@
+import workspace;
+
+def workspace_tests() -> Result<i64, i64> {
+    let mut failures = 0;
+    let changed = workspace_patch_text("first 世界 last", "世界", "Sengoo")?;
+    if changed.as_str() != "first Sengoo last" { failures = failures + 1; };
+    if workspace_patch_text("same same", "same", "other").is_ok() { failures = failures + 1; };
+    if workspace_patch_text("original", "missing", "other").is_ok() { failures = failures + 1; };
+    if workspace_patch_text("original", "", "other").is_ok() { failures = failures + 1; };
+    let buffer = ffi_buffer_new(32768)?;
+    let cwd_length = process_current_dir_copy(buffer)?;
+    let cwd = string_from_bytes_raw(buffer.ptr(), cwd_length)?;
+    let root = path_normalize_string(path_join_string(cwd.as_str(), "target")?.as_str())?;
+    if workspace_path(root.as_str(), "../../other").is_ok() { failures = failures + 1; };
+    if workspace_path(root.as_str(), "C:/outside").is_ok() { failures = failures + 1; };
+    let path = path_join_string(root.as_str(), "workspace-test.txt")?;
+    workspace_atomic_write(path.as_str(), "世界\nexact")?;
+    let read = workspace_read(path.as_str(), 100)?;
+    if read.as_str() != "世界\nexact" { failures = failures + 1; };
+    if workspace_read(path.as_str(), 3).is_ok() { failures = failures + 1; };
+    let directory = path_join_string(root.as_str(), "workspace-nested/child")?;
+    dir_create_all(directory.as_str())?;
+    let ancestor = path_join_string(root.as_str(), "workspace-nested/AGENTS.md")?;
+    let nearer = path_join_string(directory.as_str(), "CLAUDE.md")?;
+    file_write_str(ancestor.as_str(), "outer instructions")?;
+    file_write_str(nearer.as_str(), "inner instructions")?;
+    let nested = workspace_nested_instructions(root.as_str(), "workspace-nested/child/file.sg", false)?;
+    if not str_contains(nested.as_str(), "outer instructions") or not str_contains(nested.as_str(), "inner instructions") { failures = failures + 1; };
+    if str_index_of(nested.as_str(), "outer instructions") > str_index_of(nested.as_str(), "inner instructions") { failures = failures + 1; };
+    let edit = json_parse("{\"path\":\"workspace-test.txt\",\"old\":\"世界\",\"new\":\"Sengoo\"}")?;
+    let preview = workspace_edit_preview(root.as_str(), "apply_patch", &edit)?;
+    if not str_contains(preview.as_str(), "-世界") or not str_contains(preview.as_str(), "+Sengoo") { failures = failures + 1; };
+    file_remove(ancestor.as_str());
+    file_remove(nearer.as_str());
+    file_remove(path.as_str());
+    cli_ok(failures)
+}
+
+def main() -> i64 {
+    let result = workspace_tests();
+    if not result.is_ok() { println(result.error); return 1; };
+    if result.value == 0 { println("workspace acceptance passed"); };
+    result.value
+}

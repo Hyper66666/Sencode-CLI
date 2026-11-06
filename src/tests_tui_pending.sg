@@ -1,0 +1,41 @@
+import tui_pending;
+
+def pending_assert(value: bool, message: &str) -> Result<bool, i64> {
+    if not value { println(message); return Result { is_ok: false, value: false, error: 99 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def pending_tests() -> Result<i64, i64> {
+    let queue: Vec<InputHistory> = vec_new();
+    let empty = pending_recall(&queue, "draft");
+    pending_assert(empty.is_ok and not empty.value.recalled and empty.value.text.as_str() == "draft", "empty queue keeps the draft")?;
+    queue.push(InputHistory { text: cli_text("first queued") });
+    queue.push(InputHistory { text: cli_text("后加条件 😀\n保留换行") });
+    let latest = pending_recall(&queue, "")?;
+    pending_assert(latest.recalled and latest.text.as_str() == "后加条件 😀\n保留换行" and queue.len() == 2, "recall prepares newest message without mutating FIFO queue")?;
+    let merged = pending_recall(&queue, "already typing 中文")?;
+    pending_assert(merged.recalled and merged.text.as_str() == "后加条件 😀\n保留换行\n\nalready typing 中文" and queue.len() == 2, "recall merges both texts without overwriting a draft")?;
+    let huge = string_new(); let mut index = 0; while index < 65536 { huge.push_str("x")?; index = index + 1; };
+    let refused = pending_recall(&queue, huge.as_str())?;
+    pending_assert(not refused.recalled and refused.text.len() == 65536 and queue.len() == 2 and str_contains(refused.status.as_str(), "kept"), "oversize recall retains queued and draft text")?;
+    let preview = pending_preview("中文\né 👨‍👩‍👧‍👦 🇨🇳\x1b[31m forbidden\x07", 30)?;
+    pending_assert(not str_contains(preview.as_str(), "\x1b") and not str_contains(preview.as_str(), "\x07") and not str_contains(preview.as_str(), "\n") and ui_cells(preview.as_str())? <= 30, "preview strips terminal controls and fits grapheme cells")?;
+    let truncated = pending_preview(huge.as_str(), 20)?;
+    pending_assert(ui_cells(truncated.as_str())? <= 20 and str_ends_with(truncated.as_str(), "..."), "long preview uses bounded work and visible truncation")?;
+    let widths: Vec<i64> = vec_new(); widths.push(8); widths.push(32); widths.push(80); widths.push(120);
+    let mut wi = 0;
+    while wi < widths.len() { let width = widths.get(wi).value; let mut maximum = 0;
+        while maximum <= 6 { let rows = pending_rows(&queue, width, maximum)?;
+            pending_assert(rows.len() <= maximum and rows.len() <= 4, "pending preview respects reserved height")?;
+            let mut row_index = 0; while row_index < rows.len() { let row: &UiLine = rows.get(row_index); pending_assert(row.style == 2 and row.cells <= width and not str_contains(row.text.as_str(), "\n"), "pending rows stay muted and inside viewport")?; row_index = row_index + 1; };
+            maximum = maximum + 1;
+        }; wi = wi + 1;
+    };
+    let many: Vec<InputHistory> = vec_new(); index = 0; while index < 8 { let label = cli_text("queued-"); label.push_i64(index)?; many.push(InputHistory { text: label }); index = index + 1; };
+    let rows = pending_rows(&many, 80, 3)?;
+    pending_assert(rows.len() == 3 and str_contains(rows.get(0).text.as_str(), "QUEUED / 8") and str_contains(rows.get(1).text.as_str(), "[7] queued-6") and str_contains(rows.get(2).text.as_str(), "[8] queued-7"), "bounded preview retains newest items in FIFO order and absolute positions")?;
+    println("pending insertion: bounded muted previews, Unicode, pure newest recall, draft merge and lossless limit rejection passed");
+    Result { is_ok: true, value: 0, error: 0 }
+}
+
+def main() -> i64 { let result = pending_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

@@ -1,0 +1,58 @@
+import state;
+import http;
+import std::net;
+import std::time;
+
+def config_model_id_valid(id:&String)->bool{
+    if id.len()==0 or id.len()>200 or id.as_str().len()!=id.len(){return false;};
+    let characters=id.chars();loop{let next=characters.next_codepoint();if not next.is_some{break;};let cp=next.value;
+        if cp<=32 or (cp>=127 and cp<=160) or cp==5760 or (cp>=8192 and cp<=8202) or cp==8232 or cp==8233 or cp==8239 or cp==8287 or cp==12288{return false;};
+    };true
+}
+
+def config_probe(state:&CliState,input:JsonValue)->Result<JsonDoc,i64>{
+    let base=cli_json_string(input,"base_url")?;let id=cli_json_string(input,"id")?;
+    let protocol=cli_json_string(input,"protocol")?;
+    if protocol.as_str()!="chatCompletions" and protocol.as_str()!="responses" and protocol.as_str()!="messages"{return Result{is_ok:false,value:JsonDoc{handle:0},error:2};};
+    if base.len()>2048 or base.as_str().len()!=base.len(){return Result{is_ok:false,value:JsonDoc{handle:0},error:2};};
+    let mut key=cli_json_string(input,"api_key")?;
+    if key.len()==0 {
+        if not input.object_get("existing")?.bool_value()?{return Result{is_ok:false,value:JsonDoc{handle:0},error:5};};
+        let mut row=state.db.prepare("SELECT kind FROM connection_configs WHERE id=?")?;row.bind_text(1,id.as_str())?;
+        if not row.step()? or row.text(0)?.as_str()!="customApi"{return Result{is_ok:false,value:JsonDoc{handle:0},error:5};};
+        key=cli_state_credential(id.as_str())?;
+    };
+    if key.len()==0 or key.len()>8192 or key.as_str().len()!=key.len() or str_contains(key.as_str(),"\r") or str_contains(key.as_str(),"\n"){return Result{is_ok:false,value:JsonDoc{handle:0},error:2};};
+    let endpoint=http_endpoint(base.as_str(),"/models")?;
+    let wire=cli_text("GET ");wire.push_str(endpoint.path.as_str())?;wire.push_str(" HTTP/1.1\r\nHost: ")?;
+    if str_contains(endpoint.host.as_str(),":"){wire.push_str("[")?;wire.push_str(endpoint.host.as_str())?;wire.push_str("]")?; ();}else{wire.push_str(endpoint.host.as_str())?; ();};
+    wire.push_str(":")?;wire.push_i64(endpoint.port)?;
+    wire.push_str("\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nUser-Agent: sencode-config/0.1\r\n")?;
+    if protocol.as_str()=="messages"{wire.push_str("anthropic-version: 2023-06-01\r\nx-api-key: ")?; ();}else{wire.push_str("Authorization: Bearer ")?; ();};
+    wire.push_str(key.as_str())?;wire.push_str("\r\n\r\n")?;
+    let stream=net_stream_start(endpoint.host.as_str(),endpoint.port,endpoint.tls,wire.as_str(),5000,10000,262144)?;
+    let started=time_unix_ms();let body=ffi_buffer_new(1048576)?;let buffer=ffi_buffer_new(16384)?;let mut decoder=http_decoder();
+    loop{
+        if time_since_ms(started)>20000{stream.cancel();return Result{is_ok:false,value:JsonDoc{handle:0},error:11};};
+        let read=stream.read_into(buffer);if read.error!=0{return Result{is_ok:false,value:JsonDoc{handle:0},error:read.error};};
+        if not read.ready{time_sleep_ms(2);continue;};
+        if read.eof{decoder.finish()?;break;};
+        let part=decoder.feed_bytes(&buffer,0,read.count)?;
+        if decoder.headers_ready and (decoder.status<200 or decoder.status>=300){stream.cancel();return Result{is_ok:false,value:JsonDoc{handle:0},error:decoder.status};};
+        if body.used_len()+part.used_len()>1048576{stream.cancel();return Result{is_ok:false,value:JsonDoc{handle:0},error:13};};
+        cli_bytes_append(&body,&part,0,part.used_len())?;
+        if decoder.complete{decoder.finish()?;break;};
+    };
+    let parsed=json_parse_buffer_bounded(&body,body.used_len(),1048576)?;
+    let data=parsed.root().object_get("data")?;if data.kind()?!=JSON_KIND_ARRAY(){return Result{is_ok:false,value:JsonDoc{handle:0},error:10};};
+    let output=json_doc_object()?;let models=output.new_array()?;let mut truncated=false;let mut index=0;
+    while index<data.array_len()?{let id=str_trim(cli_json_optional_string(data.array_get(index)?,"id").as_str())?;
+        if config_model_id_valid(&id){let mut exists=false;let mut check=0;while check<models.array_len()?{if models.array_get(check)?.string_value()?.as_str()==id.as_str(){exists=true;};check=check+1;};
+            if not exists{if models.array_len()?>=256{truncated=true;break;};models.array_push(output.new_string(id.as_str())?)?; ();};
+        };index=index+1;
+    };
+    if parsed.root().object_has("has_more") and parsed.root().object_get("has_more")?.bool_value()?{truncated=true;};
+    if models.array_len()?==0{return Result{is_ok:false,value:JsonDoc{handle:0},error:10};};
+    output.root().object_set("model_ids",models)?;cli_put_bool(&output,output.root(),"truncated",truncated)?;
+    Result{is_ok:true,value:output,error:0}
+}

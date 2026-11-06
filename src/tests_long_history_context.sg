@@ -1,0 +1,135 @@
+import controller;
+import command_line;
+
+def long_context_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def long_context_options(cwd: &str, session: &str, connection: &str) -> AgentOptions {
+    let input: Vec<TerminalEvent> = vec_new();
+    AgentOptions { cwd: cli_text(cwd), session: cli_text(session), connection: cli_text(connection), model: cli_text("history-fixture"), effort: string_new(), format: cli_text("json"), policy: policy_default(), allow_commands: false, plan_path: string_new(), goal_text: cli_text("Retain cumulative history budget"), checks: json_parse("{\"checks\":[]}").unwrap_or(JsonDoc { handle: 0 }), input: input }
+}
+
+def long_context_seed(state: &CliState, session: &str, count: i64) -> Result<bool, i64> {
+    let mut insert = state.db.prepare("WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM n WHERE value<?) INSERT INTO messages(id,session_id,role,text,created_at,completed_at,revision) SELECT ?||'-row-'||value,?,'user','message-'||value,value,value,value FROM n")?;
+    insert.bind_i64(1, count)?; insert.bind_text(2, session)?; insert.bind_text(3, session)?; insert.step()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def long_context_checkpoint(state: &CliState, execution: &CliExecution, seen: i64) -> Result<bool, i64> {
+    let saved = json_parse("{\"schema\":2,\"messages\":[{\"role\":\"user\",\"content\":\"Retained historical continuation summary\",\"context_summary\":true}]}")?;
+    cli_put_i64(&saved, saved.root(), "messages_seen", seen)?;
+    cli_state_mode_save(state, execution, "context", &saved)
+}
+
+def long_context_restore_tests(state: &CliState, cwd: &str, connection: &str) -> Result<bool, i64> {
+    let session = cli_state_create_session(state, cwd)?;
+    long_context_seed(state, session.as_str(), 1105)?;
+    let mut execution = cli_state_begin(state, session.as_str(), connection, "history-fixture")?;
+    let options = long_context_options(cwd, session.as_str(), connection);
+    let mut roles = state.db.prepare("UPDATE messages SET role=CASE revision WHEN 1104 THEN 'assistant' ELSE 'tool' END WHERE session_id=? AND revision IN(1104,1105)")?;
+    roles.bind_text(1, session.as_str())?; roles.step()?;
+    let pair = json_parse("{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"long-history-tool\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"fixture.txt\\\"}\"}]}")?;
+    let output = json_parse("{\"role\":\"tool\",\"content\":\"fixture result\",\"tool_call_id\":\"long-history-tool\"}")?;
+    let mut insert = state.db.prepare("INSERT INTO shared_history(message_id,session_id,message_json,execution_id,fence) SELECT id,session_id,?,?,? FROM messages WHERE session_id=? AND revision=?")?;
+    insert.bind_text(1, pair.serialize_string()?.as_str())?; insert.bind_text(2, execution.id.as_str())?; insert.bind_i64(3, execution.fence)?; insert.bind_text(4, session.as_str())?; insert.bind_i64(5, 1104)?; insert.step()?;
+    insert.reset()?; insert.bind_text(1, output.serialize_string()?.as_str())?; insert.bind_text(2, execution.id.as_str())?; insert.bind_i64(3, execution.fence)?; insert.bind_text(4, session.as_str())?; insert.bind_i64(5, 1105)?; insert.step()?;
+    long_context_checkpoint(state, &execution, 1103)?;
+    let mut goal = goal_new(60, 999999); goal.requests = 37; goal.tokens = 123456; goal.same_failure_count = 1; goal.last_failure = cli_text("earlier failure"); goal.status = 2;
+    controller_save_goal(state, &execution, &options, &goal)?;
+    let budget_before = cli_state_mode_load(state, session.as_str(), "goal")?.serialize_string()?;
+    let restored = controller_context_history(state, &options)?;
+    let messages = restored.root().object_get("messages")?;
+    long_context_expect(messages.array_len()? == 4 and cli_json_string(messages.array_get(2)?, "role")?.as_str() == "assistant" and cli_json_string(messages.array_get(3)?, "tool_call_id")?.as_str() == "long-history-tool", "Checkpoint above1000 resumes from its complete canonical assistant/result tail")?;
+    long_context_expect(cli_state_mode_load(state, session.as_str(), "goal")?.serialize_string()?.as_str() == budget_before.as_str(), "Reading context does not mutate cumulative budget")?;
+    long_context_checkpoint(state, &execution, 1104)?;
+    let orphan = controller_context_history(state, &options);
+    long_context_expect(not orphan.is_ok() and orphan.error == 10, "Checkpoint cutting an assistant call cannot start context from an orphan tool result")?;
+    long_context_checkpoint(state, &execution, 1106)?;
+    let future = controller_context_history(state, &options);
+    long_context_expect(not future.is_ok() and future.error == 10, "Checkpoint consumed count must not exceed public count")?;
+    long_context_checkpoint(state, &execution, 1103)?;
+    let appended = json_parse("{\"role\":\"user\",\"content\":\"new tail after compact checkpoint 世界\"}")?;
+    cli_state_append(state, &execution, &appended)?;
+    cli_state_finish(state, &mut execution, "idle")?;
+    let reopened = cli_state_open(state.path.as_str())?;
+    let resumed = controller_context_history(&reopened, &options)?;
+    let after = resumed.root().object_get("messages")?;
+    long_context_expect(after.array_len()? == 5 and cli_json_string(after.array_get(4)?, "content")?.as_str() == "new tail after compact checkpoint 世界", "Reopened state appends the newest absolute tail without replaying old rows")?;
+    let recovered_goal = controller_restore_goal(&reopened, session.as_str(), options.goal_text.as_str(), 1, 1, false)?;
+    long_context_expect(recovered_goal.requests == 37 and recovered_goal.tokens == 123456 and recovered_goal.max_requests == 60 and recovered_goal.token_budget == 999999 and recovered_goal.same_failure_count == 1 and recovered_goal.last_failure.as_str() == "earlier failure", "Restart preserves every cumulative request/token/failure budget field")?;
+    long_context_expect(cli_state_mode_load(&reopened, session.as_str(), "goal")?.serialize_string()?.as_str() == budget_before.as_str(), "Restart and tail restore leave durable budget byte-for-byte unchanged")?;
+
+    let oversized = cli_state_create_session(state, cwd)?;
+    long_context_seed(state, oversized.as_str(), 1105)?;
+    let uncheckpointed = long_context_options(cwd, oversized.as_str(), connection);
+    let refused = controller_context_history(state, &uncheckpointed);
+    long_context_expect(not refused.is_ok() and refused.error == 13 and cli_state_history_count(state, oversized.as_str())? == 1105, "Old uncheckpointed oversized context fails13 while public newest rows remain intact")?;
+    let newest = cli_state_recent_history(state, oversized.as_str(), 1)?;
+    long_context_expect(cli_json_string(newest.root().object_get("messages")?.array_get(0)?, "content")?.as_str() == "message-1105", "Failclosed model context never removes the latest user row")?;
+    let large = cli_state_create_session(state, cwd)?;
+    long_context_seed(state, large.as_str(), 1)?;
+    let mut large_text = state.db.prepare("UPDATE messages SET text=replace(hex(zeroblob(800000)),'00','x') WHERE session_id=?")?;
+    large_text.bind_text(1, large.as_str())?; large_text.step()?;
+    let byte_refused = controller_context_history(state, &long_context_options(cwd, large.as_str(), connection));
+    long_context_expect(not byte_refused.is_ok() and byte_refused.error == 13 and cli_state_history_count(state, large.as_str())? == 1, "Large single-row model context fails byte admission without deleting history")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def long_context_compact_test(state: &CliState, cwd: &str, connection_id: &str, base_url: &str) -> Result<bool, i64> {
+    let session = cli_state_create_session(state, cwd)?;
+    long_context_seed(state, session.as_str(), 1900)?;
+    let mut execution = cli_state_begin(state, session.as_str(), connection_id, "history-fixture")?;
+    let options = long_context_options(cwd, session.as_str(), connection_id);
+    long_context_checkpoint(state, &execution, 1000)?;
+    let mut history = controller_context_history(state, &options)?;
+    long_context_expect(history.root().object_get("messages")?.array_len()? == 902, "Compacted1900-row history restores checkpoint plus all900 newer messages")?;
+    let public = cli_state_history(state, session.as_str());
+    long_context_expect(not public.is_ok() and public.error == 13, "Public node limit cannot be used as a truncated compaction watermark")?;
+    let connection = ProviderConnection { id: cli_text(connection_id), base: cli_text(base_url), model: cli_text("history-fixture"), effort: string_new(), protocol: 0, images: false };
+    let tools = json_parse("{\"tools\":[]}")?;
+    let unforced = context_plan(&history, &tools, &context_defaults(), false)?;
+    long_context_expect(not unforced.root().object_get("needed")?.bool_value()?, "Small messages alone are below byte/token compaction thresholds")?;
+    let scheduler = scheduler_new(); let task = scheduler_add(&scheduler, 0, connection_id, cwd, false)?;
+    let children = children_new(); let child_states: Vec<ControllerChild> = vec_new();
+    let terminal = terminal_open()?;
+    let mut goal = goal_new(60, 999999); goal.requests = 37; goal.tokens = 123456;
+    controller_save_goal(state, &execution, &options, &goal)?;
+    long_context_expect(controller_reduce_context(state, &execution, &options, &connection, &mut history, &tools, &scheduler, task, &mut goal, &terminal, &children, &child_states, false)?, "900-message count pressure auto-compacts through the real request path")?;
+    long_context_expect(goal.requests == 38 and goal.tokens == 123557 and goal.max_requests == 60 and goal.token_budget == 999999, "Compaction adds exactly one request and101 reported tokens to the existing budget")?;
+    let checkpoint = cli_state_mode_load(state, session.as_str(), "context")?;
+    long_context_expect(checkpoint.root().object_get("value")?.object_get("messages_seen")?.number_i64()? == 1900, "Compaction watermark uses the absolute SQL count even when full history exceeds JSON admission")?;
+    long_context_expect(cli_state_history_count(state, session.as_str())? == 1900, "Compaction preserves all public rows")?;
+    let expected = history.serialize_string()?;
+    cli_state_finish(state, &mut execution, "idle")?;
+    let reopened = cli_state_open(state.path.as_str())?;
+    let resumed = controller_context_history(&reopened, &options)?;
+    long_context_expect(resumed.serialize_string()?.as_str() == expected.as_str(), "Persisted compaction resumes the exact bounded canonical model context")?;
+    let budget = controller_restore_goal(&reopened, session.as_str(), options.goal_text.as_str(), 1, 1, false)?;
+    long_context_expect(budget.requests == 38 and budget.tokens == 123557 and budget.max_requests == 60 and budget.token_budget == 999999, "Compaction restart cannot reset accumulated budgets")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def long_context_all(database: &str, base_url: &str, connection: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let cwd = path_parent_string(database)?;
+    long_context_restore_tests(&state, cwd.as_str(), connection)?;
+    long_context_compact_test(&state, cwd.as_str(), connection, base_url)
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", "").unwrap_or(string_new());
+    let base_url = cli_option(&arguments.value, "base-url", "").unwrap_or(string_new());
+    if database.len() == 0 or base_url.len() == 0 { return 2; };
+    let identity = state_id("long-history-local-fixture-").unwrap_or(string_new());
+    let credential = cli_join("Sencode/connection/", identity.as_str()).unwrap_or(string_new());
+    if identity.len() == 0 or credential.len() == 0 or not credential_write(credential.as_str(), "loopback-fixture-not-a-real-key").is_ok() { return 1; };
+    let result = long_context_all(database.as_str(), base_url.as_str(), identity.as_str());
+    let removed = credential_delete(credential.as_str());
+    if not removed.is_ok() { cli_diagnostic("Could not remove generated loopback fixture credential"); return 1; };
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_json_bounded_live_documents() != 0 or sengoo_json_bounded_reserved_bytes() != 0 or sengoo_process_live_handle_count() != 0 or sengoo_process_live_resource_count() != 0 { cli_diagnostic("Long context regression retained JSON/process admission"); return 1; };
+    println("long context passed: >1000 checkpoint, canonical tail, 900-message automatic compaction, absolute watermark, exact budget, restart and failclosed bounds"); 0
+}

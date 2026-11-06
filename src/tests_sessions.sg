@@ -1,0 +1,53 @@
+import sessions;
+import command_line;
+
+def session_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def session_tests(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let source = cli_state_create_session(&state, cwd)?;
+    session_rename(&state, source.as_str(), "原始 project")?;
+    let mut execution = cli_state_begin(&state, source.as_str(), "fixture", "model")?;
+    session_expect(not session_rename(&state, source.as_str(), "unsafe").is_ok(), "rename must not race an active turn")?;
+    session_expect(not session_branch(&state, source.as_str(), "unsafe").is_ok(), "branch requires idle authority")?;
+    let user = json_parse("{\"role\":\"user\",\"content\":\"hello 世界\"}")?;
+    cli_state_append(&state, &execution, &user)?;
+    cli_state_tool_claim(&state, &execution, "stable-call", "write_file", "{}")?;
+    cli_state_tool_complete(&state, &execution, "stable-call", "saved result")?;
+    let goal = json_parse("{\"requests\":7,\"tokens\":123,\"objective\":\"finish\",\"status\":2}")?;
+    cli_state_mode_save(&state, &execution, "goal", &goal)?;
+    let grants = json_parse("{\"image_grants\":[{\"path\":\"C:/fixture-only.png\",\"sha256\":\"fixture\",\"byte_length\":1}]}")?;
+    cli_state_mode_save(&state, &execution, "image_grants", &grants)?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    let branch = session_branch(&state, source.as_str(), "branch 世界")?;
+    let history = cli_state_history(&state, branch.as_str())?;
+    session_expect(cli_json_string(history.root().object_get("messages")?.array_get(0)?, "content")?.as_str() == "hello 世界", "branch preserves public Unicode history")?;
+    let restored = cli_state_mode_load(&state, branch.as_str(), "goal")?;
+    session_expect(cli_json_optional_i64(restored.root().object_get("value")?, "requests", 0) == 7, "branch cannot reset the saved Goal budget")?;
+    let branch_grants = cli_state_mode_load(&state, branch.as_str(), "image_grants")?;
+    session_expect(branch_grants.root().object_get("value")?.object_get("image_grants")?.array_len()? == 0, "branch does not inherit file-read grants from copied image history")?;
+    session_expect(cli_state_tool_result(&state, branch.as_str(), "stable-call")?.as_str() == "saved result", "branch retains completed tool deduplication")?;
+    let mut next = cli_state_begin(&state, branch.as_str(), "fixture", "model")?;
+    session_expect(not cli_state_tool_claim(&state, &next, "stable-call", "write_file", "{}")?, "historical call cannot execute twice in branch")?;
+    cli_state_append(&state, &next, &user)?;
+    cli_state_finish(&state, &mut next, "idle")?;
+    let original = cli_state_history(&state, source.as_str())?;
+    session_expect(original.root().object_get("messages")?.array_len()? == 1, "branch modifications leave source intact")?;
+    let exported = session_export(&state, branch.as_str())?;
+    session_expect(str_contains(exported.as_str(), "# branch 世界") and str_contains(exported.as_str(), "hello 世界"), "export includes title and Unicode messages")?;
+    session_expect(not session_rename(&state, source.as_str(), "bad\nname").is_ok(), "reject control-containing title")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", "").unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let cwd = cli_current_directory().unwrap_or(string_new());
+    let result = session_tests(database.as_str(), cwd.as_str());
+    if not result.is_ok() { println(result.error); let detail = sqlite_error_message(); if detail.is_ok() { cli_diagnostic(detail.value.as_str()); }; return 1; };
+    println("session branch/rename/export passed"); 0
+}

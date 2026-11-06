@@ -1,0 +1,21 @@
+import tui;
+import std::time;
+
+// A local microbenchmark, separate from the real-console four-provider gate.
+// It reports full pure frame construction, not keyboard or terminal latency.
+def main() -> i64 {
+    let mut app = tui_new("D:/fixture/中文", "fixture", "fixture", "fixture");
+    let resized = tui_resize(&mut app, 110, 35); if not resized.is_ok { return 1; };
+    let mut index = 0;
+    while index < 40 {
+        let appended = tui_message(&mut app, "assistant", "# Render benchmark\nA completed paragraph with 中文 and 👨‍👩‍👧‍👦 remains cached, including its wrapping and semantic styles.\n```sg\nlet example = cached_row;\n```\nThis visible transcript is reused when only the composer changes.");
+        if not appended.is_ok { return 1; }; index = index + 1;
+    };
+    let draft = tui_set_draft(&mut app, "abcdefghijklmnopqrstuvwxyz0123456789"); if not draft.is_ok { return 1; };
+    let warmup = tui_frame_rows(&app); if not warmup.is_ok or warmup.value.len() != 35 { return 1; };
+    let started = time_unix_ms(); index = 0;
+    while index < 40 { let frame = tui_frame_rows(&app); if not frame.is_ok or frame.value.len() != 35 { return 1; }; index = index + 1; };
+    let elapsed = time_unix_ms() - started;
+    println("pure_frame_rows samples=40 viewport=110x35 messages=40 elapsed_ms"); println(elapsed); println("mean_ms"); println(elapsed / 40);
+    0
+}

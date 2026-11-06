@@ -1,0 +1,326 @@
+import workspace;
+import terminal;
+import std::env;
+import std::system;
+import executor_jobs;
+
+struct ExecutorOutput {
+    stdout: Buffer,
+    stderr: Buffer,
+    exit_code: i64,
+    timed_out: bool,
+    cancelled: bool,
+    truncated: bool,
+}
+
+struct ExecutorDisplayText {
+    text: String,
+    lossy: bool,
+    nul_escaped: bool,
+}
+
+// JSON's current borrowed text boundary is C-string based. Make embedded NUL
+// visible before that boundary so the rest of a binary diagnostic survives.
+def executor_display_text(buffer: Buffer) -> Result<ExecutorDisplayText, i64> {
+    let lossy = not buffer.is_utf8();
+    let decoded = string_from_utf8_lossy(buffer, buffer.used_len())?;
+    let has_nul = decoded.len() != decoded.as_str().len();
+    if not has_nul { return Result { is_ok: true, value: ExecutorDisplayText { text: decoded, lossy: lossy, nul_escaped: false }, error: 0 }; };
+    let source = ffi_buffer_new(decoded.len())?;
+    decoded.copy_to_buffer(source)?;
+    let escaped = ffi_buffer_new(decoded.len() * 2)?;
+    let mut offset = 0;
+    let mut start = 0;
+    while offset < source.used_len() {
+        if source.get_u8(offset)? == 0 {
+            if offset > start { escaped.append_copy(&source, start, offset - start)?; (); };
+            escaped.append_str("\\0")?;
+            start = offset + 1;
+        };
+        offset = offset + 1;
+    };
+    if offset > start { escaped.append_copy(&source, start, offset - start)?; (); };
+    let text = string_from_utf8(escaped, escaped.used_len())?;
+    Result { is_ok: true, value: ExecutorDisplayText { text: text, lossy: lossy, nul_escaped: true }, error: 0 }
+}
+
+// Only ordinary failures with a proven no-mutation boundary can return to the
+// model. Cancellation, ownership interruption, invalid handles and exhausted
+// resources remain host failures even when the attempted tool was a read.
+def executor_ordinary_tool_error(code: i64) -> bool {
+    code == 2 or code == 4 or code == 5 or code == 6 or code == 7 or code == 8 or code == 9 or code == 10 or code == 11 or code == 13 or code == 20
+}
+
+def executor_read_tool(name: &str) -> bool {
+    name == "read_file" or name == "list_directory" or name == "search" or name == "find_files" or name == "git_status" or name == "git_diff"
+}
+
+def executor_read_error_recoverable(name: &str, code: i64) -> bool {
+    executor_read_tool(name) and executor_ordinary_tool_error(code)
+}
+
+def executor_tool_failure(name: &str, code: i64, no_operation: bool) -> Result<JsonDoc, i64> {
+    let safe = no_operation or executor_read_tool(name);
+    let recoverable = safe and executor_ordinary_tool_error(code);
+    let message = cli_text("Tool "); message.push_str(name)?; message.push_str(" failed with code ")?; message.push_i64(code)?;
+    if recoverable {
+        if code == 7 { message.push_str(". Use a non-empty workspace-relative path; use '.' for the workspace root. Absolute paths, '..' escapes and symlink traversal are not allowed.")?; (); }
+        else { if code == 5 { message.push_str(". The requested path or value was not found; inspect the directory and correct the arguments.")?; (); }
+        else { if code == 20 { message.push_str(". The requested text is not valid UTF-8; choose a supported text file.")?; (); }
+        else { message.push_str(". Check the arguments, availability and size limits before choosing a corrected call.")?; (); }; }; };
+        message.push_str(if no_operation { " No operation executed. The agent may continue with a new call ID." } else { " This read did not modify the workspace. The agent may continue with a new call ID." })?;
+        ();
+    } else {
+        message.push_str(if safe { ". Host execution stopped; cancellation, ownership or resource errors require user review." } else { ". The outcome may include side effects. Execution is paused; inspect the original outcome before retrying. Automatic replay is forbidden." })?;
+        ();
+    };
+    let result = workspace_result(message.as_str(), true)?;
+    cli_put_i64(&result, result.root(), "error_code", code)?;
+    cli_put_bool(&result, result.root(), "recoverable", recoverable)?;
+    cli_put_bool(&result, result.root(), "no_side_effects", safe)?;
+    cli_put_bool(&result, result.root(), "outcome_unknown", not safe)?;
+    cli_put_bool(&result, result.root(), "host_error", not recoverable)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def executor_command(cwd: &str, command: &str, timeout_ms: i64, terminal: &Terminal) -> Result<JsonDoc, i64> {
+    let pending: Vec<TerminalEvent> = vec_new();
+    // Keep this low-level compatibility entry on the native Windows shell;
+    // model-facing run_command uses executor_command_shell_pending below and
+    // defaults to Bash.
+    executor_command_shell_pending(cwd, command, "powershell", timeout_ms, terminal, &pending)
+}
+
+def executor_command_pending(cwd: &str, command: &str, timeout_ms: i64, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    executor_command_shell_pending(cwd, command, "powershell", timeout_ms, terminal, pending)
+}
+
+// Select the command interpreter explicitly. The model-facing tool defaults
+// to Bash so shell snippets are portable across Claude Code-style workflows;
+// PowerShell and cmd remain available for Windows-specific checks and the
+// manual terminal pane.
+def executor_command_shell_pending(cwd: &str, command: &str, shell: &str, timeout_ms: i64, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let selected = if shell.len() == 0 { "bash" } else { shell };
+    if timeout_ms < 1 or timeout_ms > 600000 { return executor_not_launched("timeout_ms must be between 1 and 600000", selected, 2); };
+    let executable = executor_shell_executable(cwd, selected);
+    if not executable.is_ok() {
+        return executor_not_launched(if selected == "bash" { "Bash is unavailable on this machine; install Git Bash or choose shell=powershell for this command" } else { "Requested command shell is unavailable" }, selected, executable.error);
+    };
+    let prepared = executor_command_builder(cwd, command, selected, executable.value.as_str());
+    if not prepared.is_ok() { return executor_not_launched("Command configuration failed before process launch", selected, prepared.error); };
+    let output = executor_capture(&prepared.value, timeout_ms, terminal, pending)?;
+    let result = executor_result(&output)?;
+    cli_put_string(&result, result.root(), "shell", selected)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def executor_not_launched(message: &str, shell: &str, code: i64) -> Result<JsonDoc, i64> {
+    let result = workspace_result(message, true)?;
+    cli_put_string(&result, result.root(), "shell", shell)?;
+    cli_put_i64(&result, result.root(), "error_code", code)?;
+    cli_put_bool(&result, result.root(), "launch_failed", true)?;
+    cli_put_bool(&result, result.root(), "no_side_effects", true)?;
+    cli_put_bool(&result, result.root(), "outcome_unknown", false)?;
+    cli_put_bool(&result, result.root(), "recoverable", executor_ordinary_tool_error(code))?;
+    cli_put_bool(&result, result.root(), "host_error", not executor_ordinary_tool_error(code))?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+// All fallible work here is before spawn; its failure can prove no launch.
+// Errors from executor_capture remain conservative: an OS process may exist.
+def executor_command_builder(cwd: &str, command: &str, selected: &str, executable: &str) -> Result<ProcessCommand, i64> {
+    let builder = process_command(executable)?;
+    if selected == "bash" {
+        builder.arg("--noprofile")?;
+        builder.arg("--norc")?;
+        builder.arg("-c")?;
+        builder.arg(command)?;
+        builder.env_remove("BASH_ENV")?;
+        builder.env_remove("ENV")?;
+        ();
+    } else {
+        if selected == "powershell" {
+            builder.arg("-NoLogo")?;
+            builder.arg("-NoProfile")?;
+            builder.arg("-NonInteractive")?;
+            builder.arg("-Command")?;
+            // Configure only this child shell. Windows PowerShell otherwise
+            // encodes redirected diagnostics with the legacy console code page.
+            let script = cli_text("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ");
+            script.push_str(command)?;
+            builder.arg(script.as_str())?;
+        } else {
+            builder.arg("/d")?;
+            builder.arg("/s")?;
+            builder.arg("/c")?;
+            builder.arg(command)?;
+        };
+        ();
+    };
+    builder.cwd(cwd)?;
+    executor_search_child_path(&builder, cwd)?;
+    Result { is_ok: true, value: builder, error: 0 }
+}
+
+// The offline Windows distribution keeps ripgrep beside this image. Resolve
+// that directory from the executable, never from the project or process cwd.
+// Source builds may use an absolute PATH entry outside the workspace.
+def executor_search_executable(cwd: &str) -> Result<String, i64> {
+    let directory = path_parent_string(current_executable_string()?.as_str())?;
+    let bundled = path_join_string(directory.as_str(), "rg.exe")?;
+    if file_exists(bundled.as_str()) { return Result { is_ok: true, value: bundled, error: 0 }; };
+    if not env_has_var("PATH") { return string_result_err(5); };
+    let path = ui_env("PATH")?;
+    let root = str_to_ascii_lower(path_normalize_string(cwd)?.as_str())?;
+    let prefix = cli_join(root.as_str(), "\\")?;
+    let slash_prefix = cli_join(root.as_str(), "/")?;
+    let entries = path.split(";");
+    loop {
+        let next = entries.next(); if not next.is_some { break; };
+        let entry = next.value; if not path_is_absolute(entry.as_str()) { continue; };
+        let candidate = path_normalize_string(path_join_string(entry.as_str(), "rg.exe")?.as_str())?;
+        let lower = str_to_ascii_lower(candidate.as_str())?;
+        if lower.as_str() == root.as_str() or str_starts_with(lower.as_str(), prefix.as_str()) or str_starts_with(lower.as_str(), slash_prefix.as_str()) { continue; };
+        if file_exists(candidate.as_str()) { return candidate.clone(); };
+    };
+    string_result_err(5)
+}
+
+// ProcessCommand owns this environment override. It does not change this
+// process, persistent user PATH or the environment of later model requests.
+def executor_search_child_path(builder: &ProcessCommand, cwd: &str) -> Result<bool, i64> {
+    let found = executor_search_executable(cwd);
+    if not found.is_ok { return Result { is_ok: true, value: true, error: 0 }; };
+    let path = path_parent_string(found.value.as_str())?;
+    if env_has_var("PATH") { path.push_str(";")?; path.push_str(ui_env("PATH")?.as_str())?; (); };
+    builder.env_set("PATH", path.as_str())
+}
+
+// Resolve shells from absolute PATH entries and known system installations.
+// Never let CreateProcess search the workspace first: a repository must not
+// shadow the interpreter used to execute its own command.
+def executor_shell_executable(cwd: &str, shell: &str) -> Result<String, i64> {
+    if shell == "powershell" {
+        let buffer = ffi_buffer_new(32768)?;
+        let count = env_var_copy("SystemRoot", buffer)?;
+        let root = string_from_buffer(buffer, count)?;
+        return path_join_string(root.as_str(), "System32/WindowsPowerShell/v1.0/powershell.exe");
+    };
+    if shell == "cmd" {
+        let buffer = ffi_buffer_new(32768)?;
+        let count = env_var_copy("SystemRoot", buffer)?;
+        let root = string_from_buffer(buffer, count)?;
+        return path_join_string(root.as_str(), "System32/cmd.exe");
+    };
+    if shell != "bash" { return string_result_err(2); };
+    let buffer = ffi_buffer_new(32768)?;
+    let count = env_var_copy("PATH", buffer)?;
+    let path = string_from_buffer(buffer, count)?;
+    let root = str_to_ascii_lower(path_normalize_string(cwd)?.as_str())?;
+    let prefix = cli_join(root.as_str(), "\\")?;
+    let slash_prefix = cli_join(root.as_str(), "/")?;
+    let entries = path.split(";");
+    loop {
+        let next = entries.next();
+        if not next.is_some { break; };
+        let entry = next.value;
+        if not path_is_absolute(entry.as_str()) { continue; };
+        let candidate = path_normalize_string(path_join_string(entry.as_str(), "bash.exe")?.as_str())?;
+        let lower = str_to_ascii_lower(candidate.as_str())?;
+        if lower.as_str() == root.as_str() or str_starts_with(lower.as_str(), prefix.as_str()) or str_starts_with(lower.as_str(), slash_prefix.as_str()) { continue; };
+        if file_exists(candidate.as_str()) { return string_from_str(candidate.as_str()); };
+    };
+    if file_exists("C:/Program Files/Git/bin/bash.exe") { return string_from_str("C:/Program Files/Git/bin/bash.exe"); };
+    if file_exists("C:/Program Files/Git/usr/bin/bash.exe") { return string_from_str("C:/Program Files/Git/usr/bin/bash.exe"); };
+    if file_exists("C:/Program Files (x86)/Git/bin/bash.exe") { return string_from_str("C:/Program Files (x86)/Git/bin/bash.exe"); };
+    if file_exists("C:/Program Files (x86)/Git/usr/bin/bash.exe") { return string_from_str("C:/Program Files (x86)/Git/usr/bin/bash.exe"); };
+    string_result_err(5)
+}
+
+def executor_capture(builder: &ProcessCommand, timeout_ms: i64, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<ExecutorOutput, i64> {
+    let mut job = executor_job_start(builder, timeout_ms)?;
+    executor_job_wait(&mut job, terminal, pending)?;
+    Result { is_ok: true, value: job.output, error: 0 }
+}
+
+def executor_result(output: &ExecutorOutput) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    let root = document.root();
+    cli_put_i64(&document, root, "exit_code", output.exit_code)?;
+    cli_put_bool(&document, root, "timed_out", output.timed_out)?;
+    cli_put_bool(&document, root, "cancelled", output.cancelled)?;
+    cli_put_bool(&document, root, "truncated", output.truncated)?;
+    let text = executor_display_text(output.stdout)?;
+    let errors = executor_display_text(output.stderr)?;
+    cli_put_string(&document, root, "stdout", text.text.as_str())?;
+    cli_put_string(&document, root, "stderr", errors.text.as_str())?;
+    cli_put_bool(&document, root, "stdout_lossy", text.lossy)?;
+    cli_put_bool(&document, root, "stderr_lossy", errors.lossy)?;
+    cli_put_bool(&document, root, "stdout_nul_escaped", text.nul_escaped)?;
+    cli_put_bool(&document, root, "stderr_nul_escaped", errors.nul_escaped)?;
+    cli_put_i64(&document, root, "stdout_bytes", output.stdout.used_len())?;
+    cli_put_i64(&document, root, "stderr_bytes", output.stderr.used_len())?;
+    let failed = output.exit_code != 0 or output.timed_out or output.cancelled;
+    cli_put_bool(&document, root, "is_error", failed)?;
+    let content = document.serialize_string()?;
+    workspace_result(content.as_str(), failed)
+}
+
+// Resolve only absolute PATH entries outside the project. CreateProcess's
+// implicit current-directory search must not run a repository's git.exe.
+def executor_git_executable(cwd: &str) -> Result<String, i64> {
+    let buffer = ffi_buffer_new(32768)?;
+    let count = env_var_copy("PATH", buffer)?;
+    let path = string_from_buffer(buffer, count)?;
+    let entries = path.split(";");
+    let root = str_to_ascii_lower(path_normalize_string(cwd)?.as_str())?;
+    let prefix = cli_join(root.as_str(), "\\")?;
+    let slash_prefix = cli_join(root.as_str(), "/")?;
+    loop {
+        let next = entries.next();
+        if not next.is_some { break; };
+        let entry = next.value;
+        if not path_is_absolute(entry.as_str()) { continue; };
+        let candidate = path_normalize_string(path_join_string(entry.as_str(), "git.exe")?.as_str())?;
+        let lower = str_to_ascii_lower(candidate.as_str())?;
+        if lower.as_str() == root.as_str() or str_starts_with(lower.as_str(), prefix.as_str()) or str_starts_with(lower.as_str(), slash_prefix.as_str()) { continue; };
+        if file_exists(candidate.as_str()) { return candidate.clone(); };
+    };
+    string_result_err(5)
+}
+
+def executor_git_builder(executable: &str, cwd: &str) -> Result<ProcessCommand, i64> {
+    let builder = process_command(executable)?;
+    builder.cwd(cwd)?;
+    builder.arg("--no-pager")?;
+    builder.arg("--no-optional-locks")?;
+    builder.arg("-c")?;
+    builder.arg("core.fsmonitor=false")?;
+    builder.arg("-c")?;
+    builder.arg("submodule.recurse=false")?;
+    Result { is_ok: true, value: builder, error: 0 }
+}
+
+def executor_git(cwd: &str, diff: bool, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let mut git = executor_git_job_start(cwd, diff)?;
+    loop {
+        let interrupt = ui_poll_busy(terminal, pending);
+        if not interrupt.is_ok() { executor_job_record_error(&git.job, interrupt.error); }
+        else { if interrupt.value { executor_git_job_cancel(&mut git); }; };
+        let settled = executor_git_job_poll(&mut git);
+        if settled { return executor_git_job_result(&git); };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 6 }
+}
+
+def executor_tool(cwd: &str, tool: &str, arguments: &JsonDoc, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    if tool == "run_command" {
+        let command = cli_json_string(arguments.root(), "command")?;
+        let shell = cli_json_optional_string(arguments.root(), "shell");
+        return executor_command_shell_pending(cwd, command.as_str(), shell.as_str(), cli_json_optional_i64(arguments.root(), "timeout_ms", 120000), terminal, pending);
+    };
+    if tool == "git_status" { return executor_git(cwd, false, terminal, pending); };
+    if tool == "git_diff" { return executor_git(cwd, true, terminal, pending); };
+    workspace_file_tool(cwd, tool, arguments)
+}

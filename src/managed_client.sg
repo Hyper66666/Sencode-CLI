@@ -1,0 +1,175 @@
+import managed_transport;
+import std::path;
+
+struct ManagedClient { transport: ManagedTransport, engine: String, session: String, turn: String, queued: Vec<JsonDoc> }
+
+def managed_client_new(metadata: &JsonDoc, cwd: &str) -> Result<ManagedClient, i64> {
+    let transport = managed_transport_start(metadata, cwd)?;
+    let queue: Vec<JsonDoc> = vec_new();
+    Result { is_ok: true, value: ManagedClient { transport: transport, engine: cli_json_string(metadata.root(), "engine")?, session: string_new(), turn: string_new(), queued: queue }, error: 0 }
+}
+
+def managed_client_call(client: &mut ManagedClient, id: &str, method: &str, params: &JsonDoc, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    managed_rpc_request(&client.transport, id, method, params, terminal, input)?;
+    let started = time_unix_ms();
+    loop {
+        if ui_poll_busy(terminal, input)? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 19 }; };
+        let message = managed_transport_poll(&mut client.transport)?;
+        if message.root().object_has("id") and not message.root().object_has("method") {
+            if cli_json_optional_string(message.root(), "id").as_str() != id { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
+            if message.root().object_has("error") or not message.root().object_has("result") { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 9 }; };
+            let response = json_doc_object()?;
+            response.root().object_set("value", response.copy(message.root().object_get("result")?)?)?;
+            return Result { is_ok: true, value: response, error: 0 };
+        };
+        if message.root().object_has("method") {
+            if message.root().object_has("id") {
+                // No permission interaction is valid before the runtime has
+                // acknowledged the exact session/turn binding.
+                managed_rpc_unsupported(&client.transport, message.root().object_get("id")?, terminal, input)?;
+                ();
+            } else {
+                if client.queued.len() >= 256 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+                if not client.queued.push(message) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            };
+        };
+        if time_since_ms(started) > 20000 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 9 }; };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 9 }
+}
+
+def managed_client_next(client: &mut ManagedClient) -> Result<JsonDoc, i64> {
+    if client.queued.len() > 0 {
+        let removed = client.queued.remove(0);
+        if removed.is_some { return Result { is_ok: true, value: removed.value, error: 0 }; };
+        return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 };
+    };
+    managed_transport_poll(&mut client.transport)
+}
+
+def managed_client_initialize(client: &mut ManagedClient, metadata: &JsonDoc, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    if client.engine.as_str() == "codex-app-server" {
+        if cli_json_optional_string(metadata.root(), "runtime_version").as_str() != "0.144.4" or cli_json_optional_string(metadata.root(), "protocol_version").as_str() != "0.144.4" { return Result { is_ok: false, value: false, error: 8 }; };
+        let params = json_parse("{\"clientInfo\":{\"name\":\"sencode-sg\",\"title\":\"Sencode CLI\",\"version\":\"0.1.0\"},\"capabilities\":{\"experimentalApi\":false,\"requestAttestation\":false}}")?;
+        let initialized = managed_client_call(client, "initialize", "initialize", &params, terminal, input)?;
+        let result = initialized.root().object_get("value")?;
+        let agent = cli_json_string(result, "userAgent")?;
+        if not str_contains(agent.as_str(), "/0.144.4 ") and not str_ends_with(agent.as_str(), "/0.144.4") { return Result { is_ok: false, value: false, error: 8 }; };
+        let reported = str_to_ascii_lower(path_normalize_string(cli_json_string(result, "codexHome")?.as_str())?.as_str())?;
+        let expected = str_to_ascii_lower(path_normalize_string(cli_json_string(metadata.root(), "profile_directory")?.as_str())?.as_str())?;
+        if reported.as_str() != expected.as_str() or cli_json_optional_string(result, "platformFamily").as_str() != "windows" { return Result { is_ok: false, value: false, error: 8 }; };
+        let empty = json_parse("null")?;
+        managed_rpc_request(&client.transport, "", "initialized", &empty, terminal, input)?;
+        ();
+    } else { if client.engine.as_str() == "sencode-acp" {
+        if cli_json_optional_string(metadata.root(), "runtime_version").as_str() != "0.2.102" or cli_json_optional_string(metadata.root(), "protocol_version").as_str() != "1" { return Result { is_ok: false, value: false, error: 8 }; };
+        let params = json_parse("{\"protocolVersion\":1,\"clientInfo\":{\"name\":\"sencode-sg\",\"title\":\"Sencode CLI\",\"version\":\"0.1.0\"},\"clientCapabilities\":{\"fs\":{\"readTextFile\":false,\"writeTextFile\":false},\"terminal\":false}}")?;
+        let initialized = managed_client_call(client, "initialize", "initialize", &params, terminal, input)?;
+        let result = initialized.root().object_get("value")?;
+        if cli_json_optional_i64(result, "protocolVersion", 0) != 1 { return Result { is_ok: false, value: false, error: 8 }; };
+        if result.object_has("agentInfo") { let info = result.object_get("agentInfo")?; if cli_json_optional_string(info, "version").as_str() != "0.2.102" { return Result { is_ok: false, value: false, error: 8 }; }; };
+    } else { return Result { is_ok: false, value: false, error: 8 }; }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_client_begin(client: &mut ManagedClient, cwd: &str, model: &str, prompt: &str, local_id: &str, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    if client.engine.as_str() == "codex-app-server" {
+        let params = json_parse("{\"approvalPolicy\":\"untrusted\",\"sandbox\":\"workspace-write\",\"ephemeral\":true}")?;
+        cli_put_string(&params, params.root(), "cwd", cwd)?;
+        if model.len() > 0 { cli_put_string(&params, params.root(), "model", model)?; (); };
+        let created = managed_client_call(client, "session", "thread/start", &params, terminal, input)?;
+        client.session = cli_json_string(created.root().object_get("value")?.object_get("thread")?, "id")?;
+        let request = json_doc_object()?;
+        cli_put_string(&request, request.root(), "threadId", client.session.as_str())?;
+        cli_put_string(&request, request.root(), "clientUserMessageId", local_id)?;
+        if model.len() > 0 { cli_put_string(&request, request.root(), "model", model)?; (); };
+        let values = request.new_array()?;
+        let item = request.new_object()?;
+        cli_put_string(&request, item, "type", "text")?;
+        cli_put_string(&request, item, "text", prompt)?;
+        item.object_set("text_elements", request.new_array()?)?;
+        values.array_push(item)?;
+        request.root().object_set("input", values)?;
+        let started = managed_client_call(client, "turn", "turn/start", &request, terminal, input)?;
+        client.turn = cli_json_string(started.root().object_get("value")?.object_get("turn")?, "id")?;
+    } else {
+        let params = json_parse("{\"mcpServers\":[],\"_meta\":{\"clientIdentifier\":\"sencode-sg\",\"clientVersion\":\"0.1.0\",\"autoMode\":false,\"yoloMode\":false}}")?;
+        cli_put_string(&params, params.root(), "cwd", cwd)?;
+        if model.len() > 0 { cli_put_string(&params, params.root().object_get("_meta")?, "modelId", model)?; (); };
+        let created = managed_client_call(client, "session", "session/new", &params, terminal, input)?;
+        client.session = cli_json_string(created.root().object_get("value")?, "sessionId")?;
+        let request = json_doc_object()?;
+        cli_put_string(&request, request.root(), "sessionId", client.session.as_str())?;
+        let values = request.new_array()?;
+        let item = request.new_object()?;
+        cli_put_string(&request, item, "type", "text")?;
+        cli_put_string(&request, item, "text", prompt)?;
+        values.array_push(item)?;
+        request.root().object_set("prompt", values)?;
+        managed_rpc_request(&client.transport, "prompt", "session/prompt", &request, terminal, input)?;
+        client.turn = cli_text("prompt");
+    };
+    if client.session.len() == 0 or client.turn.len() == 0 { return Result { is_ok: false, value: false, error: 10 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_client_cancel(client: &ManagedClient) -> Result<bool, i64> {
+    // Cancellation must remain writable after the host's cancel flag is set.
+    // This small best-effort frame uses the nonblocking pipe directly; the
+    // caller always follows it with owned process-tree termination and reap.
+    let request = json_doc_object()?;
+    cli_put_string(&request, request.root(), "jsonrpc", "2.0")?;
+    let params = request.new_object()?;
+    if client.engine.as_str() == "codex-app-server" {
+        cli_put_string(&request, request.root(), "id", "interrupt")?;
+        cli_put_string(&request, request.root(), "method", "turn/interrupt")?;
+        cli_put_string(&request, params, "threadId", client.session.as_str())?;
+        cli_put_string(&request, params, "turnId", client.turn.as_str())?;
+    } else {
+        cli_put_string(&request, request.root(), "method", "session/cancel")?;
+        cli_put_string(&request, params, "sessionId", client.session.as_str())?;
+        let meta = request.new_object()?;
+        cli_put_bool(&request, meta, "cancelSubagents", true)?;
+        cli_put_bool(&request, meta, "killBackgroundTasks", true)?;
+        params.object_set("_meta", meta)?;
+    };
+    request.root().object_set("params", params)?;
+    let encoded = request.serialize_string()?; encoded.push_str("\n")?;
+    let bytes = ffi_buffer_from_bytes(encoded.as_str())?;
+    client.transport.child.try_write_stdin(&bytes, bytes.used_len())?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_approval_result(engine: &str, method: &str, params: JsonValue, approved: bool) -> Result<JsonDoc, i64> {
+    if engine == "codex-app-server" {
+        if method == "item/permissions/requestApproval" {
+            let result = json_parse("{\"permissions\":{},\"scope\":\"turn\",\"strictAutoReview\":null}")?;
+            if approved { result.root().object_set("permissions", result.copy(params.object_get("permissions")?)?)?; (); };
+            return Result { is_ok: true, value: result, error: 0 };
+        };
+        let result = json_doc_object()?;
+        cli_put_string(&result, result.root(), "decision", if approved { "accept" } else { "decline" })?;
+        return Result { is_ok: true, value: result, error: 0 };
+    };
+    let options = params.object_get("options")?;
+    let result = json_parse("{\"outcome\":{\"outcome\":\"cancelled\"}}")?;
+    let desired = if approved { "allow_once" } else { "reject_once" };
+    let mut index = 0;
+    while index < options.array_len()? {
+        let option = options.array_get(index)?;
+        if cli_json_optional_string(option, "kind").as_str() == desired {
+            let outcome = result.root().object_get("outcome")?;
+            cli_put_string(&result, outcome, "outcome", "selected")?;
+            cli_put_string(&result, outcome, "optionId", cli_json_string(option, "optionId")?.as_str())?;
+            return Result { is_ok: true, value: result, error: 0 };
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def managed_approval_method(engine: &str, method: &str) -> bool {
+    if engine == "codex-app-server" { return method == "item/commandExecution/requestApproval" or method == "item/fileChange/requestApproval" or method == "item/permissions/requestApproval"; };
+    method == "session/request_permission"
+}

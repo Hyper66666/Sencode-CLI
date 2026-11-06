@@ -1,0 +1,14 @@
+import common;
+import commands;
+
+def slash_command(line: &str) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    let split = str_index_of(line, " ");
+    let typed_name = if split < 0 { cli_text(line) } else { cli_byte_slice(line, 0, split)? };
+    let registry = commands_registry();
+    let name = commands_resolve(&registry, typed_name.as_str())?;
+    let value = if split < 0 { string_new() } else { str_trim(cli_byte_slice(line, split + 1, line.len())?.as_str())? };
+    cli_put_string(&document, document.root(), "command", name.as_str())?;
+    cli_put_string(&document, document.root(), "value", value.as_str())?;
+    Result { is_ok: true, value: document, error: 0 }
+}

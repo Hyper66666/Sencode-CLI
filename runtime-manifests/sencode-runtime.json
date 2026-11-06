@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "runtimeId": "sencode-runtime-embedded",
+  "sourceVersion": "0.2.102",
+  "desktopRevision": 31,
+  "cargoPackage": "sencode-pager-bin",
+  "binaryName": "sencode-agent.exe",
+  "targetTriple": "x86_64-pc-windows-msvc",
+  "profile": "debug",
+  "features": [
+    "desktop-embedded"
+  ],
+  "cargoLockSha256": "42835CDCA027D345AB79F2F6A6909C3BB51D5CB3F05A2BDFEC104265FDA19667",
+  "binarySha256": "58CBCD4F67DA27950719ED263882EDD7935D469EA2585AAFF05555D46725B8DC",
+  "binarySize": 200632832,
+  "buildEnvironment": {
+    "RUSTFLAGS": "-C force-unwind-tables=yes -C target-feature=+crt-static -C linker=C:\\Users\\22470\\.rustup\\toolchains\\1.94.0-x86_64-pc-windows-msvc\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe -C linker-flavor=lld-link -C link-args=/STACK:16777216"
+  }
+}

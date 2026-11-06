@@ -1,0 +1,52 @@
+import job_store;
+import command_line;
+
+def jobs_expect(ok:bool,label:&str)->Result<bool,i64>{if not ok{cli_diagnostic(label);return state_bool_error(99);};job_true()}
+
+def jobs_tests(database:&str,cwd:&str)->Result<bool,i64>{
+    let queue=cli_bytes(1024);
+    queue.append_str("{\"type\":\"hel")?;
+    jobs_expect(not job_frame_take(&queue,1024)?.root().object_has("type"),"partial JSONL remains buffered")?;
+    queue.append_str("lo\",\"text\":\"中文😀\"}\n")?;
+    let frame=job_frame_take(&queue,1024)?;
+    jobs_expect(cli_json_string(frame.root(),"text")?.as_str()=="中文😀" and queue.used_len()==0,"complete Unicode frame is consumed once")?;
+    jobs_expect(not job_keys(&frame,"|type|").is_ok(),"unknown frame fields reject")?;
+    queue.append_str("[]\n")?;jobs_expect(not job_frame_take(&queue,1024).is_ok(),"non-object frames reject")?;
+    queue.clear();queue.append_str("123456789")?;jobs_expect(not job_frame_take(&queue,8).is_ok(),"oversized partial frames reject")?;
+    let state=cli_state_open(database)?;let session=cli_state_create_session(&state,cwd)?;
+    let store=job_store_open(&state)?;
+    let submit=json_parse("{\"id\":\"stable-job-test\",\"connection\":\"fixture\",\"model\":\"fixture-model\",\"goal\":\"\"}")?;
+    let job=job_store_create(&store,&state,session.as_str(),cwd,&submit,10000)?;
+    let id=cli_json_string(job.root(),"job_id")?;let generation=cli_json_string(job.root(),"generation")?;
+    job_store_admit(&store,id.as_str(),generation.as_str())?;
+    jobs_expect(not job_store_admit(&store,id.as_str(),generation.as_str()).is_ok(),"durable admission cannot replay")?;
+    let event=json_parse("{\"type\":\"notice\",\"text\":\"bounded\"}")?;
+    let mut index=0;
+    while index<516{job_store_event(&store,id.as_str(),generation.as_str(),&event)?;index=index+1;};
+    let expired=job_store_logs(&store,id.as_str(),0,256)?;
+    jobs_expect(cli_json_string(expired.root(),"type")?.as_str()=="cursor_expired","expired cursors report explicit gap")?;
+    let logs=job_store_logs(&store,id.as_str(),515,16)?;
+    jobs_expect(logs.root().object_get("events")?.array_len()?==1,"cursor excludes previously seen event")?;
+    {let mut count=store.db.prepare("SELECT COUNT(*) FROM cli_job_events WHERE job_id=?")?;count.bind_text(1,id.as_str())?;count.step()?;
+    jobs_expect(count.integer(0)?==512,"event retention is bounded")?; (); };
+    let payload=string_new();let mut part=0;
+    while part<15000{payload.push_str("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")?;part=part+1;};
+    let large=json_doc_object()?;cli_put_string(&large,large.root(),"type","notice")?;cli_put_string(&large,large.root(),"text",payload.as_str())?;
+    let mut emitted=0;while emitted<20{job_store_event(&store,id.as_str(),generation.as_str(),&large)?;emitted=emitted+1;};
+    {let mut count=store.db.prepare("SELECT COUNT(*),SUM(byte_length) FROM cli_job_events WHERE job_id=?")?;count.bind_text(1,id.as_str())?;count.step()?;
+    jobs_expect(count.integer(0)?<20 and count.integer(0)?>1 and count.integer(1)?<=16777216,"byte retention applies independently of event count")?; (); };
+    let last=job_store_logs(&store,id.as_str(),535,1)?;
+    jobs_expect(last.root().object_get("events")?.array_len()?==1,"near-limit event remains readable as one cursor page")?;
+    let mut authority=state.db.prepare("SELECT COUNT(*) FROM shared_executions WHERE session_id=?")?;authority.bind_text(1,session.as_str())?;authority.step()?;
+    jobs_expect(authority.integer(0)?==0,"job admission never acquires shared execution authority")?;
+    job_store_status(&store,id.as_str(),generation.as_str(),"interrupted","synthetic test")?;
+    let second=job_store_open(&state)?;
+    jobs_expect(job_store_load(&second,id.as_str())?.root().object_get("admitted")?.bool_value()?,"registry survives reopening")?;
+    job_true()
+}
+
+def main()->i64{
+    let args=cli_arguments();if not args.is_ok(){return 2;};let database=cli_option(&args.value,"database","");if not database.is_ok(){return 2;};
+    let result=jobs_tests(database.value.as_str(),cli_current_directory().unwrap_or(string_new()).as_str());
+    if not result.is_ok(){println(result.error);return 1;};println("job frames, durable admission, cursor retention and authority separation passed");0
+}

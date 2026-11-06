@@ -1,0 +1,40 @@
+import sessions;
+import permissions;
+
+// Local session preferences, never an authorization source from imported
+// project history. Running requests retain their explicit submit snapshot.
+def session_permissions_value(mode: &str, commands: bool, profile: &str) -> Result<JsonDoc, i64> {
+    if mode != "manual" and mode != "auto" and mode != "full" or profile != "strict" and profile != "backend" { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let value = json_doc_object()?; cli_put_i64(&value, value.root(), "schema", 1)?;
+    cli_put_string(&value, value.root(), "mode", mode)?;
+    cli_put_bool(&value, value.root(), "allow_commands", commands or mode == "full")?;
+    cli_put_string(&value, value.root(), "profile", profile)?;
+    Result { is_ok: true, value: value, error: 0 }
+}
+
+def session_permissions_load(state: &CliState, session: &str) -> Result<JsonDoc, i64> {
+    let modes = cli_state_modes(state, session)?;
+    if not modes.root().object_has("cli_permissions") { return session_permissions_value("manual", false, "strict"); };
+    let value = modes.root().object_get("cli_permissions")?;
+    if value.kind()? != JSON_KIND_OBJECT() or cli_json_optional_i64(value, "schema", 0) != 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    session_permissions_value(cli_json_string(value, "mode")?.as_str(), value.object_get("allow_commands")?.bool_value()?, cli_json_string(value, "profile")?.as_str())
+}
+
+def session_permissions_restore(state: &CliState, session: &str, policy: &mut AgentPolicy) -> Result<JsonDoc, i64> {
+    let value = session_permissions_load(state, session)?;
+    permission_apply(policy, cli_json_string(value.root(), "mode")?.as_str());
+    Result { is_ok: true, value: value, error: 0 }
+}
+
+def session_permissions_save(state: &CliState, session: &str, policy: &AgentPolicy, commands: bool, profile: &str) -> Result<bool, i64> {
+    let value = session_permissions_value(permission_mode(policy), commands, profile)?; let raw = value.serialize_string()?;
+    let lock_path = state_lock_path(state.path.as_str(), "session", session)?; let lease = file_lock(lock_path.as_str())?;
+    session_idle(state, session)?;
+    let mut tx = state.db.transaction()?;
+    let mut unchanged = tx.prepare("SELECT 1 FROM shared_modes WHERE session_id=? AND json_extract(mode_json,'$.cli_permissions')=json(?)")?;
+    unchanged.bind_text(1, session)?; unchanged.bind_text(2, raw.as_str())?;
+    if unchanged.step()? { tx.commit()?; return Result { is_ok: true, value: true, error: 0 }; };
+    let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,json_object('cli_permissions',json(?)),?) ON CONFLICT(session_id) DO UPDATE SET mode_json=json_set(shared_modes.mode_json,'$.cli_permissions',json(?)),updated_at=excluded.updated_at")?;
+    save.bind_text(1, session)?; save.bind_text(2, raw.as_str())?; save.bind_i64(3, time_unix_ms())?; save.bind_text(4, raw.as_str())?; save.step()?;
+    tx.commit()?; Result { is_ok: true, value: true, error: 0 }
+}

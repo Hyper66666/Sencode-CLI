@@ -1,0 +1,45 @@
+import tui;
+
+def image_test_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 99 }; }; tui_true() }
+def image_test_key(code: i64) -> TerminalEvent { TerminalEvent { kind: 1, code: code, modifiers: 0, width: 100, height: 30, data: string_new() } }
+def image_test_paths() -> Result<JsonDoc, i64> { let doc = json_doc_object()?; let paths = doc.new_array()?; paths.array_push(doc.new_string("D:/fixtures/中文 one.png")?)?; paths.array_push(doc.new_string("D:/fixtures/two.jpg")?)?; doc.root().object_set("paths", paths)?; Result { is_ok: true, value: doc, error: 0 } }
+
+def image_ui_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "api", "model", "images"); let paths = image_test_paths()?; tui_image_insert(&mut app, paths.root().object_get("paths")?)?;
+    image_test_assert(app.draft.as_str() == "[image1] [image2]" and app.images.len() == 2, "image paths insert display chips without losing their original paths")?;
+    let expanded = images_expand(app.draft.as_str(), &app.images)?;
+    image_test_assert(expanded.root().object_get("images")?.array_len()? == 2 and str_contains(cli_json_string(expanded.root(), "text")?.as_str(), "\"D:/fixtures/中文 one.png\""), "image chips expand to structured images and quoted original paths")?;
+    let paint = tui_paint_update(&mut app, true)?;
+    image_test_assert(str_contains(paint.as_str(), "\x1b[1;34m[image1]\x1b[0m") and str_contains(paint.as_str(), "\x1b[1;34m[image2]\x1b[0m"), "only image token spans receive the blue style")?;
+    app.previous_frame.clear(); let plain = tui_paint_update(&mut app, false)?; image_test_assert(not str_contains(plain.as_str(), "\x1b[1;34m"), "NO_COLOR retains plain chip text")?;
+    let original = app.draft.clone()?; let backspace = image_test_key(8); tui_event(&mut app, &backspace)?;
+    image_test_assert(app.draft.as_str() == "[image1] " and app.cursor == 9, "Backspace immediately after actual insertion removes the complete final chip at its unchanged insertion cursor")?;
+    let mut middle = tui_new("D:/fixture", "api", "model", "middle"); tui_set_draft(&mut middle, "beforeafter")?; middle.cursor = 6; tui_image_insert(&mut middle, paths.root().object_get("paths")?)?; tui_event(&mut middle, &backspace)?;
+    image_test_assert(not str_contains(middle.draft.as_str(), "[image2]") and str_ends_with(middle.draft.as_str(), " after"), "middle-of-draft image insertion keeps its cursor before suffix spacing so one Backspace removes the chip")?;
+    tui_set_draft(&mut app, original.as_str())?; app.cursor = 8; tui_event(&mut app, &backspace)?;
+    image_test_assert(app.draft.as_str() == " [image2]" and app.cursor == 0 and app.images.len() == 2, "one Backspace deletes the entire chip while retaining references for queue and stash")?;
+    image_test_assert(images_expand(original.as_str(), &app.images)?.root().object_get("images")?.array_len()? == 2, "deleted draft chip remains resolvable in older queued or stashed text")?;
+    tui_set_draft(&mut app, original.as_str())?; app.cursor = 0; let delete = image_test_key(1007); tui_event(&mut app, &delete)?;
+    image_test_assert(app.draft.as_str() == " [image2]", "Delete at chip start deletes the complete chip")?;
+    tui_set_draft(&mut app, "a [image1] z")?; app.cursor = 10; let left = image_test_key(1004); let right = image_test_key(1003); tui_event(&mut app, &left)?;
+    image_test_assert(app.cursor == 2, "left movement skips to chip start")?; tui_event(&mut app, &right)?; image_test_assert(app.cursor == 10, "right movement skips to chip end")?;
+    let word_erase = image_test_key(23); tui_event(&mut app, &word_erase)?; image_test_assert(not str_contains(app.draft.as_str(), "image1"), "word deletion cannot leave a partial chip")?;
+    tui_set_draft(&mut app, "a [image1] z")?; app.keymap.mode = cli_text("vim"); app.vim.insert = false; app.cursor = 2; let x = image_test_key(120); tui_event(&mut app, &x)?;
+    image_test_assert(app.draft.as_str() == "a  z", "Vim x deletes the entire image atom")?; let undo = image_test_key(117); tui_event(&mut app, &undo)?;
+    image_test_assert(app.draft.as_str() == "a [image1] z", "Vim undo restores an intact chip")?;
+    app.keymap.mode = cli_text("default"); app.vim = keys_vim_new(); tui_set_draft(&mut app, "line one\n[image1] suffix\nlast")?; app.cursor = app.draft.len(); let up = image_test_key(1001); tui_event(&mut app, &up)?;
+    image_test_assert(images_snap(app.draft.as_str(), app.cursor, true)? == app.cursor, "vertical movement cannot enter chip internals")?;
+    let snapped = images_atomic_edit("[image1]", 8, "[image1]", 4)?; image_test_assert(snapped.cursor == 0, "generic cursor snapping protects word and custom key movements")?;
+    tui_set_draft(&mut app, "[image1]")?; let mouse = TerminalMouseEvent { column: (app.width - tui_content_width(&app)) / 2 + 7, row: app.height - 4, button: 1, action: 1, scroll_x: 0, scroll_y: 0, clicks: 1, modifiers: 0 }; tui_mouse(&mut app, &mouse)?;
+    image_test_assert(app.cursor == 0 or app.cursor == 8, "mouse positioning cannot enter an image chip")?;
+    let home = image_test_key(1005); let end = image_test_key(1006); tui_event(&mut app, &home)?; image_test_assert(app.cursor == 0, "Home lands on the chip start")?; tui_event(&mut app, &end)?; image_test_assert(app.cursor == 8, "End lands on the chip end")?;
+    app.history.clear(); app.history.push(InputHistory { text: cli_text("[image2]") }); app.history_index = 1; tui_event(&mut app, &up)?; image_test_assert(app.draft.as_str() == "[image2]", "history restores a whole image token instead of treating a changed ID as a local edit")?;
+    tui_set_draft(&mut app, "[image1]")?; app.keymap.mode = cli_text("vim"); app.vim.insert = false; app.vim.undo.push(UiUndo { text: cli_text("[image2]"), cursor: 8 }); app.vim.undo_bytes = 8; tui_event(&mut app, &undo)?; image_test_assert(app.draft.as_str() == "[image2]", "Vim snapshot restore preserves a changed complete image ID")?; app.keymap.mode = cli_text("default"); app.vim = keys_vim_new();
+    let wrapped = images_layout("123456 [image1]", 15, 10)?; image_test_assert(wrapped.lines.len() == 2 and wrapped.lines.get(1).text.as_str() == "[image1]", "image chip wraps as one display element")?;
+    tui_set_draft(&mut app, original.as_str())?; let more = json_doc_object()?; let additions = more.new_array()?; let mut index = 0;
+    while index < 8 { let path = cli_text("D:/fixtures/extra-"); path.push_i64(index)?; path.push_str(".png")?; additions.array_push(more.new_string(path.as_str())?)?; index = index + 1; };
+    let rejected = tui_image_insert(&mut app, additions); image_test_assert(not rejected.is_ok() and app.images.len() == 2 and app.draft.as_str() == original.as_str(), "more than eight unique images rejects atomically without altering draft or mapping")?;
+    let alt_v = TerminalEvent { kind: 1, code: 118, modifiers: 2, width: 100, height: 30, data: cli_text("v") }; image_test_assert(tui_event(&mut app, &alt_v)?.kind == 8, "Alt+V requests explicit clipboard inspection")?;
+    tui_set_approval(&mut app, "no-paste", "Question", true)?; image_test_assert(tui_event(&mut app, &alt_v)?.kind != 8, "clipboard image action cannot penetrate a question overlay")?;
+    println("image UI: blue atomic chips, deletion, cursor, wrapping, original paths, retained mappings and limits passed"); tui_true()
+}

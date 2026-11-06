@@ -1,0 +1,66 @@
+import tui;
+
+def scroll_expect(ok: bool, label: &str) -> Result<bool, i64> {
+    if not ok { cli_diagnostic(label); return Result { is_ok: false, value: false, error: 99 }; }; tui_true()
+}
+
+def scroll_wheel(delta: i64) -> TerminalMouseEvent { TerminalMouseEvent { column: 3, row: 5, button: 0, action: 4, scroll_x: 0, scroll_y: delta, clicks: 0, modifiers: 0 } }
+
+def scroll_blank(app: &UiApp) -> Result<bool, i64> {
+    let rows = tui_frame_rows(app)?; let width = tui_content_width(app); let expected = ui_repeat(" ", (app.width - width) / 2)?;
+    expected.push_str("│ > ")?; expected.push_str(ui_repeat(" ", width - 6)?.as_str())?; expected.push_str(" │")?;
+    scroll_expect(rows.get(app.height - 4).text.as_str() == expected.as_str(), "empty composer has no placeholder in idle or busy state")
+}
+
+def scroll_tests(width: i64, colored: bool) -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "provider", "model", "scroll"); tui_resize(&mut app, width, 40)?;
+    scroll_blank(&app)?; tui_begin(&mut app)?; scroll_blank(&app)?; tui_finish(&mut app, true)?;
+    let text = string_new(); let mut index = 0;
+    while index < 180 { text.push_str("line ")?; text.push_i64(index)?; text.push_str(" 中文 é [code]\n")?; index = index + 1; };
+    tui_message(&mut app, "assistant", text.as_str())?;
+    tui_paint_update(&mut app, colored)?;
+    let small = scroll_wheel(10); let mut count = 0;
+    while count < 3 { tui_mouse(&mut app, &small)?; scroll_expect(app.scroll == 0 and not app.mouse_changed, "sub-line wheel movement is accumulated without a redundant paint")?; count = count + 1; };
+    tui_mouse(&mut app, &small)?; scroll_expect(app.scroll == 1 and app.mouse_changed, "four small deltas produce one line instead of disappearing")?;
+    let shifted = tui_paint_update(&mut app, colored)?;
+    scroll_expect(str_contains(shifted.as_str(), "r\x1b[3;1H\x1b[1T") and not str_contains(shifted.as_str(), "\x1b[?25"), "older history uses a validated region shift without toggling cursor")?;
+    let full = tui_frame(&app)?;
+    scroll_expect(shifted.len() * 3 < full.len(), "one-row scrolling writes less than one third of a complete frame")?;
+    scroll_expect(tui_paint_update(&mut app, colored)?.len() == 0, "stationary scroll view is completely idle")?;
+    tui_mouse(&mut app, &scroll_wheel(-40))?; let reverse = tui_paint_update(&mut app, colored)?;
+    scroll_expect(app.scroll == 0 and str_contains(reverse.as_str(), "r\x1b[3;1H\x1b[1S"), "reverse wheel direction shifts the message region forward")?;
+    tui_scroll(&mut app, 100000)?; let visible = tui_view_height(&app)?;
+    scroll_expect(app.scroll == app.transcript.len() + tui_live_rows(&app) - visible, "oldest position retains a full viewport")?;
+    let oldest = tui_frame_rows(&app)?;
+    let initial = ui_repeat(" ", (app.width - tui_content_width(&app)) / 2)?; initial.push_str(app.transcript.get(0).text.as_str())?;
+    scroll_expect(oldest.get(2).text.as_str() == initial.as_str(), "oldest page starts with first transcript row")?;
+    tui_paint_update(&mut app, colored)?;
+    tui_set_draft(&mut app, "draft 中文")?; tui_paint_update(&mut app, colored)?;
+    let draft = app.draft.clone()?; let cursor = app.cursor; tui_scroll(&mut app, -2)?; tui_paint_update(&mut app, colored)?;
+    scroll_expect(app.draft.as_str() == draft.as_str() and app.cursor == cursor, "scroll does not alter draft or input cursor")?;
+    tui_set_approval(&mut app, "fixture", "Permission?", false)?; tui_paint_update(&mut app, colored)?;
+    let before = app.scroll; tui_mouse(&mut app, &scroll_wheel(120))?;
+    scroll_expect(app.scroll == before and not app.mouse_changed and app.wheel_remainder == 0, "approval owns focus and discards stale wheel remainder")?;
+    let escape = TerminalEvent { kind: 1, code: 27, modifiers: 0, width: width, height: 40, data: string_new() }; tui_event(&mut app, &escape)?;
+    let after_overlay = tui_paint_update(&mut app, colored)?;
+    scroll_expect(not str_contains(after_overlay.as_str(), "r\x1b[3;1H"), "closing an overlay never reuses its viewport as message history")?;
+    tui_scroll(&mut app, -1)?; tui_resize(&mut app, width - 2, 38)?;
+    let resized = tui_paint_update(&mut app, colored)?;
+    scroll_expect(not str_contains(resized.as_str(), "r\x1b[3;1H"), "resize invalidates region reuse")?;
+    tui_mouse(&mut app, &scroll_wheel(10))?;
+    let picker_first = tui_wheel_steps(&mut app, 90, "models", 1)?;
+    let picker_next = tui_wheel_steps(&mut app, 30, "models", 1)?;
+    scroll_expect(picker_first == 0 and picker_next == 1, "focus change resets fractional input before picker navigation")?;
+    tui_true()
+}
+
+def main() -> i64 {
+    let mut index = 0;
+    while index < 3 {
+        let width = if index == 0 { 80 } else { if index == 1 { 120 } else { 160 } };
+        let result = scroll_tests(width, true); if not result.is_ok() { println(result.error); return 1; };
+        let plain = scroll_tests(width, false); if not plain.is_ok() { println(plain.error); return 1; };
+        index = index + 1;
+    };
+    println("scroll: 80/120/160 columns, fractional wheel, shifted rows, idle, focus, resize, draft and blank composer passed"); 0
+}

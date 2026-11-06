@@ -1,0 +1,132 @@
+import scheduler;
+import tool_schedule;
+import std::process;
+import std::time;
+
+def expect_schedule_process(value: bool, message: &str) -> i64 {
+    if value { return 0; };
+    cli_diagnostic(message); 1
+}
+
+def scheduling_probe_spawn(command: &str) -> Result<ProcessHandle, i64> {
+    let builder = process_command("powershell.exe")?;
+    builder.arg("-NoLogo")?; builder.arg("-NoProfile")?;
+    builder.arg("-NonInteractive")?; builder.arg("-Command")?;
+    builder.arg(command)?;
+    let process = builder.spawn_piped()?;
+    process.close_stdin()?;
+    Result { is_ok: true, value: process, error: 0 }
+}
+
+def scheduling_probe_quiet(process: &ProcessHandle, buffer: &mut Buffer) -> Result<bool, i64> {
+    process.read_stdout(buffer)?; process.read_stderr(buffer)?;
+    Result { is_ok: true, value: process.try_wait()? and process.stdout_eof()? and process.stderr_eof()? and process.tree_quiescent()?, error: 0 }
+}
+
+def scheduling_probe_stop(process: &ProcessHandle) -> Result<bool, i64> {
+    process.terminate_tree()?;
+    let started = time_unix_ms();
+    let mut buffer = ffi_buffer_new(8192)?;
+    loop {
+        if scheduling_probe_quiet(process, &mut buffer)? { return Result { is_ok: true, value: true, error: 0 }; };
+        if time_since_ms(started) >= 10000 { return Result { is_ok: false, value: false, error: 12 }; };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: false, value: false, error: 12 }
+}
+
+def check_schedule_process() -> Result<i64, i64> {
+    let mut failures = 0;
+    let scheduler = scheduler_new();
+    let owner = scheduler_add(&scheduler, 0, "fixture", ".", true)?;
+    let empty = json_parse("{}")?;
+    let shell = json_parse("{\"command\":\"fixture\"}")?;
+    let batch = tool_schedule_new(2)?;
+    tool_schedule_add(&batch, "read-one", "git_status", &empty, false, -1)?;
+    tool_schedule_add(&batch, "read-two", "git_diff", &empty, false, -1)?;
+    tool_schedule_add(&batch, "effect", "run_command", &shell, false, -1)?;
+    tool_schedule_seal(&batch);
+    let first_ordinal = tool_schedule_next(&batch)?;
+    let first_lease = scheduler_begin_tool(&scheduler, owner)?;
+    let first = scheduling_probe_spawn("[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Milliseconds 300")?;
+    let second_ordinal = tool_schedule_next(&batch)?;
+    let second_lease = scheduler_begin_tool(&scheduler, owner)?;
+    let second = scheduling_probe_spawn("[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Milliseconds 100")?;
+    println("process schedule: simultaneous read jobs");
+    failures = failures + expect_schedule_process(first_ordinal == 0 and second_ordinal == 1 and tool_schedule_active(&batch) == 2 and not first.try_wait()? and not second.try_wait()?, "Two process-backed reads are live concurrently before either is awaited");
+    failures = failures + expect_schedule_process(tool_schedule_next(&batch)? == -1, "Effectful successor cannot start beside live reads");
+    let mut buffer = ffi_buffer_new(8192)?;
+    let mut first_bytes = 0;
+    let mut second_bytes = 0;
+    let started = time_unix_ms();
+    while tool_schedule_active(&batch) != 0 {
+        first_bytes = first_bytes + first.read_stdout(&mut buffer)?;
+        first_bytes = first_bytes + first.read_stderr(&mut buffer)?;
+        second_bytes = second_bytes + second.read_stdout(&mut buffer)?;
+        second_bytes = second_bytes + second.read_stderr(&mut buffer)?;
+        if tool_schedule_state(&batch, 0) == 1 and first.try_wait()? and first.stdout_eof()? and first.stderr_eof()? and first.tree_quiescent()? {
+            scheduler_end_tool(&scheduler, owner, first_lease, true)?;
+            tool_schedule_complete(&batch, 0, first.exit_code()? == 0, true)?;
+            ();
+        };
+        if tool_schedule_state(&batch, 1) == 1 and second.try_wait()? and second.stdout_eof()? and second.stderr_eof()? and second.tree_quiescent()? {
+            scheduler_end_tool(&scheduler, owner, second_lease, true)?;
+            tool_schedule_complete(&batch, 1, second.exit_code()? == 0, true)?;
+            ();
+        };
+        if time_since_ms(started) >= 10000 { scheduling_probe_stop(&first)?; scheduling_probe_stop(&second)?; return cli_fail(12); };
+        time_sleep_ms(1);
+    };
+    failures = failures + expect_schedule_process(first_bytes == 6 and second_bytes == 6 and tool_schedule_publish_next(&batch) == 0 and tool_schedule_publish_next(&batch) == 1, "Both stdout and stderr drain without losing declared result order");
+    failures = failures + expect_schedule_process(tool_schedule_next(&batch)? == 2 and scheduler_acquire_write(&scheduler, owner)?, "Writer becomes runnable only after both process trees settle");
+    let write_lease = scheduler_begin_tool(&scheduler, owner)?;
+    let writer = scheduling_probe_spawn("[Console]::Out.Write('write'); Start-Sleep -Milliseconds 100")?;
+    let write_started = time_unix_ms();
+    while not scheduling_probe_quiet(&writer, &mut buffer)? {
+        if time_since_ms(write_started) >= 10000 { scheduling_probe_stop(&writer)?; return cli_fail(12); };
+        time_sleep_ms(1);
+    };
+    scheduler_end_tool(&scheduler, owner, write_lease, true)?;
+    tool_schedule_complete(&batch, 2, writer.exit_code()? == 0, true)?;
+    scheduler_release_write(&scheduler, owner)?;
+    failures = failures + expect_schedule_process(tool_schedule_quiescent(&batch), "Successful real process batch drains and releases its write lease");
+
+    println("process schedule: grandchild cancellation and FIFO handoff");
+    let canceled = tool_schedule_new(1)?;
+    tool_schedule_add(&canceled, "tree", "run_command", &shell, false, -1)?;
+    tool_schedule_seal(&canceled);
+    tool_schedule_next(&canceled)?;
+    scheduler_acquire_write(&scheduler, owner)?;
+    let tree_lease = scheduler_begin_tool(&scheduler, owner)?;
+    let tree = scheduling_probe_spawn("Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru -WindowStyle Hidden | ForEach-Object { [Console]::Out.Write('child-ready') }; Start-Sleep -Seconds 30")?;
+    let wait_started = time_unix_ms();
+    let mut ready = false;
+    while not ready {
+        if tree.read_stdout(&mut buffer)? > 0 { ready = true; };
+        tree.read_stderr(&mut buffer)?;
+        if time_since_ms(wait_started) >= 10000 { scheduling_probe_stop(&tree)?; return cli_fail(12); };
+        time_sleep_ms(1);
+    };
+    let successor = scheduler_add(&scheduler, 0, "fixture-two", "./src/..", true)?;
+    failures = failures + expect_schedule_process(not scheduler_acquire_write(&scheduler, successor)?, "Canonical workspace successor queues behind live tree");
+    scheduler_cancel_tree(&scheduler, owner);
+    tool_schedule_cancel(&canceled);
+    let premature_end = scheduler_end_tool(&scheduler, owner, tree_lease, false);
+    let premature_release = scheduler_confirm_quiescent(&scheduler, owner);
+    failures = failures + expect_schedule_process(not premature_end.is_ok() and not premature_release.is_ok() and not scheduler_acquire_write(&scheduler, successor)? and not tool_schedule_quiescent(&canceled), "Cancellation alone never lets the next writer overlap a live grandchild");
+    scheduling_probe_stop(&tree)?;
+    failures = failures + expect_schedule_process(tree.tree_quiescent()?, "Process job confirms direct child and grandchild are quiescent");
+    scheduler_end_tool(&scheduler, owner, tree_lease, tree.tree_quiescent()?)?;
+    tool_schedule_complete(&canceled, 0, false, true)?;
+    failures = failures + expect_schedule_process(scheduler_confirm_quiescent(&scheduler, owner)? and scheduler_acquire_write(&scheduler, successor)? and tool_schedule_quiescent(&canceled), "FIFO handoff occurs after real process-tree cleanup");
+    scheduler_release_write(&scheduler, successor)?;
+    cli_ok(failures)
+}
+
+def main() -> i64 {
+    let result = check_schedule_process();
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_process_live_resource_count() != 0 or sengoo_process_live_handle_count() != 0 { cli_diagnostic("Scheduling probe leaked a process resource"); return 1; };
+    if result.value == 0 { println("process scheduling acceptance passed"); };
+    result.value
+}

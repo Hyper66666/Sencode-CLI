@@ -1,0 +1,248 @@
+import controller;
+import session_target;
+import session_permissions;
+import runtime_adapter;
+import engine_managed;
+import config_catalog;
+import model_selection;
+import execution_diagnostics;
+
+def engine_submit_valid(command: &JsonDoc) -> Result<bool, i64> {
+    if command.root().kind()? != JSON_KIND_OBJECT() { return Result { is_ok: false, value: false, error: 2 }; };
+    let keys = command.root().object_keys()?;
+    let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        if key.as_str() != "type" and key.as_str() != "id" and key.as_str() != "text" and key.as_str() != "connection" and key.as_str() != "model" and key.as_str() != "effort" and key.as_str() != "plan" and key.as_str() != "auto_edit" and key.as_str() != "allow_commands" and key.as_str() != "full_access" and key.as_str() != "maximum_requests" and key.as_str() != "token_budget" and key.as_str() != "operation" and key.as_str() != "goal" and key.as_str() != "checks" and key.as_str() != "permission_profile" and key.as_str() != "images" {
+            return Result { is_ok: false, value: false, error: 2 };
+        };
+        if key.as_str() == "type" or key.as_str() == "connection" or key.as_str() == "model" or key.as_str() == "text" or key.as_str() == "id" or key.as_str() == "operation" or key.as_str() == "goal" or key.as_str() == "permission_profile" {
+            if not command.root().object_get(key.as_str())?.string_value().is_ok() { return Result { is_ok: false, value: false, error: 2 }; };
+        };
+        if key.as_str() == "plan" or key.as_str() == "auto_edit" or key.as_str() == "allow_commands" or key.as_str() == "full_access" {
+            if not command.root().object_get(key.as_str())?.bool_value().is_ok() { return Result { is_ok: false, value: false, error: 2 }; };
+        };
+        if key.as_str() == "maximum_requests" or key.as_str() == "token_budget" {
+            if not command.root().object_get(key.as_str())?.number_i64().is_ok() { return Result { is_ok: false, value: false, error: 2 }; };
+        };
+        index = index + 1;
+    };
+    if command.root().object_has("effort") { let effort = cli_json_string(command.root(), "effort")?; if effort.len() != effort.as_str().len() or not connection_effort_valid(effort.as_str()) { return state_bool_error(2); }; };
+    if command.root().object_has("images") and not image_paths_valid(command.root().object_get("images")?) { return state_bool_error(2); };
+    let id = cli_json_string(command.root(), "id")?;
+    let text = cli_json_string(command.root(), "text")?;
+    if cli_json_optional_string(command.root(), "type").as_str() != "submit" or id.len() == 0 or id.len() > 128 or text.len() == 0 { return Result { is_ok: false, value: false, error: 2 }; };
+    let operation = cli_json_optional_string(command.root(), "operation");
+    let permissions = cli_json_optional_string(command.root(), "permission_profile");
+    if permissions.len() > 0 and permissions.as_str() != "strict" and permissions.as_str() != "backend" { return Result { is_ok: false, value: false, error: 2 }; };
+    if operation.len() > 0 and operation.as_str() != "turn" and operation.as_str() != "compact" and operation.as_str() != "consult" { return Result { is_ok: false, value: false, error: 2 }; };
+    if command.root().object_has("checks") {
+        let checks = command.root().object_get("checks")?;
+        let count = checks.array_len()?;
+        if count > 32 { return Result { is_ok: false, value: false, error: 13 }; };
+        let mut check_index = 0;
+        while check_index < count { let check = checks.array_get(check_index)?.string_value()?; if check.len() == 0 or check.len() > 8192 { return Result { is_ok: false, value: false, error: 2 }; }; check_index = check_index + 1; };
+    };
+    let maximum = cli_json_optional_i64(command.root(), "maximum_requests", 50);
+    let tokens = cli_json_optional_i64(command.root(), "token_budget", 0);
+    if maximum < 1 or maximum > 10000 or tokens < 0 or text.len() > 131072 or cli_json_optional_string(command.root(), "goal").len() > 131072 { return Result { is_ok: false, value: false, error: 2 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_submit_full_access(command: &JsonDoc) -> Result<bool, i64> {
+    if not command.root().object_has("full_access") { return Result { is_ok: true, value: false, error: 0 }; };
+    command.root().object_get("full_access")?.bool_value()
+}
+
+def engine_apply_submit_permissions(options: &mut AgentOptions, command: &JsonDoc) -> Result<bool, i64> {
+    let previous_full = options.policy.full_access;
+    let requested_full = engine_submit_full_access(command)?;
+    if command.root().object_has("auto_edit") { options.policy.auto_edit = command.root().object_get("auto_edit")?.bool_value()?; }
+    else { if previous_full { options.policy.auto_edit = false; }; };
+    if command.root().object_has("allow_commands") { options.allow_commands = command.root().object_get("allow_commands")?.bool_value()?; }
+    else { if previous_full { options.allow_commands = false; }; };
+    options.policy.full_access = requested_full;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_result(options: &AgentOptions, id: &str, content: &str, code: i64) -> Result<bool, i64> {
+    engine_result_elapsed(options, id, content, code, -1)
+}
+
+// Additive host result fields; early admission failures keep the legacy API.
+def engine_result_elapsed(options: &AgentOptions, id: &str, content: &str, code: i64, elapsed_ms: i64) -> Result<bool, i64> {
+    let document = json_doc_object()?;
+    cli_put_i64(&document, document.root(), "schema", 1)?;
+    cli_put_string(&document, document.root(), "type", "result")?;
+    cli_put_string(&document, document.root(), "id", id)?;
+    cli_put_string(&document, document.root(), "request_id", id)?;
+    cli_put_string(&document, document.root(), "session_id", options.session.as_str())?;
+    cli_put_string(&document, document.root(), "connection_id", options.connection.as_str())?;
+    cli_put_string(&document, document.root(), "model", options.model.as_str())?;
+    cli_put_string(&document, document.root(), "content", content)?;
+    cli_put_i64(&document, document.root(), "code", code)?;
+    cli_put_bool(&document, document.root(), "success", code == 0)?;
+    if elapsed_ms >= 0 { cli_put_i64(&document, document.root(), "elapsed_ms", elapsed_ms)?; (); };
+    if code != 0 {
+        let diagnostic = execution_diagnostic_document(&options.input, code)?;
+        document.root().object_set("diagnostic", document.copy(diagnostic.root())?)?;
+        ();
+    };
+    output_document(&document)
+}
+
+def engine_request_seen(state: &CliState, options: &AgentOptions, id: &str) -> Result<bool, i64> {
+    let stored = cli_state_mode_load(state, options.session.as_str(), "engine_requests")?;
+    if not stored.root().object_has("value") { return Result { is_ok: true, value: false, error: 0 }; };
+    let accepted = stored.root().object_get("value")?.object_get("accepted")?;
+    let mut index = 0;
+    while index < accepted.array_len()? { if accepted.array_get(index)?.string_value()?.as_str() == id { return Result { is_ok: true, value: true, error: 0 }; }; index = index + 1; };
+    Result { is_ok: true, value: false, error: 0 }
+}
+
+def engine_select_target(state: &CliState, requested: &str, model: &str) -> Result<JsonDoc, i64> {
+    let mut selected = cli_text(requested);
+    if selected.len() == 0 { selected = cli_state_default_connection(state)?; };
+    if selected.len() == 0 {
+        let connections = cli_state_connections(state)?;
+        let entries = connections.root().object_get("connections")?;
+        if entries.array_len()? != 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+        selected = cli_json_string(entries.array_get(0)?, "id")?;
+    };
+    let metadata = cli_state_connection_metadata(state, selected.as_str())?;
+    if cli_json_string(metadata.root(), "engine")?.as_str() == "sengoo-native-api" {
+        let connection = controller_connection(state, selected.as_str(), model)?;
+        cli_put_string(&metadata, metadata.root(), "model", connection.model_id())?;
+        ();
+    } else { if model.len() > 0 { cli_put_string(&metadata, metadata.root(), "model", model)?; (); }; };
+    Result { is_ok: true, value: metadata, error: 0 }
+}
+
+def engine_selected_policy(options: &AgentOptions, metadata: &JsonDoc, operation: &str, token_budget: i64, permission_profile: &str) -> Result<bool, i64> {
+    if cli_json_string(metadata.root(), "engine")?.as_str() == "sengoo-native-api" {
+        let capabilities = runtime_native_capabilities();
+        return runtime_validate_policy(&capabilities, &options.policy, options.goal_text.len() > 0, token_budget);
+    };
+    if permission_profile != "backend" or options.policy.plan or options.policy.full_access or options.goal_text.len() > 0 or token_budget > 0 { return Result { is_ok: false, value: false, error: 7 }; };
+    if options.effort.len() > 0 { return Result { is_ok: false, value: false, error: 8 }; };
+    if operation.len() > 0 and operation != "turn" { return Result { is_ok: false, value: false, error: 8 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_selected_document(options: &AgentOptions, metadata: &JsonDoc) -> Result<JsonDoc, i64> {
+    let engine = cli_json_string(metadata.root(), "engine")?;
+    if engine.as_str() == "sengoo-native-api" { let capabilities = runtime_native_capabilities(); return runtime_policy_document(&capabilities, &options.policy); };
+    runtime_managed_policy_document(engine.as_str())
+}
+
+def engine_execute_selected(state: &CliState, options: &AgentOptions, metadata: &JsonDoc, prompt: &str, operation: &str, maximum_requests: i64, token_budget: i64, terminal: &Terminal) -> Result<String, i64> {
+    let empty = json_parse("{\"images\":[]}")?;
+    engine_execute_selected_with_images(state, options, metadata, prompt, operation, maximum_requests, token_budget, terminal, empty.root().object_get("images")?)
+}
+
+def engine_execute_selected_with_images(state: &CliState, options: &AgentOptions, metadata: &JsonDoc, prompt: &str, operation: &str, maximum_requests: i64, token_budget: i64, terminal: &Terminal, images: JsonValue) -> Result<String, i64> {
+    if not image_paths_valid(images) { return string_result_err(2); };
+    if images.array_len()? > 0 and operation.len() > 0 and operation != "turn" { cli_diagnostic("Image attachments are supported for normal native API turns only."); return string_result_err(7); };
+    session_target_save(state, options.session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str())?;
+    if cli_json_string(metadata.root(), "engine")?.as_str() != "sengoo-native-api" {
+        let history = cli_state_history(state, options.session.as_str())?;
+        if images.array_len()? > 0 or image_request_has_media(&history)? { cli_diagnostic("This managed account adapter has no verified image-input contract; images were not sent. Select a vision-enabled native API model."); return string_result_err(7); };
+        return engine_managed_turn(state, options, metadata, prompt, terminal);
+    };
+    if options.effort.len() > 0 { let catalog = config_snapshot(state)?; model_selection_target(&catalog, options.connection.as_str(), options.model.as_str(), options.effort.as_str())?; (); };
+    if operation == "compact" {
+        let result = controller_compact(state, options, maximum_requests, token_budget, terminal);
+        return if result.is_ok() { string_from_str("Context compacted; request accounting was preserved") } else { string_result_err(result.error) };
+    };
+    if operation == "consult" {
+        let reports = controller_consult(state, options, prompt, maximum_requests, token_budget, terminal);
+        return if reports.is_ok() { reports.value.serialize_string() } else { string_result_err(reports.error) };
+    };
+    controller_turn_with_images(state, options, prompt, maximum_requests, token_budget, terminal, images)
+}
+
+// Shared by the foreground host, redirected/headless output and scrolling
+// clients. A target is frozen before any request; no account/API failover.
+def engine_dispatch(state: &CliState, options: &mut AgentOptions, prompt: &str, operation: &str, maximum_requests: i64, token_budget: i64, terminal: &Terminal, permission_profile: &str) -> Result<String, i64> {
+    if operation.len() > 0 and operation != "turn" and operation != "compact" and operation != "consult" { return string_result_err(2); };
+    let metadata = engine_select_target(state, options.connection.as_str(), options.model.as_str())?;
+    let policy = engine_selected_policy(options, &metadata, operation, token_budget, permission_profile);
+    if not policy.is_ok() {
+        cli_diagnostic("The selected account backend requires explicit /permissions backend consent. Strict Plan, Goal, exact budgets, compact and consult are unavailable for managed account execution.");
+        return string_result_err(policy.error);
+    };
+    options.connection = cli_json_string(metadata.root(), "connection_id")?;
+    options.model = cli_json_string(metadata.root(), "model")?;
+    session_permissions_save(state, options.session.as_str(), &options.policy, options.allow_commands, permission_profile)?;
+    engine_execute_selected(state, options, &metadata, prompt, operation, maximum_requests, token_budget, terminal)
+}
+
+// Runs many submissions against one local session. The frontend remains a
+// separate process; all blocking waits pump the same bounded control queue.
+def engine_stdio(state: &CliState, options: &mut AgentOptions, maximum_requests: i64, token_budget: i64, terminal: &Terminal) -> Result<i64, i64> {
+    if terminal.is_tty() { return cli_fail(2); };
+    options.format = cli_text("host-json");
+    options.policy.interactive = true;
+    engine_control_init(&options.input)?;
+    let capabilities = runtime_native_capabilities();
+    let ready = runtime_policy_document(&capabilities, &options.policy)?;
+    cli_put_string(&ready, ready.root(), "type", "ready")?;
+    cli_put_i64(&ready, ready.root(), "schema", 1)?;
+    cli_put_string(&ready, ready.root(), "session_id", options.session.as_str())?;
+    output_document(&ready)?;
+    loop {
+        engine_control_poll(terminal, &options.input)?;
+        if engine_control_slot(&options.input, 93) >= 0 { break; };
+        let command = engine_control_next(&options.input)?;
+        if not command.root().object_has("type") { time_sleep_ms(2); continue; };
+        let id = cli_json_string(command.root(), "id")?;
+        execution_diagnostic_reset(&options.input);
+        let valid = engine_submit_valid(&command);
+        if not valid.is_ok() { engine_result(options, id.as_str(), "Unsupported or invalid submit field; session changes require a new idle host", 2)?; continue; };
+        if engine_request_seen(state, options, id.as_str())? { engine_result(options, id.as_str(), "Duplicate accepted submission was not replayed", 12)?; continue; };
+        let requested = cli_json_optional_string(command.root(), "connection");
+        let model = cli_json_optional_string(command.root(), "model");
+        let target = engine_select_target(state, if command.root().object_has("connection") { requested.as_str() } else { options.connection.as_str() }, if command.root().object_has("model") { model.as_str() } else { if command.root().object_has("connection") and requested.as_str() != options.connection.as_str() { "" } else { options.model.as_str() } });
+        if not target.is_ok() { engine_result(options, id.as_str(), "Requested connection/model or verified managed runtime is unavailable; no provider fallback occurred", target.error)?; continue; };
+        if command.root().object_has("plan") { options.policy.plan = command.root().object_get("plan")?.bool_value()?; };
+        // Full access is an explicit request snapshot, never inherited when a
+        // legacy/new submit omits it. Drop implicit legacy flags from the
+        // previous full snapshot unless this submit explicitly grants them.
+        engine_apply_submit_permissions(options, &command)?;
+        options.goal_text = cli_json_optional_string(command.root(), "goal");
+        options.checks = json_parse("{\"checks\":[]}")?;
+        if command.root().object_has("checks") { options.checks.root().object_set("checks", options.checks.copy(command.root().object_get("checks")?)?)?; (); };
+        options.connection = cli_json_string(target.value.root(), "connection_id")?;
+        options.model = cli_json_string(target.value.root(), "model")?;
+        options.effort = cli_json_optional_string(command.root(), "effort");
+        let max_requests = cli_json_optional_i64(command.root(), "maximum_requests", maximum_requests);
+        let tokens = cli_json_optional_i64(command.root(), "token_budget", token_budget);
+        let permissions = cli_json_optional_string(command.root(), "permission_profile");
+        let operation = cli_json_optional_string(command.root(), "operation");
+        let policy = engine_selected_policy(options, &target.value, operation.as_str(), tokens, permissions.as_str());
+        if not policy.is_ok() { engine_result(options, id.as_str(), "Managed account execution requires explicit /permissions backend consent. This backend cannot enforce strict Plan, Goal, exact budgets, compact or consult; native API token accounting also requires complete provider usage.", policy.error)?; continue; };
+        let remembered = session_permissions_save(state, options.session.as_str(), &options.policy, options.allow_commands, if permissions.len() == 0 { "strict" } else { permissions.as_str() });
+        if not remembered.is_ok() { engine_result(options, id.as_str(), "Session permissions could not be saved while the session is busy or unavailable; no request or tool was started. Retry after its owner finishes.", remembered.error)?; continue; };
+        engine_control_begin(&options.input, id.as_str())?;
+        let session = engine_selected_document(options, &target.value)?;
+        cli_put_string(&session, session.root(), "type", "session")?;
+        cli_put_string(&session, session.root(), "id", id.as_str())?;
+        cli_put_string(&session, session.root(), "request_id", id.as_str())?;
+        cli_put_string(&session, session.root(), "session_id", options.session.as_str())?;
+        cli_put_string(&session, session.root(), "connection_id", options.connection.as_str())?;
+        cli_put_string(&session, session.root(), "model", options.model.as_str())?;
+        output_document(&session)?;
+        let text = cli_json_string(command.root(), "text")?;
+        let empty_images = json_parse("{\"images\":[]}")?;
+        let images = if command.root().object_has("images") { command.root().object_get("images")? } else { empty_images.root().object_get("images")? };
+        let started = time_monotonic_ms();
+        let result = engine_execute_selected_with_images(state, options, &target.value, text.as_str(), operation.as_str(), max_requests, tokens, terminal, images);
+        let finished = time_monotonic_ms();
+        let elapsed = if started >= 0 and finished >= started { finished - started } else { -1 };
+        let failure = if result.is_ok() { string_new() } else { execution_diagnostic_content(&execution_diagnostic_document(&options.input, result.error)?)? };
+        engine_result_elapsed(options, id.as_str(), if result.is_ok() { result.value.as_str() } else { failure.as_str() }, if result.is_ok() { 0 } else { result.error }, elapsed)?;
+        engine_control_end(&options.input);
+        options.goal_text = string_new();
+    };
+    cli_ok(0)
+}

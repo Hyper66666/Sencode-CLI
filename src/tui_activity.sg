@@ -1,0 +1,55 @@
+import terminal;
+
+def tui_duration(elapsed_ms: i64) -> Result<String, i64> {
+    let seconds = if elapsed_ms > 0 { elapsed_ms / 1000 } else { 0 }; let out = string_new();
+    if seconds >= 3600 { out.push_i64(seconds / 3600)?; out.push_str("h")?; (); };
+    if seconds >= 60 { out.push_i64((seconds / 60) % 60)?; out.push_str("min")?; (); };
+    out.push_i64(seconds % 60)?; out.push_str("s")?;
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def tui_activity(app: &mut UiApp, phase: &str) -> Result<bool, i64> {
+    if phase != "thinking" and phase != "working" and phase != "waiting" and phase != "compacting" { return tui_true(); };
+    app.phase = cli_text(phase); tui_true()
+}
+
+// A provider continuation is another response in the same turn, not a turn
+// completion. Keep elapsed time, permissions, queue and the activity identity.
+def tui_continuation(app: &mut UiApp) -> Result<bool, i64> {
+    tui_seal_stream(app)?; tui_activity(app, "working")
+}
+
+def tui_activity_text(app: &UiApp, phase: &str) -> Result<String, i64> {
+    let waiting = app.approval.len() > 0 or phase == "waiting";
+    let text = cli_text(if waiting { "Waiting for approval" } else { if phase == "thinking" { "Thinking" } else { if phase == "compacting" { "Compacting" } else { "Working" } } });
+    if not waiting {
+        text.push_str(" ")?;
+        let step = app.animation_tick % 6;
+        text.push_str(if not app.animate_tools or app.picker.len() > 0 { "·" } else { if step == 0 or step == 5 { "✧" } else { if step == 1 or step == 4 { "✦" } else { "✶" } } })?; ();
+    };
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def tui_elapsed_note(app: &mut UiApp, elapsed_ms: i64, outcome: &str) -> Result<bool, i64> {
+    if elapsed_ms < 0 { return tui_true(); };
+    let text = cli_text(if outcome == "completed" or outcome == "idle" or outcome == "success" { "Worked for " } else { if outcome == "cancelled" or outcome == "interrupted" { "Cancelled after " } else { "Stopped after " } });
+    text.push_str(tui_duration(elapsed_ms)?.as_str())?;
+    tui_message(app, "elapsed", text.as_str())
+}
+
+def tui_finish_outcome(app: &mut UiApp, success: bool, elapsed_ms: i64, outcome: &str) -> Result<bool, i64> {
+    let anchor = tui_read_anchor(app); let active = app.busy; let duration = if elapsed_ms >= 0 { elapsed_ms } else { time_monotonic_ms() - app.turn_started };
+    tui_finish_body(app, success)?;
+    if active { tui_elapsed_note(app, duration, outcome)?; (); };
+    tui_restore_read_anchor(app, anchor); tui_true()
+}
+
+def tui_finish_elapsed(app: &mut UiApp, success: bool, elapsed_ms: i64) -> Result<bool, i64> {
+    tui_finish_outcome(app, success, elapsed_ms, if success { "completed" } else { "stopped" })
+}
+
+def tui_tool_phase(app: &mut UiApp, key: &str, phase: &str) -> Result<bool, i64> {
+    let slot = tui_tool_slot(app, key); if slot < 0 { return tui_true(); };
+    let message: &UiMessage = app.messages.get(slot);
+    if phase == "thinking" or phase == "working" or phase == "waiting" { message.tool_phase.clear(); message.tool_phase.push_str(phase)?; (); }; tui_true()
+}

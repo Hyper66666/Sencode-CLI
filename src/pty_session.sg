@@ -1,0 +1,303 @@
+import state;
+import workspace;
+import policy;
+import std::pty;
+
+// Explicit user terminals only. This module is deliberately absent from
+// workspace_tools, agent dispatch and managed-engine protocol methods.
+struct PtySessionSpec {
+    executable: String,
+    args: Vec<String>,
+    cwd: String,
+    env: JsonDoc,
+    inherit_env: bool,
+    columns: i64,
+    rows: i64,
+}
+struct PtySession {
+    process: PtyProcess,
+    lease: FileLock,
+    id: String,
+    workspace: String,
+    cwd: String,
+    display: Buffer,
+    dropped_bytes: i64,
+    bytes_seen: i64,
+    columns: i64,
+    rows: i64,
+    exited: bool,
+    exit_code: i64,
+    quiescent: bool,
+    lock_held: bool,
+    cleanup_unknown: bool,
+    closed: bool,
+}
+impl !Send for PtySession {}
+impl !Sync for PtySession {}
+
+def pty_session_empty() -> PtySession {
+    PtySession { process: PtyProcess { handle: 0 }, lease: FileLock { handle: 0 }, id: String { handle: 0 }, workspace: String { handle: 0 }, cwd: String { handle: 0 }, display: Buffer { handle: 0 }, dropped_bytes: 0, bytes_seen: 0, columns: 0, rows: 0, exited: false, exit_code: -1, quiescent: false, lock_held: false, cleanup_unknown: false, closed: true }
+}
+def pty_session_error(code: i64) -> Result<PtySession, i64> {
+    Result { is_ok: false, value: pty_session_empty(), error: code }
+}
+def pty_session_spec(executable: &str, cwd: &str) -> Result<PtySessionSpec, i64> {
+    let arguments: Vec<String> = vec_new();
+    Result { is_ok: true, value: PtySessionSpec { executable: string_from_str(executable)?, args: arguments, cwd: string_from_str(cwd)?, env: json_doc_object()?, inherit_env: false, columns: 96, rows: 28 }, error: 0 }
+}
+def pty_session_text_valid(text: &String, maximum: i64, empty: bool) -> bool {
+    if text.len() < 0 or text.len() > maximum or not empty and text.len() == 0 { return false; };
+    let bytes = text.bytes();
+    loop { let byte = bytes.next(); if not byte.is_some { break; }; if byte.value == 0 { return false; }; };
+    true
+}
+def pty_session_env_name_valid(name: &String) -> bool {
+    if not pty_session_text_valid(name, 256, false) { return false; };
+    let bytes = name.bytes();
+    loop {
+        let next = bytes.next(); if not next.is_some { break; }; let byte = next.value;
+        if not (byte >= 65 and byte <= 90 or byte >= 97 and byte <= 122 or byte >= 48 and byte <= 57 or byte == 95 or byte == 40 or byte == 41 or byte == 46 or byte == 45) { return false; };
+    };
+    true
+}
+def pty_session_spec_valid(spec: &PtySessionSpec) -> Result<bool, i64> {
+    // Whole-parent inheritance is not a CLI capability. The system allowlist
+    // below is always explicit, and provider/auth variables are never copied.
+    if spec.inherit_env { return state_bool_error(7); };
+    if not pty_session_text_valid(&spec.executable, 32768, false) or not pty_session_text_valid(&spec.cwd, 32768, false) or spec.args.len() > 128 or spec.columns < 1 or spec.columns > 1000 or spec.rows < 1 or spec.rows > 1000 { return state_bool_error(2); };
+    if spec.env.root().kind()? != JSON_KIND_OBJECT() { return state_bool_error(2); };
+    let mut index = 0;
+    while index < spec.args.len() {
+        let argument = spec.args.get(index)?;
+        if not pty_session_text_valid(&argument, 8192, true) { return state_bool_error(2); };
+        index = index + 1;
+    };
+    let keys = spec.env.root().object_keys()?;
+    if keys.root().array_len()? > 32 { return state_bool_error(13); };
+    let seen = json_doc_object()?;
+    index = 0;
+    while index < keys.root().array_len()? {
+        let name = keys.root().array_get(index)?.string_value()?;
+        if not pty_session_env_name_valid(&name) { return state_bool_error(2); };
+        let lower = str_to_ascii_lower(name.as_str())?;
+        if seen.root().object_has(lower.as_str()) { return state_bool_error(2); };
+        cli_put_bool(&seen, seen.root(), lower.as_str(), true)?;
+        let value = spec.env.root().object_get(name.as_str())?;
+        if not value.is_null() {
+            let text = value.string_value()?;
+            if not pty_session_text_valid(&text, 8192, true) { return state_bool_error(2); };
+            ();
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+def pty_session_no_reparse(path: &str) -> Result<bool, i64> {
+    let mut current = path_normalize_string(path)?;
+    let mut depth = 0;
+    while depth < 128 {
+        if file_kind(current.as_str())? != PATH_KIND_DIR() { return state_bool_error(7); };
+        if current.len() == 3 and str_contains(current.as_str(), ":") { return Result { is_ok: true, value: true, error: 0 }; };
+        let parent = path_parent_string(current.as_str())?;
+        if parent.len() == 0 or parent.as_str() == current.as_str() { return Result { is_ok: true, value: true, error: 0 }; };
+        current = parent; depth = depth + 1;
+    };
+    state_bool_error(13)
+}
+def pty_session_guard(workspace: &str, cwd: &str) -> Result<String, i64> {
+    if not path_is_absolute(workspace) or not path_is_absolute(cwd) { return string_result_err(7); };
+    if str_starts_with(workspace, "\\\\") or str_starts_with(cwd, "\\\\") or str_starts_with(workspace, "//") or str_starts_with(cwd, "//") { return string_result_err(7); };
+    let root_text = cli_text(workspace); let cwd_text = cli_text(cwd);
+    if not pty_session_text_valid(&root_text, 32768, false) or not pty_session_text_valid(&cwd_text, 32768, false) { return string_result_err(2); };
+    pty_session_no_reparse(workspace)?; pty_session_no_reparse(cwd)?;
+    let root = canonical_path_string(workspace)?; let current = canonical_path_string(cwd)?;
+    let lower_root = str_to_ascii_lower(path_normalize_string(root.as_str())?.as_str())?;
+    let lower_cwd = str_to_ascii_lower(path_normalize_string(current.as_str())?.as_str())?;
+    let separator = if env_is_windows() { "\\" } else { "/" };
+    let prefix = if str_ends_with(lower_root.as_str(), separator) { lower_root.clone()? } else { cli_join(lower_root.as_str(), separator)? };
+    if lower_cwd.as_str() != lower_root.as_str() and not str_starts_with(lower_cwd.as_str(), prefix.as_str()) { return string_result_err(7); };
+    Result { is_ok: true, value: current, error: 0 }
+}
+
+// JSON preview escapes terminal controls and identifies literal argv instead
+// of presenting an ambiguously re-parsed shell line. Do not log this snapshot.
+def pty_session_preview(workspace: &str, spec: &PtySessionSpec) -> Result<String, i64> {
+    pty_session_spec_valid(spec)?;
+    let cwd = pty_session_guard(workspace, spec.cwd.as_str())?;
+    let root = canonical_path_string(workspace)?;
+    let document = json_doc_object()?;
+    cli_put_i64(&document, document.root(), "schema", 1)?;
+    cli_put_string(&document, document.root(), "workspace", root.as_str())?;
+    cli_put_string(&document, document.root(), "cwd", cwd.as_str())?;
+    cli_put_string(&document, document.root(), "executable", spec.executable.as_str())?;
+    cli_put_bool(&document, document.root(), "inherit_env", false)?;
+    cli_put_string(&document, document.root(), "environment_policy", "system-allowlist-plus-explicit-user-edits")?;
+    cli_put_i64(&document, document.root(), "columns", spec.columns)?;
+    cli_put_i64(&document, document.root(), "rows", spec.rows)?;
+    let arguments = document.new_array()?;
+    document.root().object_set("args", arguments)?;
+    let mut index = 0;
+    while index < spec.args.len() { let argument = spec.args.get(index)?; arguments.array_push(document.new_string(argument.as_str())?)?; index = index + 1; };
+    document.root().object_set("env", document.copy(spec.env.root())?)?;
+    let serialized = document.serialize_string()?;
+    if serialized.len() > 262144 { return string_result_err(13); };
+    Result { is_ok: true, value: serialized, error: 0 }
+}
+def pty_session_approval_key(workspace: &str, spec: &PtySessionSpec) -> Result<String, i64> {
+    let preview = pty_session_preview(workspace, spec)?;
+    state_digest(preview.as_str())
+}
+def pty_session_system_env(command: &PtyCommand, name: &str) -> Result<bool, i64> {
+    if not env_has_var(name) { return Result { is_ok: true, value: true, error: 0 }; };
+    let buffer = ffi_buffer_new(32768)?;
+    let count = env_var_copy(name, buffer)?;
+    let value = string_from_buffer(buffer, count)?;
+    let key = cli_text(name);
+    command.env(&key, &value)
+}
+def pty_session_environment(command: &PtyCommand, overrides: &JsonDoc) -> Result<bool, i64> {
+    command.inherit_env(false)?;
+    pty_session_system_env(command, "SystemRoot")?; pty_session_system_env(command, "WINDIR")?;
+    pty_session_system_env(command, "PATH")?; pty_session_system_env(command, "PATHEXT")?;
+    pty_session_system_env(command, "ComSpec")?; pty_session_system_env(command, "TEMP")?; pty_session_system_env(command, "TMP")?;
+    pty_session_system_env(command, "USERPROFILE")?; pty_session_system_env(command, "HOMEDRIVE")?; pty_session_system_env(command, "HOMEPATH")?;
+    pty_session_system_env(command, "APPDATA")?; pty_session_system_env(command, "LOCALAPPDATA")?;
+    pty_session_system_env(command, "PROGRAMDATA")?; pty_session_system_env(command, "ProgramFiles")?;
+    pty_session_system_env(command, "ProgramFiles(x86)")?; pty_session_system_env(command, "ProgramW6432")?;
+    pty_session_system_env(command, "SYSTEMDRIVE")?; pty_session_system_env(command, "NUMBER_OF_PROCESSORS")?;
+    pty_session_system_env(command, "OS")?; pty_session_system_env(command, "PROCESSOR_ARCHITECTURE")?;
+    let keys = overrides.root().object_keys()?;
+    let mut index = 0;
+    while index < keys.root().array_len()? {
+        let name = keys.root().array_get(index)?.string_value()?;
+        let value = overrides.root().object_get(name.as_str())?;
+        if value.is_null() { command.env_remove(&name)?; (); } else { let text = value.string_value()?; command.env(&name, &text)?; (); };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+// approved/key come only from a fresh, explicit host user interaction. Never
+// infer approval from --allow-commands, model text, pending prompts or a tool.
+def pty_session_start(state: &CliState, workspace: &str, policy: &AgentPolicy, spec: PtySessionSpec, approved: bool, approval_key: &str) -> Result<PtySession, i64> {
+    if policy.plan or policy.depth != 0 or not policy.interactive or not approved { return pty_session_error(7); };
+    if not pty_available() { return pty_session_error(8); };
+    let expected = pty_session_approval_key(workspace, &spec)?;
+    if approval_key.len() != 64 or expected.as_str() != approval_key { return pty_session_error(7); };
+    let cwd = pty_session_guard(workspace, spec.cwd.as_str())?;
+    let root = canonical_path_string(workspace)?;
+    let lease = cli_state_workspace_lock(state, root.as_str())?;
+    let rechecked = pty_session_guard(workspace, spec.cwd.as_str())?;
+    if rechecked.as_str() != cwd.as_str() { return pty_session_error(7); };
+    let command = pty_command(&spec.executable)?;
+    command.cwd(&cwd)?;
+    let mut index = 0;
+    while index < spec.args.len() { let argument = spec.args.get(index)?; command.arg(&argument)?; index = index + 1; };
+    pty_session_environment(&command, &spec.env)?;
+    let display = ffi_buffer_new(262144)?;
+    let id = state_id("terminal-")?;
+    let process = command.spawn(spec.columns, spec.rows)?;
+    Result { is_ok: true, value: PtySession { process: process, lease: lease, id: id, workspace: root, cwd: cwd, display: display, dropped_bytes: 0, bytes_seen: 0, columns: spec.columns, rows: spec.rows, exited: false, exit_code: -1, quiescent: false, lock_held: true, cleanup_unknown: false, closed: false }, error: 0 }
+}
+def pty_session_refresh(session: &mut PtySession) -> Result<bool, i64> {
+    if session.closed { return Result { is_ok: true, value: true, error: 0 }; };
+    session.exited = session.process.try_wait()?;
+    session.quiescent = session.process.tree_quiescent()?;
+    if session.exited { session.exit_code = session.process.reap(0)?; };
+    if session.exited and session.quiescent and session.lock_held {
+        session.lease.close()?; session.lock_held = false;
+    };
+    Result { is_ok: true, value: session.exited and session.quiescent, error: 0 }
+}
+def pty_session_retain(session: &mut PtySession, bytes: &Buffer, count: i64) -> Result<bool, i64> {
+    if count < 0 or count > bytes.used_len() or count > 65536 { return state_bool_error(2); };
+    if session.bytes_seen > 9223372036854775807 - count { return state_bool_error(13); };
+    let overflow = session.display.used_len() + count - 262144;
+    if overflow > 0 {
+        let tail = ffi_buffer_new(262144)?;
+        tail.append_copy(&session.display, overflow, session.display.used_len() - overflow)?;
+        session.display.clear();
+        session.display.append_copy(&tail, 0, tail.used_len())?;
+        session.dropped_bytes = session.dropped_bytes + overflow;
+    };
+    session.display.append_copy(bytes, 0, count)?;
+    session.bytes_seen = session.bytes_seen + count;
+    Result { is_ok: true, value: true, error: 0 }
+}
+def pty_session_read(session: &mut PtySession, out: &mut Buffer) -> Result<i64, i64> {
+    if session.closed { return cli_fail(3); };
+    let count = session.process.read(out)?;
+    pty_session_retain(session, out, count)?;
+    pty_session_refresh(session)?;
+    cli_ok(count)
+}
+def pty_session_write(session: &PtySession, policy: &AgentPolicy, input: &Buffer, length: i64) -> Result<i64, i64> {
+    if policy.plan or policy.depth != 0 or not policy.interactive or session.closed or not session.lock_held { return cli_fail(7); };
+    session.process.write(input, length)
+}
+def pty_session_resize(session: &mut PtySession, columns: i64, rows: i64) -> Result<bool, i64> {
+    if session.closed { return state_bool_error(3); };
+    session.process.resize(columns, rows)?;
+    session.columns = columns; session.rows = rows;
+    Result { is_ok: true, value: true, error: 0 }
+}
+def pty_session_poll(session: &mut PtySession, events: i64, timeout_ms: i64) -> Result<i64, i64> {
+    if session.closed { return cli_fail(3); };
+    let ready = session.process.poll(events, timeout_ms)?;
+    pty_session_refresh(session)?;
+    cli_ok(ready)
+}
+def pty_session_display_copy(session: &PtySession, out: &mut Buffer) -> Result<i64, i64> {
+    if out.capacity() < session.display.used_len() { return cli_fail(4); };
+    out.clear(); out.append_copy(&session.display, 0, session.display.used_len())
+}
+def pty_session_status(session: &PtySession) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    cli_put_string(&document, document.root(), "id", session.id.as_str())?;
+    cli_put_string(&document, document.root(), "cwd", session.cwd.as_str())?;
+    cli_put_bool(&document, document.root(), "exited", session.exited)?;
+    cli_put_i64(&document, document.root(), "exit_code", session.exit_code)?;
+    cli_put_bool(&document, document.root(), "tree_quiescent", session.quiescent)?;
+    cli_put_bool(&document, document.root(), "lock_held", session.lock_held)?;
+    cli_put_bool(&document, document.root(), "cleanup_unknown", session.cleanup_unknown)?;
+    cli_put_bool(&document, document.root(), "closed", session.closed)?;
+    cli_put_i64(&document, document.root(), "bytes_seen", session.bytes_seen)?;
+    cli_put_i64(&document, document.root(), "dropped_bytes", session.dropped_bytes)?;
+    cli_put_i64(&document, document.root(), "retained_bytes", session.display.used_len())?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+def pty_session_close(session: &mut PtySession) -> Result<bool, i64> {
+    if session.closed { return Result { is_ok: true, value: true, error: 0 }; };
+    session.process.terminate_tree()?;
+    session.exit_code = session.process.reap(5000)?;
+    let started = time_unix_ms();
+    while not session.process.tree_quiescent()? {
+        if time_since_ms(started) >= 5000 { session.cleanup_unknown = true; return state_bool_error(11); };
+        time_sleep_ms(1);
+    };
+    session.process.close()?;
+    session.closed = true; session.exited = true; session.quiescent = true;
+    if session.lock_held { session.lease.close()?; session.lock_held = false; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+impl Drop for PtySession {
+    def drop(&mut self) {
+        if self.process.handle != 0 {
+            let terminated = sengoo_pty_process_terminate_tree(self.process.handle);
+            let reaped = sengoo_pty_process_reap(self.process.handle, 5000);
+            let mut quiet = sengoo_pty_process_tree_quiescent(self.process.handle);
+            let started = time_unix_ms();
+            while quiet == 0 and time_since_ms(started) < 5000 { time_sleep_ms(1); quiet = sengoo_pty_process_tree_quiescent(self.process.handle); };
+            let closed = sengoo_pty_process_close(self.process.handle);
+            if closed >= 0 { self.process.handle = 0; };
+            if terminated < 0 or reaped < 0 or quiet != 1 or closed < 0 {
+                // Fail closed: detach the wrapper without closing its native
+                // lock. Windows retains ownership until this CLI process exits.
+                self.cleanup_unknown = true; self.lease.handle = 0; self.lock_held = false;
+            };
+        } else {
+            if self.lock_held and not self.closed { self.cleanup_unknown = true; self.lease.handle = 0; self.lock_held = false; };
+        };
+        if self.lease.handle != 0 { let released = sengoo_file_lock_close(self.lease.handle); self.lease.handle = 0; };
+        ();
+    }
+}

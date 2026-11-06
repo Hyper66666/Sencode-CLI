@@ -1,0 +1,48 @@
+import tui;
+import tui_history;
+
+def turn_expect(value: bool, message: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(message); return Result { is_ok: false, value: false, error: 99 }; };
+    tui_true()
+}
+
+def turn_headings(rows: &Vec<UiLine>) -> i64 {
+    let mut index = 0; let mut headings = 0;
+    while index < rows.len() { if str_trim(rows.get(index).text.as_str()).unwrap_or(string_new()).as_str() == "SENCODE" { headings = headings + 1; }; index = index + 1; };
+    headings
+}
+
+def turn_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "turns"); tui_resize(&mut app, 120, 40)?;
+    tui_message(&mut app, "user", "question one")?; tui_begin(&mut app)?;
+    tui_delta(&mut app, "Before tools 中文")?;
+    turn_expect(turn_headings(&tui_frame_rows(&app)?) == 1, "first live stream has a speaker")?;
+    tui_tool(&mut app, "read", "read_file", "running", "one.txt", "")?;
+    tui_delta(&mut app, "Between tools 😀")?;
+    turn_expect(turn_headings(&tui_frame_rows(&app)?) == 1, "new stream after tool does not repeat its speaker")?;
+    tui_message(&mut app, "notice", "non-turn status")?;
+    tui_tool(&mut app, "read", "read_file", "completed", "", "")?;
+    tui_delta(&mut app, "After tools")?; tui_finish(&mut app, true)?;
+    turn_expect(turn_headings(&app.transcript) == 1 and app.messages.len() == 7, "content and identities remain separate under one speaker")?;
+    tui_reflow(&mut app)?;
+    turn_expect(turn_headings(&app.transcript) == 1, "reflow retains grouping")?;
+    tui_resize(&mut app, 80, 24)?;
+    turn_expect(turn_headings(&app.transcript) == 1, "narrow reflow retains grouping")?;
+    tui_resize(&mut app, 120, 60)?;
+    tui_message(&mut app, "user", "question two")?; tui_begin(&mut app)?; tui_delta(&mut app, "second answer")?;
+    turn_expect(turn_headings(&tui_frame_rows(&app)?) == 2, "new user message opens one new assistant heading")?;
+    tui_finish(&mut app, false)?;
+    let history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"restored question\"},{\"role\":\"assistant\",\"content\":\"before\",\"tool_calls\":[{\"id\":\"read\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"one.txt\\\"}\"}]},{\"role\":\"tool\",\"tool_call_id\":\"read\",\"content\":\"{\\\"is_error\\\":false,\\\"content\\\":\\\"read\\\"}\"},{\"role\":\"assistant\",\"content\":\"after\"}]}")?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &history)?;
+    turn_expect(turn_headings(&app.transcript) == 1, "restored tool history uses the live turn rule")?;
+    let internal = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"restored question\"},{\"role\":\"assistant\",\"content\":\"before internal continuation\"},{\"role\":\"user\",\"content\":\"PRIVATE_COORDINATOR_CONTEXT\",\"cli_internal\":true,\"cli_turn_elapsed_ms\":65000,\"cli_turn_outcome\":\"budget\"}]}")?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &internal)?;
+    let restored = tui_frame(&app)?;
+    turn_expect(app.messages.len() == 3 and turn_headings(&app.transcript) == 1 and not str_contains(restored.as_str(), "PRIVATE_COORDINATOR_CONTEXT") and str_contains(restored.as_str(), "Stopped after 1min5s"), "hidden coordinator context retains final elapsed metadata without creating another user turn")?;
+    tui_clear(&mut app)?; tui_message(&mut app, "user", "silent tools")?;
+    tui_begin(&mut app)?; tui_tool(&mut app, "silent", "read_file", "completed", "one.txt", "")?; tui_delta(&mut app, "only visible answer")?; tui_finish(&mut app, true)?;
+    turn_expect(turn_headings(&app.transcript) == 1, "empty assistant/tool events do not create duplicate headings")?;
+    tui_true()
+}
+
+def main() -> i64 { let result = turn_tests(); if not result.is_ok() { println(result.error); return 1; }; println("assistant turn grouping passed"); 0 }

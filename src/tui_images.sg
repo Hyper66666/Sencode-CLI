@@ -1,0 +1,113 @@
+import terminal;
+
+struct UiImageRef { id: i64, path: String }
+struct UiImageSpan { start: i64, end: i64, id: i64 }
+struct UiImageEdit { text: String, cursor: i64 }
+
+def images_token(id: i64) -> Result<String, i64> { let token = cli_text("[image"); token.push_i64(id)?; token.push_str("]")?; Result { is_ok: true, value: token, error: 0 } }
+
+def images_spans(text: &str) -> Result<Vec<UiImageSpan>, i64> {
+    let spans: Vec<UiImageSpan> = vec_new();
+    if not str_contains(text, "[image") { return Result { is_ok: true, value: spans, error: 0 }; };
+    let source = cli_text(text); let chars = source.chars(); let mut state = 0; let mut start = 0; let mut offset = 0; let mut id = 0; let mut digits = 0;
+    loop { let next = chars.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?;
+        let expected = if state == 1 { 105 } else { if state == 2 { 109 } else { if state == 3 { 97 } else { if state == 4 { 103 } else { 101 } } } };
+        if state >= 1 and state <= 5 and cp == expected { state = state + 1; } else {
+            if state == 6 and cp >= 48 and cp <= 57 and digits < 3 { id = id * 10 + cp - 48; digits = digits + 1; } else {
+                if state == 6 and cp == 93 and digits > 0 and id > 0 and id <= 128 {
+                    let token = images_token(id)?; if cli_byte_slice(text, start, offset + 1)?.as_str() == token.as_str() { spans.push(UiImageSpan { start: start, end: offset + 1, id: id }); (); };
+                };
+                state = 0; id = 0; digits = 0;
+                if cp == 91 { state = 1; start = offset; };
+            };
+        };
+        offset = offset + ui_scalar_bytes(cp);
+    }; chars.free(); Result { is_ok: true, value: spans, error: 0 }
+}
+
+def images_snap(text: &str, cursor: i64, toward_end: bool) -> Result<i64, i64> {
+    if not str_contains(text, "[image") { return cli_ok(cursor); };
+    let spans = images_spans(text)?; let mut index = 0;
+    while index < spans.len() { let span: &UiImageSpan = spans.get(index); if cursor > span.start and cursor < span.end { return cli_ok(if toward_end { span.end } else { span.start }); }; index = index + 1; };
+    cli_ok(cursor)
+}
+
+// Widen edits that intersect a chip, preserving the unchanged Unicode prefix
+// and suffix. This also covers configurable word deletion and Vim operators.
+def images_atomic_edit(old: &str, old_cursor: i64, text: &str, cursor: i64) -> Result<UiImageEdit, i64> {
+    if not str_contains(old, "[image") and not str_contains(text, "[image") { return Result { is_ok: true, value: UiImageEdit { text: cli_text(text), cursor: cursor }, error: 0 }; };
+    let spans = images_spans(old)?;
+    if old == text or spans.len() == 0 { return Result { is_ok: true, value: UiImageEdit { text: cli_text(text), cursor: images_snap(text, cursor, cursor >= old_cursor)? }, error: 0 }; };
+    let before = ui_clusters(old)?; let after = ui_clusters(text)?; let mut prefix = 0; let mut start = 0;
+    while prefix < before.len() and prefix < after.len() and before.get(prefix).text.as_str() == after.get(prefix).text.as_str() { start = before.get(prefix).end; prefix = prefix + 1; };
+    let mut left = before.len() - 1; let mut right = after.len() - 1;
+    while left >= prefix and right >= prefix and before.get(left).text.as_str() == after.get(right).text.as_str() { left = left - 1; right = right - 1; };
+    let mut end = if left >= prefix { before.get(left).end } else { start }; let replacement_end = if right >= prefix { after.get(right).end } else { start }; let replacement = cli_byte_slice(text, start, replacement_end)?;
+    let mut changed = false; let mut index = 0;
+    while index < spans.len() { let span: &UiImageSpan = spans.get(index);
+        if span.start < end and span.end > start or start == end and start > span.start and start < span.end { if span.start < start { start = span.start; }; if span.end > end { end = span.end; }; changed = true; };
+        index = index + 1;
+    };
+    if not changed { return Result { is_ok: true, value: UiImageEdit { text: cli_text(text), cursor: images_snap(text, cursor, cursor >= old_cursor)? }, error: 0 }; };
+    let result = ui_replace_range(old, start, end, replacement.as_str())?; let next = images_snap(result.as_str(), start + replacement.len(), true)?;
+    Result { is_ok: true, value: UiImageEdit { text: result, cursor: next }, error: 0 }
+}
+
+def images_clusters(text: &str) -> Result<Vec<UiCluster>, i64> {
+    let basic = ui_clusters(text)?; let spans = images_spans(text)?; let clusters: Vec<UiCluster> = vec_new(); let mut index = 0; let mut si = 0;
+    while index < basic.len() { let current: &UiCluster = basic.get(index);
+        while si < spans.len() and spans.get(si).start < current.offset { si = si + 1; };
+        if si < spans.len() and spans.get(si).start == current.offset {
+            let span: &UiImageSpan = spans.get(si); let mut last = index; while last < basic.len() and basic.get(last).end < span.end { last = last + 1; };
+            if last < basic.len() and basic.get(last).end == span.end { let token = cli_byte_slice(text, span.start, span.end)?; clusters.push(UiCluster { cells: token.len(), text: token, offset: span.start, end: span.end, newline: false }); index = last + 1; si = si + 1; } else { clusters.push(UiCluster { text: current.text.clone()?, cells: current.cells, offset: current.offset, end: current.end, newline: current.newline }); index = index + 1; };
+        } else { clusters.push(UiCluster { text: current.text.clone()?, cells: current.cells, offset: current.offset, end: current.end, newline: current.newline }); index = index + 1; };
+    }; Result { is_ok: true, value: clusters, error: 0 }
+}
+
+def images_layout(text: &str, cursor: i64, width: i64) -> Result<UiLayout, i64> {
+    if not str_contains(text, "[image") { return ui_layout(text, cursor, width); };
+    let limit = if width < 2 { 2 } else { width }; let lines: Vec<UiLine> = vec_new(); let clusters = images_clusters(text)?;
+    let mut line = string_new(); let mut cells = 0; let mut offset = 0; let mut row = 0; let mut column = 0; let mut index = 0;
+    while index < clusters.len() { let cluster: &UiCluster = clusters.get(index); let rendered = if cluster.cells > limit { ui_fit(cluster.text.as_str(), limit)? } else { cluster.text.clone()? }; let size = if cluster.cells > limit { ui_cells(rendered.as_str())? } else { cluster.cells };
+        if not cluster.newline and cells + size > limit { lines.push(UiLine { text: line, cells: cells, style: 0, message_id: 0 , spans: ui_spans_empty() }); line = string_new(); cells = 0; };
+        if cluster.offset <= cursor and cursor < cluster.end { row = lines.len(); column = cells; };
+        if cluster.newline { lines.push(UiLine { text: line, cells: cells, style: 0, message_id: 0 , spans: ui_spans_empty() }); line = string_new(); cells = 0; } else { line.push_str(rendered.as_str())?; cells = cells + size; };
+        offset = cluster.end; index = index + 1;
+    };
+    if cursor >= offset { row = lines.len(); column = cells; }; lines.push(UiLine { text: line, cells: cells, style: 0, message_id: 0 , spans: ui_spans_empty() }); Result { is_ok: true, value: UiLayout { lines: lines, cursor_row: row, cursor_column: column }, error: 0 }
+}
+
+def images_colored(text: &str) -> Result<String, i64> {
+    if not str_contains(text, "[image") { return string_from_str(text); };
+    let spans = images_spans(text)?; let out = string_new(); let mut offset = 0; let mut index = 0;
+    while index < spans.len() { let span: &UiImageSpan = spans.get(index); out.push_str(cli_byte_slice(text, offset, span.start)?.as_str())?; out.push_str("\x1b[1;34m")?; out.push_str(cli_byte_slice(text, span.start, span.end)?.as_str())?; out.push_str("\x1b[0m")?; offset = span.end; index = index + 1; };
+    out.push_str(cli_byte_slice(text, offset, text.len())?.as_str())?; Result { is_ok: true, value: out, error: 0 }
+}
+
+def images_hit(text: &str, width: i64, target_row: i64, target_column: i64) -> Result<i64, i64> {
+    let limit = if width < 2 { 2 } else { width }; let clusters = images_clusters(text)?; let column = if target_column < 0 { 0 } else { target_column }; let mut row = 0; let mut cells = 0; let mut index = 0;
+    while index < clusters.len() { let cluster: &UiCluster = clusters.get(index); let size = if cluster.cells > limit { limit } else { cluster.cells };
+        if not cluster.newline and cells + size > limit { if row == target_row { return cli_ok(cluster.offset); }; row = row + 1; cells = 0; };
+        if row == target_row { if cluster.newline or cells >= column { return cli_ok(cluster.offset); }; if cells + size > column { return cli_ok(if column - cells >= (size + 1) / 2 { cluster.end } else { cluster.offset }); }; };
+        if cluster.newline { row = row + 1; cells = 0; } else { cells = cells + size; }; index = index + 1;
+    }; cli_ok(text.len())
+}
+
+def images_vertical_cursor(text: &str, cursor: i64, width: i64, direction: i64) -> Result<i64, i64> {
+    if not str_contains(text, "[image") { return ui_vertical_cursor(text, cursor, width, direction); };
+    let layout = images_layout(text, cursor, width)?; let target = layout.cursor_row + direction;
+    if target < 0 or target >= layout.lines.len() { return cli_ok(cursor); };
+    images_hit(text, width, target, layout.cursor_column)
+}
+
+def images_expand(text: &str, references: &Vec<UiImageRef>) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?; let images = document.new_array()?; let spans = images_spans(text)?; let out = string_new(); let mut offset = 0; let mut index = 0;
+    while index < spans.len() { let span: &UiImageSpan = spans.get(index); let mut found = 0; while found < references.len() and references.get(found).id != span.id { found = found + 1; };
+        if found == references.len() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }; };
+        let path = references.get(found).path.as_str(); let mut duplicate = false; let mut image = 0; while image < images.array_len()? { if images.array_get(image)?.string_value()?.as_str() == path { duplicate = true; }; image = image + 1; };
+        if not duplicate { if images.array_len()? >= 8 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; }; images.array_push(document.new_string(path)?)?; (); };
+        out.push_str(cli_byte_slice(text, offset, span.start)?.as_str())?; out.push_str("\"")?; out.push_str(path)?; out.push_str("\"")?; offset = span.end; index = index + 1;
+    };
+    out.push_str(cli_byte_slice(text, offset, text.len())?.as_str())?; cli_put_string(&document, document.root(), "text", out.as_str())?; document.root().object_set("images", images)?;
+    Result { is_ok: true, value: document, error: 0 }
+}

@@ -1,0 +1,44 @@
+import engine;
+
+def engine_schema_case(text: &str, expected: bool) -> i64 {
+    let document = json_parse(text);
+    if not document.is_ok() { cli_diagnostic("Invalid JSON in engine schema test fixture"); return 1; };
+    let result = engine_submit_valid(&document.value);
+    if result.is_ok() != expected { cli_diagnostic(text); return 1; };
+    0
+}
+
+def main() -> i64 {
+    let mut failures = 0;
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"effort\",\"text\":\"question\",\"effort\":\"high\"}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"effort\",\"text\":\"question\",\"effort\":\"ultra\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"effort\",\"text\":\"question\",\"effort\":\"high\\u0000bad\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"你好😀\"}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"operation\":\"consult\",\"connection\":\"custom-one\",\"model\":\"model-a\",\"plan\":true,\"auto_edit\":false,\"allow_commands\":false,\"maximum_requests\":50,\"token_budget\":0,\"goal\":\"complete it\",\"checks\":[\"exit 0\"]}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"compact\",\"operation\":\"compact\"}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"turn\",\"operation\":\"turn\",\"checks\":[]}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"turn\",\"permission_profile\":\"backend\"}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"turn\",\"permission_profile\":\"strict\"}", true);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"turn\",\"permission_profile\":\"yolo\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"turn\",\"permission_profile\":true}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"session\":\"other\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"connection\":1}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"model\":false}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"plan\":\"yes\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":\"50\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":1.5}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"token_budget\":true}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":0}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"token_budget\":-1}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"operation\":\"unsupported\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"checks\":[false]}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"checks\":[\"\"]}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"checks\":{}}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"goal\":{}}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"\",\"text\":\"question\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"\"}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"unknown\\u005ffield\":true}", false);
+    failures = failures + engine_schema_case("[]", false);
+    if failures == 0 { println("engine strict submit schema acceptance passed"); };
+    failures
+}

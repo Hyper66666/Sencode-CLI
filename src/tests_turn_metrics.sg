@@ -1,0 +1,46 @@
+import turn_metrics;
+import command_line;
+
+def metrics_assert(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def metrics_tests(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let session = cli_state_create_session(&state, cwd)?;
+    let mut execution = cli_state_begin(&state, session.as_str(), "fixture", "model")?;
+    let user = json_parse("{\"role\":\"user\",\"content\":\"elapsed fixture\"}")?;
+    cli_state_append(&state, &execution, &user)?;
+    let answer = json_parse("{\"role\":\"assistant\",\"content\":\"public answer\",\"tool_calls\":[]}")?;
+    cli_state_append(&state, &execution, &answer)?;
+    turn_metrics_save_elapsed(&state, &execution, 61999, "completed")?;
+    let history = cli_state_history(&state, session.as_str())?;
+    let messages = history.root().object_get("messages")?;
+    metrics_assert(messages.array_len()? == 2, "elapsed metadata creates no synthetic model message")?;
+    metrics_assert(not messages.array_get(0)?.object_has("cli_turn_elapsed_ms"), "only the terminal row gets elapsed time")?;
+    metrics_assert(cli_json_string(messages.array_get(1)?, "content")?.as_str() == "public answer", "elapsed metadata preserves public content")?;
+    metrics_assert(cli_json_optional_i64(messages.array_get(1)?, "cli_turn_elapsed_ms", -1) == 61999, "elapsed time survives stored history")?;
+    metrics_assert(cli_json_string(messages.array_get(1)?, "cli_turn_outcome")?.as_str() == "completed", "outcome survives history")?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    metrics_assert(not turn_metrics_save_elapsed(&state, &execution, 1, "completed").is_ok(), "released execution cannot overwrite terminal metadata")?;
+    let mut next = cli_state_begin(&state, session.as_str(), "fixture", "model")?;
+    cli_state_append(&state, &next, &user)?;
+    turn_metrics_save_elapsed(&state, &next, 100, "cancelled")?;
+    cli_state_finish(&state, &mut next, "interrupted")?;
+    let restored = cli_state_history(&state, session.as_str())?;
+    let records = restored.root().object_get("messages")?;
+    metrics_assert(cli_json_optional_i64(records.array_get(1)?, "cli_turn_elapsed_ms", -1) == 61999, "later turn cannot reset prior elapsed time")?;
+    metrics_assert(cli_json_string(records.array_get(2)?, "cli_turn_outcome")?.as_str() == "cancelled", "pre-answer cancel retains a static terminal record")?;
+    println("fenced turn elapsed metadata passed");
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", "").unwrap_or(string_new());
+    let cwd = cli_current_directory().unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let result = metrics_tests(database.as_str(), cwd.as_str());
+    if not result.is_ok() { println(result.error); return 1; }; 0
+}

@@ -1,0 +1,67 @@
+import tui_keys;
+
+def key_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; keys_bool(true) }
+def key_event(kind: i64, code: i64, modifiers: i64, text: &str) -> TerminalEvent { TerminalEvent { kind: kind, code: code, modifiers: modifiers, width: 80, height: 24, data: cli_text(text) } }
+
+def key_tests() -> Result<i64, i64> {
+    let map = keys_parse("{\"version\":1,\"mode\":\"vim\",\"bindings\":[{\"key\":\"alt+b\",\"action\":\"word_left\"},{\"key\":\"ctrl+a\",\"action\":\"line_start\"}]}", "fixture")?;
+    key_assert(map.mode.as_str() == "vim" and map.bindings.len() == 2, "validated versioned keymap")?;
+    let alt = key_event(1, 98, 2, "b"); let paste = key_event(2, 98, 2, "b");
+    key_assert(keys_lookup(&map, &alt) == 3 and keys_lookup(&map, &paste) == 0, "custom bindings apply only to keyboard events")?;
+    key_assert(not keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"enter\",\"action\":\"left\"}]}", "fixture").is_ok, "Enter cannot be remapped")?;
+    key_assert(not keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"ctrl+c\",\"action\":\"left\"}]}", "fixture").is_ok and not keys_chord("ctrl+q").is_ok and not keys_chord("alt+enter").is_ok, "cancel, queue and modified Enter stay reserved")?;
+    key_assert(not keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"alt+b\",\"action\":\"submit\"}]}", "fixture").is_ok, "keymaps cannot submit or execute actions")?;
+    key_assert(not keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"alt+b\",\"action\":\"left\"},{\"key\":\"alt+b\",\"action\":\"right\"}]}", "fixture").is_ok, "duplicate chords reject the complete keymap")?;
+    key_assert(not keys_parse("{\"version\":1,\"mode\":\"vim\",\"bindings\":[],\"command\":\"bad\"}", "fixture").is_ok and not keys_parse("{\"version\":2}", "fixture").is_ok, "unknown fields and schema versions fail closed")?;
+    key_assert(not keys_parse("{\"version\":1,\"\":0}", "fixture").is_ok and not keys_parse("{\"version\":1,\"version||mode\":0}", "fixture").is_ok, "unknown field matching cannot be bypassed by empty or delimiter-containing names")?;
+    key_assert(not keys_parse("{\"version\":1,\"mode\":\"default\",\"mode\":\"vim\"}", "fixture").is_ok and not keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"alt+b\",\"key\":\"alt+x\",\"action\":\"left\"}]}", "fixture").is_ok, "duplicate JSON members cannot be normalized into an accepted map")?;
+    key_assert(not keys_parse("{\"version\":1,\"mode\":\"default\",\"m\\u006fde\":\"vim\"}", "fixture").is_ok and keys_parse("{\"vers\\u0069on\":1,\"bindings\":[{\"key\":\"alt+b\",\"action\":\"left\"}]}", "fixture").is_ok, "escaped property names are decoded before duplicate detection")?;
+    key_assert(not keys_parse("{\"version\":1,\"mode\":\"vim\",\"bindings\":[{\"key\":\"alt+b\",\"action\":\"left\"},{\"key\":\"enter\",\"action\":\"right\"}]}", "fixture").is_ok, "invalid suffix never applies a partial valid prefix")?;
+    key_assert(not keys_parse("{\"version\":1,\"mode\":\"vim\\u0000default\"}", "fixture").is_ok and not keys_parse("{\"version\":1,\"bindings\":[{\"key\":\"alt+b\",\"action\":\"left\\u0000submit\"}]}", "fixture").is_ok, "escaped NUL cannot bypass literal schema validation")?;
+    let large = cli_text("{\"version\":1,\"mode\":\""); large.push_str(ui_repeat("x", 65536)?.as_str())?; large.push_str("\"}")?;
+    key_assert(not keys_parse(large.as_str(), "fixture").is_ok, "keymap size is bounded")?;
+    let many = cli_text("{\"version\":1,\"bindings\":["); let mut entries = 0;
+    while entries < 65 { if entries > 0 { many.push_str(",")?; (); }; many.push_str("{\"key\":\"alt+b\",\"action\":\"left\"}")?; entries = entries + 1; }; many.push_str("]}")?;
+    key_assert(keys_parse(many.as_str(), "fixture").error == 13, "binding count is checked before application")?;
+    let described = keys_describe(&map)?; key_assert(str_contains(described.as_str(), "alt+b → word_left") and str_contains(described.as_str(), "Ctrl+C cancels"), "discoverable effective bindings and explicit Vim cancel shortcut")?;
+
+    let mut vim = keys_vim_new(); let esc = key_event(1, 27, 0, "");
+    let initial = keys_vim_event(&mut vim, "中文 👨‍👩‍👧‍👦 next", 37, 80, &esc)?;
+    key_assert(initial.handled and not vim.insert, "Vim starts INSERT and Escape enters NORMAL")?;
+    let left = key_event(1, 104, 0, "h"); let emoji = keys_vim_event(&mut vim, "x👨‍👩‍👧‍👦", 26, 80, &left)?;
+    key_assert(emoji.handled and emoji.cursor == 1, "Vim h moves a whole Unicode grapheme")?;
+    let remove = key_event(1, 120, 0, "x"); let removed = keys_vim_event(&mut vim, "x👨‍👩‍👧‍👦", emoji.cursor, 80, &remove)?;
+    key_assert(removed.text.as_str() == "x" and removed.cursor == 1, "Vim x removes a whole Unicode cluster")?;
+    let undo = key_event(1, 117, 0, "u"); let restored = keys_vim_event(&mut vim, removed.text.as_str(), removed.cursor, 80, &undo)?;
+    key_assert(restored.text.as_str() == "x👨‍👩‍👧‍👦" and restored.cursor == 1, "Vim undo restores text and byte cursor")?;
+    key_assert(keys_word_right("中文 next word", 0)? == 7 and keys_word_left("中文 next word", 11)? == 7, "word motion preserves Unicode boundaries")?;
+    let delete = key_event(1, 100, 0, "d"); let word = key_event(1, 119, 0, "w");
+    keys_vim_event(&mut vim, "中文 next word", 0, 80, &delete)?; let dw = keys_vim_event(&mut vim, "中文 next word", 0, 80, &word)?;
+    key_assert(dw.text.as_str() == "next word" and dw.cursor == 0 and vim.pending == 0, "dw is an isolated two-key edit")?;
+    keys_vim_event(&mut vim, "one\n中文\nthree", 7, 80, &delete)?; let dd = keys_vim_event(&mut vim, "one\n中文\nthree", 7, 80, &delete)?;
+    key_assert(dd.text.as_str() == "one\nthree" and dd.cursor == 4, "dd removes exactly the current line")?;
+    let change = key_event(1, 99, 0, "c"); keys_vim_event(&mut vim, "one two", 0, 80, &change)?; let cw = keys_vim_event(&mut vim, "one two", 0, 80, &word)?;
+    key_assert(cw.text.as_str() == "two" and vim.insert and vim.record_insert, "cw enters INSERT after its edit")?;
+    keys_before_insert(&mut vim, cw.text.as_str(), cw.cursor)?; keys_vim_event(&mut vim, "new two", 4, 80, &esc)?;
+    let revert = keys_vim_event(&mut vim, "new two", 4, 80, &undo)?;
+    key_assert(revert.text.as_str() == "two", "one insert session is one undo unit")?;
+    let enter = key_event(1, 13, 0, ""); let cancel = key_event(4, 3, 4, "");
+    key_assert(not keys_vim_event(&mut vim, "task", 0, 80, &enter)?.handled and not keys_vim_event(&mut vim, "task", 0, 80, &cancel)?.handled, "Vim cannot swallow explicit send or cancellation")?;
+    keys_vim_event(&mut vim, "one two", 0, 80, &delete)?; let arrow = key_event(1, 1004, 0, ""); keys_vim_event(&mut vim, "one two", 0, 80, &arrow)?;
+    key_assert(vim.pending == 0 and keys_vim_event(&mut vim, "one two", 0, 80, &word)?.text.as_str() == "one two", "ordinary navigation clears an incomplete destructive Vim operator")?;
+    let append = key_event(1, 65, 1, "A"); let appended = keys_vim_event(&mut vim, "one\ntwo", 1, 80, &append)?;
+    key_assert(appended.handled and appended.cursor == 3 and vim.insert, "shifted uppercase Vim commands use real terminal modifiers")?;
+    keys_vim_event(&mut vim, "task", 0, 80, &esc)?;
+    let pasted = key_event(2, 0, 0, "dd\n/permissions auto-edit");
+    key_assert(not keys_vim_event(&mut vim, "draft", 0, 80, &pasted)?.handled and vim.insert and vim.pending == 0, "pasted text never executes Vim commands")?;
+    keys_vim_event(&mut vim, "draft", 0, 80, &esc)?; let chinese = key_event(1, 20013, 0, "中");
+    key_assert(keys_vim_event(&mut vim, "draft", 0, 80, &chinese)?.handled and not vim.insert, "normal mode never inserts unsupported Unicode key events")?;
+    keys_vim_event(&mut vim, "one two", 0, 80, &delete)?; keys_vim_event(&mut vim, "one two", 0, 80, &chinese)?;
+    key_assert(vim.pending == 0 and keys_vim_event(&mut vim, "one two", 0, 80, &word)?.text.as_str() == "one two", "an unsupported normal-mode Unicode key clears incomplete destructive operations")?;
+    let mut index = 0;
+    while index < 45 { let text = cli_text("revision "); text.push_i64(index)?; keys_snapshot(&mut vim, text.as_str(), 0)?; index = index + 1; };
+    key_assert(vim.undo.len() == 32 and vim.undo_bytes < 1048576, "undo history is bounded")?;
+    println("keys: safe schema, reserved inputs, atomic rejection, Unicode Vim subset, paste isolation and bounded undo passed"); cli_ok(0)
+}
+
+def main() -> i64 { let result = key_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

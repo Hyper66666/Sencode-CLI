@@ -1,0 +1,61 @@
+import mcp;
+import command_line;
+
+extern "C" {
+    fn sengoo_process_live_resource_count() -> i64;
+    fn sengoo_process_live_handle_count() -> i64;
+}
+
+def mcp_tests() -> Result<i64, i64> {
+    let command = cli_argument(0)?;
+    let fixture = cli_argument(1)?;
+    let cwd = cli_current_directory()?;
+    let arguments = json_doc_object()?;
+    let items = arguments.new_array()?;
+    items.array_push(arguments.new_string("-u")?)?;
+    items.array_push(arguments.new_string(fixture.as_str())?)?;
+    let terminal = terminal_open()?;
+    let pending: Vec<TerminalEvent> = vec_new();
+    pending.push(TerminalEvent { kind: 2, code: 0, modifiers: 0, width: 80, height: 24, data: cli_text("yes\n中文😀") });
+    pending.push(TerminalEvent { kind: 1, code: 13, modifiers: 0, width: 80, height: 24, data: cli_text("\r") });
+    let mut client = mcp_start(command.as_str(), items, cwd.as_str())?;
+    client.initialize_pending(&terminal, &pending)?;
+    let tools = client.tools_pending(&terminal, &pending)?;
+    let mut failures = 0;
+    if tools.root().object_get("tools")?.array_len()? != 2 { failures = failures + 1; };
+    let input = json_parse("{\"message\":\"中文😀\"}")?;
+    let output = client.call_tool_pending("echo", input.root(), &terminal, &pending)?;
+    let result = output.root().object_get("result")?.object_get("content")?.array_get(0)?;
+    if not str_contains(cli_json_string(result, "text")?.as_str(), "中文😀") { failures = failures + 1; };
+    if pending.len() != 2 or pending.get(0).data.as_str() != "yes\n中文😀" or pending.get(1).code != 13 { cli_diagnostic("MCP consumed the next prompt's queued input"); failures = failures + 1; };
+    let diagnostic = client.diagnostic_report()?;
+    if not diagnostic.root().object_get("stderr_truncated")?.bool_value()? or cli_json_optional_i64(diagnostic.root(), "stderr_bytes", 0) != 65536 { failures = failures + 1; };
+    let slow = json_parse("{\"name\":\"slow\",\"arguments\":{}}")?;
+    let timed = client.rpc_pending("tools/call", slow.root(), 100, &terminal, &pending);
+    if timed.is_ok() or timed.error != 11 { failures = failures + 1; };
+    if pending.len() != 2 { cli_diagnostic("Timed-out MCP consumed queued input"); failures = failures + 1; };
+    let mut crash = mcp_start(command.as_str(), items, cwd.as_str())?;
+    crash.initialize(&terminal)?;
+    let crash_params = json_parse("{\"name\":\"exit\",\"arguments\":{}}")?;
+    let exited = crash.rpc("tools/call", crash_params.root(), 5000, &terminal);
+    if exited.is_ok() or exited.error != 9 { failures = failures + 1; };
+    let mut large = mcp_start(command.as_str(), items, cwd.as_str())?;
+    large.initialize(&terminal)?;
+    let large_params = json_parse("{\"name\":\"oversize\",\"arguments\":{}}")?;
+    let oversized = large.rpc("tools/call", large_params.root(), 5000, &terminal);
+    if oversized.is_ok() or oversized.error != 13 { failures = failures + 1; };
+    large.cancel()?;
+    let mut canceled = mcp_start(command.as_str(), items, cwd.as_str())?;
+    canceled.initialize(&terminal)?;
+    canceled.cancel()?;
+    if canceled.call_tool("echo", input.root(), &terminal).is_ok() { failures = failures + 1; };
+    cli_ok(failures)
+}
+
+def main() -> i64 {
+    let result = mcp_tests();
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_process_live_resource_count() != 0 or sengoo_process_live_handle_count() != 0 { cli_diagnostic("MCP leaked native process resources"); return 1; };
+    if result.value == 0 { println("MCP handshake, pagination, Unicode, stderr, timeout, exit, oversized output and cancellation passed"); };
+    result.value
+}

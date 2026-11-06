@@ -1,0 +1,6 @@
+- [x] Implement bounded prepared/complete/restoring/restored journal using shared_modes.
+- [x] Verify Unicode restore, conflicts, approvals, contention, replay and crash-window behavior natively.
+- [ ] Connect the journal to the approved native write/patch execution path.
+- [ ] Connect rewind picker, preview and fresh-input confirmation in fullscreen.
+- [ ] Run production restore/conflict gate and existing coding fixtures.
+- [ ] Validate OpenSpec and reconcile coverage documentation.

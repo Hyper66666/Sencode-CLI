@@ -1,0 +1,53 @@
+import state;
+import provider;
+
+// Allowlisted connection/model catalog. This module has no executable entry
+// point and never returns credentials or the original config JSON.
+def config_snapshot(state: &CliState) -> Result<JsonDoc,i64> {
+    let document = cli_state_connections(state)?;
+    cli_put_string(&document,document.root(),"current",cli_state_default_connection(state)?.as_str())?;
+    cli_put_string(&document,document.root(),"database",state.path.as_str())?;
+    let items=document.root().object_get("connections")?;let mut index=0;
+    while index<items.array_len()? {
+        let item=items.array_get(index)?;let models=document.new_array()?;let enabled=document.new_array()?;let discovered=document.new_array()?;
+        let selected=cli_json_optional_string(item,"model");
+        if selected.len()>0{models.array_push(document.new_string(selected.as_str())?)?; ();};
+        let kind=cli_json_optional_string(item,"kind");
+        let capabilities=document.new_object()?;
+        // This is the native encoder's implemented contract, not a claim that
+        // every remote model accepts it. Explicit configured/model capability
+        // false still wins; provider rejection is reported without fallback.
+        let native=kind.as_str()=="customApi" and provider_protocol(cli_json_optional_string(item,"protocol").as_str())>=0;
+        cli_put_bool(&document,capabilities,"reasoningEffort",native)?;
+        cli_put_string(&document,item,"effort_source",if native{"native-protocol-encoder"}else{"unavailable"})?;
+        let mut query=state.db.prepare("SELECT config_json FROM connection_configs WHERE id=?")?;
+        query.bind_text(1,cli_json_string(item,"id")?.as_str())?;
+        if query.step()? {let config=json_parse(query.text(0)?.as_str())?;
+            if config.root().object_has("enabledModels"){
+                let source=config.root().object_get("enabledModels")?;
+                if source.kind()?==JSON_KIND_ARRAY(){let mut m=0;
+                    while m<source.array_len()? and m<256 {let entry=source.array_get(m)?;let model=cli_json_optional_string(entry,"id");
+                        if model.len()>0{enabled.array_push(document.copy(entry)?)?; ();};
+                        if model.len()>0 and model.as_str()!=selected.as_str(){models.array_push(document.new_string(model.as_str())?)?; ();};m=m+1;
+                    };
+                };
+            };
+            if config.root().object_has("discoveredModelIds"){let source=config.root().object_get("discoveredModelIds")?;
+                if source.kind()?==JSON_KIND_ARRAY(){let mut d=0;while d<source.array_len()? and d<256{discovered.array_push(document.copy(source.array_get(d)?)?)?;d=d+1;};};
+            };
+            // Persisted custom API settings may explicitly narrow the encoder
+            // capability. Managed accounts stay unavailable until an adapter
+            // reports its actual live capability; names never grant support.
+            if native and config.root().object_has("capabilities") and config.root().object_get("capabilities")?.kind()?==JSON_KIND_OBJECT(){
+                let source=config.root().object_get("capabilities")?;
+                if source.object_has("reasoningEffort"){cli_put_bool(&document,capabilities,"reasoningEffort",source.object_get("reasoningEffort")?.bool_value()?)?; ();};
+                if source.object_has("supportsReasoningEffort"){cli_put_bool(&document,capabilities,"supportsReasoningEffort",source.object_get("supportsReasoningEffort")?.bool_value()?)?; ();};
+                if source.object_has("reasoningEfforts"){capabilities.object_set("reasoningEfforts",document.copy(source.object_get("reasoningEfforts")?)?)?; ();};
+                if source.object_has("supportedReasoningEfforts"){capabilities.object_set("supportedReasoningEfforts",document.copy(source.object_get("supportedReasoningEfforts")?)?)?; ();};
+            };
+        };
+        if enabled.array_len()?==0 and selected.len()>0{let entry=document.new_object()?;cli_put_string(&document,entry,"id",selected.as_str())?;cli_put_string(&document,entry,"label",selected.as_str())?;let caps=document.new_object()?;cli_put_bool(&document,caps,"visionSupported",false)?;entry.object_set("capabilities",caps)?;enabled.array_push(entry)?; ();};
+        item.object_set("capabilities",capabilities)?;
+        item.object_set("models",models)?;item.object_set("enabled_models",enabled)?;item.object_set("discovered_model_ids",discovered)?;index=index+1;
+    };Result{is_ok:true,value:document,error:0}
+}

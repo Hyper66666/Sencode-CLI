@@ -1,0 +1,61 @@
+import terminal;
+
+// Draft and queued messages remain owned by the caller. Preparing a recall is
+// side-effect free: only a successful result may remove the newest queue item.
+struct UiPendingRecall { recalled: bool, text: String, status: String }
+
+def pending_recall(queue: &Vec<InputHistory>, draft: &str) -> Result<UiPendingRecall, i64> {
+    if queue.len() == 0 { return Result { is_ok: true, value: UiPendingRecall { recalled: false, text: cli_text(draft), status: string_new() }, error: 0 }; };
+    let item: &InputHistory = queue.get(queue.len() - 1);
+    let length = item.text.len() + draft.len() + if draft.len() > 0 { 2 } else { 0 };
+    if length > 65536 {
+        return Result { is_ok: true, value: UiPendingRecall { recalled: false, text: cli_text(draft), status: cli_text("Recall exceeds draft limit; queued message and draft kept. Use Ctrl+Q to edit.") }, error: 0 };
+    };
+    let text = item.text.clone()?;
+    if draft.len() > 0 { text.push_str("\n\n")?; text.push_str(draft)?; (); };
+    Result { is_ok: true, value: UiPendingRecall { recalled: true, text: text, status: cli_text("Recalled queued message; current request continues") }, error: 0 }
+}
+
+// Bound the work independently of the queue item's maximum 64-KiB size. The
+// original text is never altered; this is a sanitized, single-row preview.
+def pending_preview(text: &str, width: i64) -> Result<String, i64> {
+    let limit = if width < 1 { 1 } else { if width > 500 { 500 } else { width } };
+    let budget = limit * 4 + 32;
+    let source = cli_text(text); let chars = source.chars(); let prefix = string_new(); let mut used = 0; let mut clipped = false;
+    loop { let next = chars.next(); if not next.is_some { break; }; let code = char_codepoint(next.value)?; used = used + ui_scalar_bytes(code);
+        if used > budget { clipped = true; break; };
+        if code == 10 { prefix.push_str(" / ")?; (); } else { if code == 9 or code == 13 { prefix.push_str(" ")?; (); } else { prefix.push_char(next.value)?; (); }; };
+    }; chars.free();
+    let safe = cli_terminal_safe(prefix.as_str())?;
+    if limit > 3 and (clipped or ui_cells(safe.as_str())? > limit) {
+        let output = ui_fit(safe.as_str(), limit - 3)?; output.push_str("...")?;
+        return Result { is_ok: true, value: output, error: 0 };
+    };
+    ui_fit(safe.as_str(), limit)
+}
+
+def pending_row(rows: &Vec<UiLine>, text: &str, width: i64) -> Result<bool, i64> {
+    let fitted = ui_fit(text, width)?; let cells = ui_cells(fitted.as_str())?;
+    rows.push(UiLine { text: fitted, cells: cells, style: 2, message_id: 0 , spans: ui_spans_empty() });
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+// At most four muted rows. Show the newest visible items in their original
+// FIFO order, retaining their absolute queue indices so truncation is clear.
+def pending_rows(queue: &Vec<InputHistory>, width: i64, maximum: i64) -> Result<Vec<UiLine>, i64> {
+    let rows: Vec<UiLine> = vec_new();
+    if queue.len() == 0 or maximum < 1 or width < 1 { return Result { is_ok: true, value: rows, error: 0 }; };
+    let maximum_rows = if maximum > 4 { 4 } else { maximum };
+    let header = cli_text("QUEUED / "); header.push_i64(queue.len())?; header.push_str(" / Esc recall last")?;
+    pending_row(&rows, header.as_str(), width)?;
+    let shown = if queue.len() < maximum_rows - 1 { queue.len() } else { maximum_rows - 1 };
+    let mut index = queue.len() - shown;
+    while index < queue.len() {
+        let label = cli_text("["); label.push_i64(index + 1)?; label.push_str("] ")?;
+        let available = width - ui_cells(label.as_str())?;
+        if available > 0 { label.push_str(pending_preview(queue.get(index).text.as_str(), available)?.as_str())?; (); };
+        pending_row(&rows, label.as_str(), width)?;
+        index = index + 1;
+    };
+    Result { is_ok: true, value: rows, error: 0 }
+}

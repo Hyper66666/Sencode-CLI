@@ -1,0 +1,29 @@
+import terminal;
+
+// Pure transcript focus. It cannot modify a draft, submit or approve anything.
+struct UiReading { active: bool, pending_top: bool }
+struct UiReadAction { kind: i64, scroll: i64 }
+
+def reading_new() -> UiReading { UiReading { active: false, pending_top: false } }
+def reading_enter(state: &mut UiReading) { state.active = true; state.pending_top = false; (); }
+def reading_action(kind: i64, scroll: i64) -> UiReadAction { UiReadAction { kind: kind, scroll: scroll } }
+def reading_event(state: &mut UiReading, event: &TerminalEvent, height: i64, total: i64, scroll: i64) -> UiReadAction {
+    if not state.active { return reading_action(0, scroll); };
+    if event.kind == 4 or event.kind == 5 or event.kind == 3 or event.kind == 6 { return reading_action(0, scroll); };
+    if event.kind != 1 { return reading_action(1, scroll); };
+    if event.code == 27 or event.code == 113 and event.modifiers <= 1 {
+        state.active = false; state.pending_top = false; return reading_action(2, scroll);
+    };
+    let mut next = scroll; let half = if height > 3 { height / 2 } else { 1 };
+    if state.pending_top and event.code == 103 and event.modifiers == 0 { next = total; };
+    let top = state.pending_top; state.pending_top = false;
+    if event.code == 103 and event.modifiers == 0 and not top { state.pending_top = true; };
+    if event.code == 1001 or event.code == 107 and event.modifiers <= 1 { next = next + 1; };
+    if event.code == 1002 or event.code == 106 and event.modifiers <= 1 { next = next - 1; };
+    if event.code == 1008 or event.code == 21 and event.modifiers == 4 { next = next + half; };
+    if event.code == 1009 or event.code == 4 and event.modifiers == 4 or event.code == 32 and event.modifiers == 0 { next = next - half; };
+    if event.code == 1005 { next = total; }; if event.code == 1006 or event.code == 71 and event.modifiers <= 1 { next = 0; };
+    let maximum = if total > height { total - height } else { 0 };
+    if next < 0 { next = 0; }; if next > maximum { next = maximum; };
+    reading_action(1, next)
+}

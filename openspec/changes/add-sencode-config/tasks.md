@@ -1,0 +1,6 @@
+- [x] Implement the Sengoo store bridge and isolated credential/catalog checks (`target/bridge-evidence.json`, 14 checks).
+- [x] Generate typed native commands and enforce bounds/timeout (generated bindings match; Rust build passed).
+- [x] Implement desktop-compatible discovery, multi-model enablement, default selection and vision metadata (loopback three-protocol fixture + UI checks).
+- [x] Implement the React connection workbench and form/import/export flows (`npm test`, 4 tests).
+- [x] Validate keyboard, empty/error states and narrow/wide window layouts (`target/ui-evidence.json`, 12 checks).
+- [x] Build and launch a standalone Windows artifact, then record evidence (portable package, native initial end-to-end and final launch/probe; see `sencode-config/verification.md` for exact hashes and limitations).

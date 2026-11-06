@@ -1,0 +1,186 @@
+import common;
+
+// One registry supplies slash parsing, menus, help and host capability gates.
+// A listed future command is never executable until its host enables it.
+struct UiCommand {
+    name: String, aliases: String, description: String, arguments: String,
+    category: String, available: bool, during_run: bool, reason: String,
+}
+struct UiCommandMatch { index: i64, score: i64 }
+struct UiCommandArgument { value: String, description: String }
+
+def commands_add(items: &Vec<UiCommand>, name: &str, aliases: &str, description: &str, arguments: &str, category: &str, available: bool) {
+    let immediate = name == "/help" or name == "/context" or name == "/usage" or name == "/agents" or name == "/connections" or name == "/model" or name == "/permissions" or name == "/quit" or name == "/copy" or name == "/queue" or name == "/keys" or name == "/read" or name == "/history" or name == "/stash";
+    items.push(UiCommand { name: cli_text(name), aliases: cli_text(aliases), description: cli_text(description), arguments: cli_text(arguments), category: cli_text(category), available: available, during_run: immediate, reason: cli_text(if available { "" } else { "This host has not enabled this capability." }) }); ();
+}
+
+def commands_registry() -> Vec<UiCommand> {
+    let items: Vec<UiCommand> = vec_new();
+    commands_add(&items, "/model", "/models", "选择后续请求使用的模型", "[MODEL]", "Models", true);
+    commands_add(&items, "/connections", "/connection", "切换 API 连接", "[ID]", "Models", true);
+    commands_add(&items, "/resume", "/continue", "搜索并恢复会话", "[SESSION]", "Sessions", true);
+    commands_add(&items, "/plan", "", "规划任务，批准后执行", "[TASK|approve]", "Agents", true);
+    commands_add(&items, "/goal", "", "持续目标、预算与恢复", "[TASK|pause|resume]", "Agents", true);
+    commands_add(&items, "/agents", "/tasks", "查看子代理与任务", "", "Agents", true);
+    commands_add(&items, "/consult", "", "多个模型并行会诊", "QUESTION", "Agents", true);
+    commands_add(&items, "/skills", "", "发现并调用项目技能", "[NAME]", "Workspace", true);
+    commands_add(&items, "/permissions", "/allowed-tools", "查看或修改操作权限 · Shift+Tab", "[ask|auto-edit|full|backend]", "Workspace", true);
+    commands_add(&items, "/context", "", "查看当前会话上下文", "", "Sessions", true);
+    commands_add(&items, "/compact", "", "压缩上下文并保留任务", "", "Sessions", true);
+    commands_add(&items, "/usage", "/cost", "按 API 查看用量", "", "Models", true);
+    commands_add(&items, "/copy", "", "复制最新回答或选择代码块", "[code]", "Interface", true);
+    commands_add(&items, "/history", "", "搜索本项目的历史提示词", "[SEARCH]", "Interface", false);
+    commands_add(&items, "/stash", "", "暂存、恢复或交换输入草稿", "", "Interface", false);
+    commands_add(&items, "/queue", "", "查看、编辑或取消待发任务", "[pause|resume|clear]", "Interface", false);
+    commands_add(&items, "/keys", "", "编辑键位与 Vim 输入模式", "[default|vim|show|reset]", "Interface", false);
+    commands_add(&items, "/read", "", "阅读历史输出并保留输入草稿", "", "Interface", false);
+    commands_add(&items, "/terminal", "/term", "打开由你操作的工作区终端", "[powershell|cmd]", "Workspace", false);
+    commands_add(&items, "/worktree", "/worktrees", "查看或明确管理 Git 工作树", "[list|create PATH|remove PATH|cancel]", "Workspace", false);
+    commands_add(&items, "/help", "", "命令与键盘操作说明", "", "Interface", true);
+    commands_add(&items, "/quit", "/exit", "退出并暂停前台任务", "", "Interface", true);
+    commands_add(&items, "/new", "/clear /reset", "新建会话", "", "Sessions", false);
+    commands_add(&items, "/rename", "", "修改当前会话名称", "TITLE", "Sessions", false);
+    commands_add(&items, "/export", "", "导出当前会话", "[PATH]", "Sessions", false);
+    commands_add(&items, "/branch", "/fork", "从当前会话创建分支", "[TITLE]", "Sessions", false);
+    commands_add(&items, "/rewind", "", "查看与恢复文件检查点", "[CHECKPOINT]", "Sessions", false);
+    commands_add(&items, "/mcp", "", "管理本地 MCP 服务", "[list|doctor]", "Workspace", false);
+    commands_add(&items, "/diff", "", "查看工作区修改", "", "Workspace", false);
+    commands_add(&items, "/memory", "", "查看项目指令与记忆", "", "Workspace", false);
+    commands_add(&items, "/doctor", "", "诊断安装与连接环境", "", "Interface", false);
+    commands_add(&items, "/config", "", "查看当前配置与来源", "", "Interface", false);
+    commands_add(&items, "/hooks", "", "管理生命周期 hooks", "", "Extensions", false);
+    commands_add(&items, "/plugin", "/plugins", "插件与扩展", "", "Extensions", false);
+    items
+}
+
+def commands_argument(items: &Vec<UiCommandArgument>, value: &str, description: &str) { items.push(UiCommandArgument { value: cli_text(value), description: cli_text(description) }); (); }
+def commands_arguments(name: &str) -> Vec<UiCommandArgument> {
+    let items: Vec<UiCommandArgument> = vec_new();
+    if name == "/copy" { commands_argument(&items, "code", "选择完整代码块复制，不包含围栏"); };
+    if name == "/permissions" {
+        commands_argument(&items, "ask", "读取自动；修改、命令和 MCP 需要确认");
+        commands_argument(&items, "auto-edit", "允许工作区文件编辑，命令仍单独授权");
+        commands_argument(&items, "full", "自动批准编辑、命令与 MCP；仍遵守 Plan");
+        commands_argument(&items, "allow-commands", "授权后续请求执行非交互命令");
+        commands_argument(&items, "backend", "确认使用托管运行时自己的权限策略");
+    };
+    if name == "/goal" { commands_argument(&items, "pause", "暂停当前目标"); commands_argument(&items, "resume", "明确恢复已保存的目标"); };
+    if name == "/plan" { commands_argument(&items, "approve", "批准计划；执行仍受当前权限约束"); };
+    if name == "/queue" { commands_argument(&items, "pause", "暂停待发任务"); commands_argument(&items, "resume", "明确继续派发待发任务"); commands_argument(&items, "clear", "确认取消全部待发任务"); };
+    if name == "/keys" { commands_argument(&items, "default", "默认编辑模式；保留安全自定义键位"); commands_argument(&items, "vim", "启用文档所列的 Vim 编辑子集"); commands_argument(&items, "show", "查看生效键位和只读配置来源"); commands_argument(&items, "reset", "本次运行恢复内置默认，不修改配置文件"); };
+    if name == "/terminal" { commands_argument(&items, "powershell", "手动操作 PowerShell；不由模型输入命令"); commands_argument(&items, "cmd", "手动操作命令提示符；不由模型输入命令"); };
+    if name == "/worktree" { commands_argument(&items, "list", "只读查看本地 Git 工作树"); commands_argument(&items, "create", "预览并批准创建一个分离 HEAD 工作树"); commands_argument(&items, "remove", "预览并批准移除干净的非当前工作树"); commands_argument(&items, "cancel", "取消当前作业并等待 Git 进程树退出"); };
+    items
+}
+
+// Scrolling/plain hosts expose only handlers they implement. A fullscreen-only
+// command being present in the shared catalog does not make it executable here.
+def commands_scrolling_registry() -> Vec<UiCommand> {
+    let items = commands_registry();
+    commands_enable(&items, "/copy", false, "Copy is provided by the fullscreen interface.").unwrap_or(false);
+    items
+}
+
+def commands_help(items: &Vec<UiCommand>, fullscreen: bool) -> Result<String, i64> {
+    let out = cli_text(if fullscreen { "Type / to search commands. Enter completes the selection; a separate Enter runs it.\n\n" } else { "Commands supported by the scrolling/plain interface:\n\n" });
+    let mut index = 0;
+    while index < items.len() {
+        let command: &UiCommand = items.get(index);
+        if command.available {
+            out.push_str(command.name.as_str())?;
+            if command.arguments.len() > 0 { out.push_str(" ")?; out.push_str(command.arguments.as_str())?; (); };
+            out.push_str("  ")?; out.push_str(command.description.as_str())?;
+            if command.aliases.len() > 0 { out.push_str("  (aliases: ")?; out.push_str(command.aliases.as_str())?; out.push_str(")")?; (); };
+            out.push_str("\n")?; ();
+        }; index = index + 1;
+    };
+    out.push_str("\nEnter sends / Shift+Enter adds a line / Ctrl+C cancels / Ctrl+D exits an empty prompt\n")?;
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def commands_has_alias(aliases: &str, query: &str, prefix: bool) -> bool {
+    let text = cli_text(aliases); let iter = text.split(" ");
+    loop { let item = iter.next(); if not item.is_some { break; }; if item.value.len() > 0 and (if prefix { str_starts_with(item.value.as_str(), query) } else { item.value.as_str() == query }) { iter.free(); return true; }; };
+    iter.free();
+    false
+}
+
+def commands_subsequence(value: &str, query: &str) -> bool {
+    let source = cli_text(value); let bytes = source.bytes(); let needle = cli_text(query); let wanted = needle.bytes(); let mut target = wanted.next();
+    loop { if not target.is_some { break; }; let next = bytes.next(); if not next.is_some { break; }; if next.value == target.value { target = wanted.next(); }; };
+    bytes.free(); wanted.free();
+    not target.is_some
+}
+
+def commands_score(command: &UiCommand, query: &str) -> i64 {
+    let mut score = -1;
+    if query.len() <= 1 { score = 0; } else {
+        if str_starts_with(command.name.as_str(), query) { score = 10; } else {
+            if commands_has_alias(command.aliases.as_str(), query, true) { score = 20; } else {
+                if str_contains(command.name.as_str(), query) { score = 30; } else {
+                    if commands_subsequence(command.name.as_str(), query) { score = 40; } else {
+                        if str_contains(command.description.as_str(), query) { score = 50; };
+                    };
+                };
+            };
+        };
+    };
+    if score >= 0 and not command.available { score = score + 100; };
+    score
+}
+
+def commands_matches(items: &Vec<UiCommand>, input: &str) -> Result<Vec<UiCommandMatch>, i64> {
+    let found: Vec<UiCommandMatch> = vec_new(); let query = str_to_ascii_lower(input)?; let mut index = 0;
+    while index < items.len() {
+        let score = commands_score(items.get(index), query.as_str());
+        if score >= 0 {
+            let mut place = 0;
+            while place < found.len() { let previous: &UiCommandMatch = found.get(place); if score < previous.score { break; }; place = place + 1; };
+            found.insert(place, UiCommandMatch { index: index, score: score }); ();
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: found, error: 0 }
+}
+
+def commands_resolve(items: &Vec<UiCommand>, name: &str) -> Result<String, i64> {
+    let query = str_to_ascii_lower(name)?; let mut index = 0;
+    while index < items.len() {
+        let command: &UiCommand = items.get(index);
+        if command.name.as_str() == query.as_str() or commands_has_alias(command.aliases.as_str(), query.as_str(), false) { return command.name.clone(); };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: cli_text(name), error: 0 }
+}
+
+def commands_enable(items: &Vec<UiCommand>, name: &str, enabled: bool, reason: &str) -> Result<bool, i64> {
+    let mut index = 0;
+    while index < items.len() {
+        let item: &UiCommand = items.get(index);
+        if item.name.as_str() == name {
+            let replacement = UiCommand { name: item.name.clone()?, aliases: item.aliases.clone()?, description: item.description.clone()?, arguments: item.arguments.clone()?, category: item.category.clone()?, available: enabled, during_run: item.during_run, reason: cli_text(reason) };
+            items.set(index, replacement); return Result { is_ok: true, value: true, error: 0 };
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: false, error: 0 }
+}
+
+def commands_names(items: &Vec<UiCommand>) -> Result<String, i64> {
+    let out = string_new(); let mut index = 0;
+    while index < items.len() { let item: &UiCommand = items.get(index); if item.available { if out.len() > 0 { out.push_str(" ")?; (); }; out.push_str(item.name.as_str())?; (); }; index = index + 1; };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def commands_immediate(items: &Vec<UiCommand>, text: &str) -> Result<bool, i64> {
+    if not str_starts_with(text, "/") { return Result { is_ok: true, value: false, error: 0 }; };
+    let split = str_index_of(text, " "); let token = if split < 0 { cli_text(text) } else { cli_byte_slice(text, 0, split)? }; let name = commands_resolve(items, token.as_str())?;
+    let argument = if split < 0 { string_new() } else { str_trim(cli_byte_slice(text, split + 1, text.len())?.as_str())? };
+    if name.as_str() == "/goal" and argument.as_str() == "pause" { return Result { is_ok: true, value: true, error: 0 }; };
+    if name.as_str() == "/worktree" and argument.as_str() == "cancel" {
+        let mut index = 0; while index < items.len() { let item: &UiCommand = items.get(index); if item.name.as_str() == "/worktree" { return Result { is_ok: true, value: item.available, error: 0 }; }; index = index + 1; };
+    };
+    let mut index = 0;
+    while index < items.len() { let command: &UiCommand = items.get(index); if command.name.as_str() == name.as_str() { return Result { is_ok: true, value: command.available and command.during_run, error: 0 }; }; index = index + 1; };
+    Result { is_ok: true, value: false, error: 0 }
+}

@@ -1,0 +1,94 @@
+import workspace;
+import std::terminal;
+import std::random;
+import std::system;
+import std::media;
+import std::env;
+
+def clipboard_attachment_result(text: &str, status: &str) -> Result<JsonDoc, i64> {
+    let result = json_doc_object_bounded(1048576)?;
+    cli_put_string(&result, result.root(), "text", text)?;
+    cli_put_string(&result, result.root(), "status", status)?;
+    cli_put_string(&result, result.root(), "temporary_path", "")?;
+    result.root().object_set("paths", result.new_array()?)?;
+    cli_put_bool(&result, result.root(), "matched", false)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def attachment_image_path(cwd: &str, value: &String) -> Result<String, i64> {
+    if value.len() == 0 or value.len() > 32768 or value.len() != value.as_str().len() { return string_result_err(2); };
+    let full = if path_is_absolute(value.as_str()) { value.clone()? } else { path_join_string(cwd, value.as_str())? };
+    let extension = str_to_ascii_lower(path_extension_string(full.as_str())?.as_str())?;
+    if extension.as_str() != "png" and extension.as_str() != ".png" and extension.as_str() != "jpg" and extension.as_str() != ".jpg" and extension.as_str() != "jpeg" and extension.as_str() != ".jpeg" { return string_result_err(8); };
+    let path = canonical_path_string(full.as_str())?;
+    if file_kind(path.as_str())? != PATH_KIND_FILE() { return string_result_err(8); };
+    let length = file_len(path.as_str())?; if length < 1 or length > 8388608 { return string_result_err(13); };
+    let bytes = ffi_buffer_new(length)?; let count = file_read_into(path.as_str(), bytes)?;
+    if count != length { return string_result_err(12); };
+    let info = media_inspect_with_limits(&bytes, 1048576, 4096, 8192, 16777216)?;
+    if not info.header_recognized() or info.kind != MEDIA_KIND_PNG() and info.kind != MEDIA_KIND_JPEG() { return string_result_err(8); };
+    Result { is_ok: true, value: path, error: 0 }
+}
+
+// Match only a complete pasted path list. Never read paths mentioned in prose.
+def attachment_parse_paths(cwd: &str, text: &str) -> Result<JsonDoc, i64> {
+    let output = clipboard_attachment_result(text, "")?;
+    if text.len() == 0 or text.len() > 65536 { return Result { is_ok: true, value: output, error: 0 }; };
+    let trimmed = str_trim(text)?; let candidates = output.new_array()?;
+    if str_starts_with(trimmed.as_str(), "\"") or str_starts_with(trimmed.as_str(), "'") {
+        let chars = trimmed.chars(); let current = string_new(); let mut quote = 0; let mut valid = true;
+        loop { let next = chars.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?;
+            if quote == 0 { if cp == 34 or cp == 39 { quote = cp; } else { if cp != 32 and cp != 9 and cp != 10 and cp != 13 { valid = false; break; }; }; (); } else {
+                if cp == quote { candidates.array_push(output.new_string(current.as_str())?)?; current.clear(); quote = 0; (); } else { current.push_char(next.value)?; (); }; ();
+            };
+        }; chars.free();
+        if not valid or quote != 0 { return Result { is_ok: true, value: output, error: 0 }; }; ();
+    } else {
+        let lines = trimmed.split("\n"); loop { let next = lines.next(); if not next.is_some { break; }; let path = str_trim(next.value.as_str())?; if path.len() > 0 { candidates.array_push(output.new_string(path.as_str())?)?; (); }; }; lines.free(); ();
+    };
+    let count = candidates.array_len()?;
+    if count == 0 or count > 8 { return Result { is_ok: true, value: output, error: 0 }; };
+    let paths = output.new_array()?; let mut index = 0;
+    while index < count {
+        let candidate = candidates.array_get(index)?.string_value()?;
+        let path = attachment_image_path(cwd, &candidate);
+        if not path.is_ok() { return Result { is_ok: true, value: output, error: 0 }; };
+        paths.array_push(output.new_string(path.value.as_str())?)?; index = index + 1;
+    };
+    output.root().object_set("paths", paths)?; cli_put_bool(&output, output.root(), "matched", true)?;
+    cli_put_string(&output, output.root(), "text", "")?;
+    cli_put_string(&output, output.root(), "status", "Original images attached; no project copy created")?;
+    Result { is_ok: true, value: output, error: 0 }
+}
+
+def clipboard_attachment(cwd: &str, capacity: i64) -> Result<JsonDoc, i64> {
+    if capacity < 0 or capacity > 65536 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let files = json_parse_bounded(terminal_clipboard_files()?.as_str(), 1048576)?;
+    if files.root().array_len()? > 0 {
+        let listed = string_new(); let mut index = 0;
+        while index < files.root().array_len()? { if index > 0 { listed.push_str(" ")?; (); }; listed.push_str("\"")?; listed.push_str(files.root().array_get(index)?.string_value()?.as_str())?; listed.push_str("\"")?; index = index + 1; };
+        return attachment_parse_paths(cwd, listed.as_str());
+    };
+    if terminal_clipboard_has_image()? {
+        if capacity < 16 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        let buffer = ffi_buffer_new(32768)?; let length = env_var_copy("TEMP", buffer)?; let temp = string_from_buffer(buffer, length)?;
+        if not path_is_absolute(temp.as_str()) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 7 }; };
+        let directory = path_join_string(temp.as_str(), "SencodeCLI-clipboard")?; dir_create_all(directory.as_str())?;
+        if file_kind(directory.as_str())? != PATH_KIND_DIR() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 7 }; };
+        let name = cli_text("image-"); name.push_i64(time_unix_ms())?; name.push_str("-")?; name.push_i64(random_i64())?; name.push_str(".png")?;
+        let path = path_join_string(directory.as_str(), name.as_str())?;
+        // Prepare all fallible metadata before creating the exclusive file.
+        let output = clipboard_attachment_result("", "Clipboard pixels have no source path; image cached in system TEMP")?;
+        output.root().object_get("paths")?.array_push(output.new_string(path.as_str())?)?;
+        cli_put_string(&output, output.root(), "temporary_path", path.as_str())?;
+        cli_put_bool(&output, output.root(), "matched", true)?;
+        if terminal_clipboard_image_save(&path, 8388608)? {
+            return Result { is_ok: true, value: output, error: 0 };
+        };
+    };
+    let text = terminal_clipboard_text()?;
+    let parsed = attachment_parse_paths(cwd, text.as_str())?;
+    if not parsed.root().object_get("matched")?.bool_value()? and text.len() > capacity { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    if text.len() == 0 { cli_put_string(&parsed, parsed.root(), "status", "Clipboard has no image or text. Use Alt+V if the terminal intercepts Ctrl+V.")?; (); };
+    Result { is_ok: true, value: parsed, error: 0 }
+}

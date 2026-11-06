@@ -1,0 +1,84 @@
+import common;
+
+// This is evidence about one network attempt, never permission to rerun tools.
+struct RetryEvidence {
+    attempt: i64,
+    status: i64,
+    error: i64,
+    request_started: bool,
+    stream_observed: bool,
+    side_effects: bool,
+}
+
+struct RetryDecision { retry: bool, delay_ms: i64, reason: String }
+
+def retry_decision(retry: bool, delay_ms: i64, reason: &str) -> RetryDecision {
+    RetryDecision { retry: retry, delay_ms: delay_ms, reason: cli_text(reason) }
+}
+
+def retry_leap(year: i64) -> bool { year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) }
+
+def retry_month(name: &str) -> i64 {
+    if name == "Jan" { return 1; }; if name == "Feb" { return 2; }; if name == "Mar" { return 3; };
+    if name == "Apr" { return 4; }; if name == "May" { return 5; }; if name == "Jun" { return 6; };
+    if name == "Jul" { return 7; }; if name == "Aug" { return 8; }; if name == "Sep" { return 9; };
+    if name == "Oct" { return 10; }; if name == "Nov" { return 11; }; if name == "Dec" { return 12; };
+    0
+}
+
+def retry_month_days(year: i64, month: i64) -> i64 {
+    if month == 2 { return if retry_leap(year) { 29 } else { 28 }; };
+    if month == 4 or month == 6 or month == 9 or month == 11 { return 30; };
+    31
+}
+
+// Preferred IMF-fixdate form, with a bounded calendar. Obsolete/invalid HTTP
+// date forms fail closed instead of accidentally scheduling an early retry.
+def retry_http_date(value: &str) -> Result<i64, i64> {
+    if value.len() != 29 or cli_byte_slice(value, 3, 5)?.as_str() != ", " or cli_byte_slice(value, 7, 8)?.as_str() != " " or cli_byte_slice(value, 11, 12)?.as_str() != " " or cli_byte_slice(value, 16, 17)?.as_str() != " " or cli_byte_slice(value, 19, 20)?.as_str() != ":" or cli_byte_slice(value, 22, 23)?.as_str() != ":" or cli_byte_slice(value, 25, 29)?.as_str() != " GMT" { return cli_fail(2); };
+    let weekday = cli_byte_slice(value, 0, 3)?;
+    if weekday.as_str() != "Mon" and weekday.as_str() != "Tue" and weekday.as_str() != "Wed" and weekday.as_str() != "Thu" and weekday.as_str() != "Fri" and weekday.as_str() != "Sat" and weekday.as_str() != "Sun" { return cli_fail(2); };
+    let day = cli_parse_unsigned(cli_byte_slice(value, 5, 7)?.as_str(), 10)?;
+    let month = retry_month(cli_byte_slice(value, 8, 11)?.as_str());
+    let year = cli_parse_unsigned(cli_byte_slice(value, 12, 16)?.as_str(), 10)?;
+    let hour = cli_parse_unsigned(cli_byte_slice(value, 17, 19)?.as_str(), 10)?;
+    let minute = cli_parse_unsigned(cli_byte_slice(value, 20, 22)?.as_str(), 10)?;
+    let second = cli_parse_unsigned(cli_byte_slice(value, 23, 25)?.as_str(), 10)?;
+    if year < 1970 or year > 9999 or month < 1 or day < 1 or day > retry_month_days(year, month) or hour > 23 or minute > 59 or second > 59 { return cli_fail(2); };
+    let mut days = 0;
+    let mut cursor = 1970;
+    while cursor < year { days = days + if retry_leap(cursor) { 366 } else { 365 }; cursor = cursor + 1; };
+    cursor = 1;
+    while cursor < month { days = days + retry_month_days(year, cursor); cursor = cursor + 1; };
+    days = days + day - 1;
+    cli_ok(((days * 24 + hour) * 60 + minute) * 60000 + second * 1000)
+}
+
+// A valid server delay above the local bound means do not retry. Clamping it
+// down would violate Retry-After and can amplify a provider outage.
+def retry_after_delay(header: &str, now_ms: i64) -> Result<i64, i64> {
+    if header.len() == 0 or header.len() > 128 or now_ms < 0 { return cli_fail(2); };
+    let trimmed = str_trim(header)?;
+    let seconds = cli_parse_unsigned(trimmed.as_str(), 10);
+    if seconds.is_ok() { if seconds.value > 30 { return cli_fail(13); }; return cli_ok(seconds.value * 1000); };
+    let date = retry_http_date(trimmed.as_str())?;
+    if date <= now_ms { return cli_ok(0); };
+    if date - now_ms > 30000 { return cli_fail(13); };
+    cli_ok(date - now_ms)
+}
+
+def request_retry(evidence: &RetryEvidence, retry_after: &str, now_ms: i64, waited_ms: i64) -> RetryDecision {
+    if evidence.attempt < 1 or evidence.attempt >= 3 or waited_ms < 0 or waited_ms >= 30000 { return retry_decision(false, 0, "attempt or wait limit reached"); };
+    if evidence.stream_observed or evidence.side_effects { return retry_decision(false, 0, "stream or side effect already observed; inspect before retrying"); };
+    let rejected = evidence.status == 429 or evidence.status == 500 or evidence.status == 502 or evidence.status == 503 or evidence.status == 504;
+    let before_send = evidence.status == 0 and not evidence.request_started and (evidence.error == 9 or evidence.error == 11);
+    if not rejected and not before_send { return retry_decision(false, 0, "failure is not safely retryable"); };
+    let mut delay = if evidence.attempt == 1 { 250 } else { 500 };
+    if retry_after.len() > 0 {
+        let parsed = retry_after_delay(retry_after, now_ms);
+        if not parsed.is_ok() { return retry_decision(false, 0, "Retry-After is invalid or exceeds the local wait bound"); };
+        if parsed.value > delay { delay = parsed.value; };
+    };
+    if delay > 30000 - waited_ms { return retry_decision(false, 0, "server delay exceeds remaining bounded wait"); };
+    retry_decision(true, delay, if rejected { "provider rejected the attempt before streaming" } else { "transport proved request emission never began" })
+}

@@ -1,0 +1,242 @@
+import tui;
+
+// Projection state is frontend-owned. Internal sessions and call IDs are keys,
+// never terminal text. A child keeps one card across all of its model requests.
+struct UiAgentCall { id: String, name: String, detail: String }
+struct UiAgentCard {
+    session: String, key: String, model: String, role: String,
+    preview: String, activity: String, tool_call: String, phase: String,
+    counters: Vec<i64>, calls: Vec<UiAgentCall>,
+}
+struct UiAgents { cards: Vec<UiAgentCard> }
+
+def tui_agents_new() -> UiAgents {
+    let cards: Vec<UiAgentCard> = vec_new(); UiAgents { cards: cards }
+}
+
+// Counters: id, newest request, terminal (0 live / 1 done / 2 failed /
+// 3 interrupted), distinct tools, input tokens, output tokens, read-only flag,
+// current canonical tool index.
+def tui_agent_count(card: &UiAgentCard, index: i64) -> i64 { card.counters.get(index).unwrap_or(0) }
+
+def tui_agent_slot(agents: &UiAgents, session: &str) -> i64 {
+    let mut index = agents.cards.len() - 1;
+    while index >= 0 { if agents.cards.get(index).session.as_str() == session { return index; }; index = index - 1; }; -1
+}
+
+def tui_agent_create(agents: &UiAgents, session: &str, id: i64, model: &str) -> Result<i64, i64> {
+    if session.len() == 0 or session.len() > 1024 or id <= 0 { return cli_fail(2); };
+    if agents.cards.len() >= 32 {
+        let mut index = 0;
+        while index < agents.cards.len() and tui_agent_count(agents.cards.get(index), 2) == 0 { index = index + 1; };
+        if index == agents.cards.len() { return cli_fail(13); };
+        agents.cards.remove(index); ();
+    };
+    let key = cli_join("agent/", session)?; key.push_str("/")?; key.push_i64(id)?;
+    let counters: Vec<i64> = vec_new(); let mut index = 0;
+    while index < 10 { counters.push(if index == 0 { id } else { if index == 7 { -1 } else { if index == 8 { time_monotonic_ms() } else { 0 } } }); index = index + 1; };
+    let calls: Vec<UiAgentCall> = vec_new();
+    agents.cards.push(UiAgentCard { session: cli_text(session), key: key, model: pending_preview(model, 44)?, role: string_new(), preview: string_new(), activity: cli_text("Starting"), tool_call: string_new(), phase: cli_text("working"), counters: counters, calls: calls });
+    cli_ok(agents.cards.len() - 1)
+}
+
+def tui_agent_preview(card: &UiAgentCard, text: &str) -> Result<bool, i64> {
+    let safe = pending_preview(tui_limit(text, 768)?.as_str(), 144)?;
+    card.preview.clear(); card.preview.push_str(safe.as_str())?; tui_true()
+}
+
+def tui_agent_argument_preview(args: JsonValue) -> Result<String, i64> {
+    let path = cli_json_optional_string(args, "path");
+    let command = cli_json_optional_string(args, "command");
+    let query = cli_json_optional_string(args, "query");
+    pending_preview(if path.len() > 0 { path.as_str() } else { if command.len() > 0 { command.as_str() } else { query.as_str() } }, 144)
+}
+
+def tui_agent_register_call(card: &UiAgentCard, id: &str, name: &str, detail: &str) -> Result<i64, i64> {
+    let mut index = 0;
+    while index < card.calls.len() { if card.calls.get(index).id.as_str() == id { return cli_ok(index); }; index = index + 1; };
+    if id.len() == 0 or id.len() > 1024 or name.len() == 0 or name.len() > 128 or card.calls.len() >= 256 { return cli_ok(-1); };
+    card.calls.push(UiAgentCall { id: cli_text(id), name: pending_preview(name, 48)?, detail: pending_preview(detail, 144)? });
+    card.counters.set(3, tui_agent_count(card, 3) + 1); cli_ok(card.calls.len() - 1)
+}
+
+def tui_agent_show_call(card: &UiAgentCard, slot: i64, suffix: &str) -> Result<bool, i64> {
+    if slot < 0 or slot >= card.calls.len() { return tui_true(); };
+    let call: &UiAgentCall = card.calls.get(slot);
+    card.tool_call.clear(); card.tool_call.push_str(call.id.as_str())?;
+    card.activity.clear(); card.activity.push_str(call.name.as_str())?; card.activity.push_str(suffix)?;
+    tui_agent_preview(card, call.detail.as_str())
+}
+
+def tui_agent_paint(app: &mut UiApp, card: &UiAgentCard) -> Result<bool, i64> {
+    let title = cli_text("Agent #"); title.push_i64(tui_agent_count(card, 0))?;
+    if card.model.len() > 0 { title.push_str("  ")?; title.push_str(card.model.as_str())?; (); };
+    let detail = string_new();
+    if card.role.len() > 0 { detail.push_str(card.role.as_str())?; (); };
+    if tui_agent_count(card, 6) > 0 { if detail.len() > 0 { detail.push_str(" · ")?; (); }; detail.push_str("read only")?; (); };
+    let tools = tui_agent_count(card, 3);
+    if tools > 0 { if detail.len() > 0 { detail.push_str(" · ")?; (); }; detail.push_i64(tools)?; detail.push_str(if tools == 1 { " tool" } else { " tools" })?; (); };
+    // A fast tool may finish between rendered frames. Keep its readable name
+    // in the stable summary when a later request replaces transient activity.
+    if card.calls.len() > 0 { detail.push_str(" · ")?; detail.push_str(card.calls.get(card.calls.len() - 1).name.as_str())?; (); };
+    let body = string_new();
+    if card.activity.len() > 0 { body.push_str(card.activity.as_str())?; (); };
+    if card.preview.len() > 0 { if body.len() > 0 { body.push_str(" · ")?; (); }; body.push_str(card.preview.as_str())?; (); };
+    let status = tui_agent_count(card, 2);
+    if status != 0 { body.push_str("\n")?; body.push_str(if status == 1 { "Worked for " } else { if status == 3 { "Cancelled after " } else { "Stopped after " } })?; body.push_str(tui_duration(tui_agent_count(card, 9))?.as_str())?; (); };
+    tui_tool(app, card.key.as_str(), title.as_str(), if status == 0 { "running" } else { if status == 1 { "completed" } else { if status == 2 { "failed" } else { "interrupted" } } }, detail.as_str(), body.as_str())?;
+    tui_tool_phase(app, card.key.as_str(), card.phase.as_str())
+}
+
+def tui_agent_event_body(agents: &UiAgents, app: &mut UiApp, text: &str) -> Result<bool, i64> {
+    if text.len() == 0 or text.len() > 262144 { return tui_true(); };
+    let document = json_parse_bounded(text, 262144)?;
+    let event = document.root().object_get("agent")?;
+    if event.kind()? != JSON_KIND_OBJECT() { return tui_true(); };
+    let id = event.object_get("id")?.number_i64()?;
+    let request = event.object_get("request")?.number_i64()?;
+    let session = cli_json_string(event, "session_id")?;
+    let kind = cli_json_string(event, "kind")?;
+    if id <= 0 or request < 1 or session.len() == 0 or session.len() > 1024 or session.as_str() == app.session.as_str() { return tui_true(); };
+    if kind.as_str() != "phase" and kind.as_str() != "request_started" and kind.as_str() != "text_delta" and kind.as_str() != "turn" and kind.as_str() != "usage" and kind.as_str() != "tool_denied" and kind.as_str() != "tool_completed" and kind.as_str() != "finished" { return tui_true(); };
+    let value = event.object_get("value")?;
+    if value.kind()? != JSON_KIND_OBJECT() { return tui_true(); };
+    let existing = tui_agent_slot(agents, session.as_str());
+    let slot = if existing >= 0 { existing } else { tui_agent_create(agents, session.as_str(), id, cli_json_optional_string(event, "model").as_str())? };
+    let card: &UiAgentCard = agents.cards.get(slot);
+    if tui_agent_count(card, 0) != id or tui_agent_count(card, 2) != 0 or request < tui_agent_count(card, 1) { return tui_true(); };
+    if request > tui_agent_count(card, 1) {
+        card.phase.clear(); card.phase.push_str("working")?;
+        card.counters.set(1, request); card.preview.clear(); card.activity.clear(); card.activity.push_str("Working")?; card.tool_call.clear(); ();
+    };
+    let role = cli_json_optional_string(event, "role");
+    if role.as_str() == "explore" or role.as_str() == "plan" or role.as_str() == "general" { card.role.clear(); card.role.push_str(role.as_str())?; (); };
+    if event.object_has("read_only") { if event.object_get("read_only")?.bool_value()? { card.counters.set(6, 1); (); }; } else { if role.as_str() == "explore" or role.as_str() == "plan" { card.counters.set(6, 1); (); }; };
+    if kind.as_str() == "phase" { let phase = cli_json_optional_string(value, "phase"); if phase.as_str() == "thinking" or phase.as_str() == "working" or phase.as_str() == "waiting" { card.phase.clear(); card.phase.push_str(phase.as_str())?; (); }; };
+    if kind.as_str() == "text_delta" { card.phase.clear(); card.phase.push_str("working")?;
+        // The card holds only a bounded preview. A full preview stops growing;
+        // every provider token does not allocate another transcript entry.
+        if card.preview.len() >= 576 { return tui_true(); };
+        let before = card.preview.clone()?; let already_working = card.activity.as_str() == "Working";
+        let delta = cli_json_string(value, "content")?;
+        let joined = card.preview.clone()?; joined.push_str(tui_limit(delta.as_str(), 576 - card.preview.len())?.as_str())?;
+        tui_agent_preview(card, joined.as_str())?;
+        if already_working and before.as_str() == card.preview.as_str() { return tui_true(); };
+        card.activity.clear(); card.activity.push_str("Working")?; ();
+    };
+    if kind.as_str() == "turn" {
+        let content = cli_json_optional_string(value, "content");
+        if content.len() > 0 { tui_agent_preview(card, content.as_str())?; (); };
+        card.activity.clear(); card.activity.push_str("Working")?;
+        if value.object_has("tool_calls") {
+            let calls = value.object_get("tool_calls")?; let mut index = 0; let mut first = -1;
+            while index < calls.array_len()? and index < 128 {
+                let call = calls.array_get(index)?; let call_id = cli_json_optional_string(call, "id"); let name = cli_json_optional_string(call, "name");
+                let encoded = cli_json_optional_string(call, "arguments");
+                let arguments = json_parse_bounded(encoded.as_str(), 262144);
+                let detail = if arguments.is_ok() { tui_agent_argument_preview(arguments.value.root())? } else { string_new() };
+                let registered = tui_agent_register_call(card, call_id.as_str(), name.as_str(), detail.as_str())?;
+                if first < 0 { first = registered; };
+                index = index + 1;
+            };
+            if first >= 0 { card.counters.set(7, first); tui_agent_show_call(card, first, "")?; (); };
+        }; ();
+    };
+    if kind.as_str() == "usage" { return tui_true(); };
+    if kind.as_str() == "tool_denied" {
+        let name = cli_json_optional_string(value, "name");
+        card.activity.clear(); card.activity.push_str(pending_preview(name.as_str(), 48)?.as_str())?; card.activity.push_str(" denied")?; ();
+    };
+    if kind.as_str() == "tool_completed" {
+        let current = tui_agent_count(card, 7); let mut unknown = false;
+        if value.object_has("outcome_unknown") { unknown = value.object_get("outcome_unknown")?.bool_value()?; };
+        let failed = value.object_has("is_error") and value.object_get("is_error")?.bool_value()?;
+        if unknown { card.counters.set(2, 3); tui_agent_show_call(card, current, " outcome unknown")?; (); } else {
+            let next = current + 1;
+            if current >= 0 and next < card.calls.len() { card.counters.set(7, next); tui_agent_show_call(card, next, "")?; (); } else {
+                tui_agent_show_call(card, current, if failed { " failed" } else { " done" })?; ();
+            };
+        }; ();
+    };
+    if kind.as_str() == "finished" {
+        let code = value.object_get("error")?.number_i64()?;
+        card.counters.set(9, cli_json_optional_i64(value, "elapsed_ms", time_monotonic_ms() - tui_agent_count(card, 8)));
+        card.counters.set(2, if code == 0 { 1 } else { if code == 19 { 3 } else { 2 } });
+        card.activity.clear(); card.activity.push_str(if code == 0 { "Done" } else { if code == 19 { "Cancelled" } else { "Stopped" } })?;
+        let content = cli_json_optional_string(value, "content");
+        if content.len() > 0 { tui_agent_preview(card, content.as_str())?; (); };
+        ();
+    };
+    tui_agent_paint(app, card)
+}
+
+// Invalid, unknown and future payloads never fall back to raw protocol text.
+def tui_agent_event(agents: &UiAgents, app: &mut UiApp, text: &str) -> Result<bool, i64> {
+    let result = tui_agent_event_body(agents, app, text);
+    if result.is_ok() { return result; };
+    if result.error == 8 or result.error == 14 { return result; };
+    tui_status(app, "An Agent update could not be displayed")
+}
+
+def tui_agent_tool_body(agents: &UiAgents, app: &mut UiApp, event: &JsonDoc) -> Result<bool, i64> {
+    let session = cli_json_string(event.root(), "session_id")?;
+    if session.as_str() == app.session.as_str() { return tui_true(); };
+    let slot = tui_agent_slot(agents, session.as_str()); if slot < 0 { return tui_true(); };
+    let card: &UiAgentCard = agents.cards.get(slot); if tui_agent_count(card, 2) != 0 { return tui_true(); };
+    let raw = cli_json_string(event.root(), "text")?; if raw.len() > 262144 { return tui_true(); };
+    let value = json_parse_bounded(raw.as_str(), 262144)?;
+    let name = cli_json_string(value.root(), "name")?;
+    let status = cli_json_string(value.root(), "status")?;
+    let call = cli_json_string(event.root(), "id")?;
+    if name.len() == 0 or name.len() > 128 or call.len() == 0 or call.len() > 1024 { return tui_true(); };
+    if status.as_str() != "running" and status.as_str() != "completed" and status.as_str() != "failed" { return tui_true(); };
+    if status.as_str() == "running" {
+        card.phase.clear(); card.phase.push_str("working")?;
+        if card.tool_call.as_str() == call.as_str() { return tui_true(); };
+        let detail = if value.root().object_has("arguments") { tui_agent_argument_preview(value.root().object_get("arguments")?)? } else { string_new() };
+        let registered = tui_agent_register_call(card, call.as_str(), name.as_str(), detail.as_str())?;
+        if registered >= 0 { card.counters.set(7, registered); (); };
+        card.tool_call.clear(); card.tool_call.push_str(call.as_str())?;
+        card.activity.clear(); card.activity.push_str(pending_preview(name.as_str(), 48)?.as_str())?;
+        card.preview.clear();
+        if value.root().object_has("arguments") {
+            let args = value.root().object_get("arguments")?;
+            let path = cli_json_optional_string(args, "path");
+            let command = cli_json_optional_string(args, "command");
+            let query = cli_json_optional_string(args, "query");
+            tui_agent_preview(card, if path.len() > 0 { path.as_str() } else { if command.len() > 0 { command.as_str() } else { query.as_str() } })?; ();
+        }; ();
+    } else {
+        if card.tool_call.as_str() != call.as_str() { return tui_true(); };
+        let mut unknown = not value.root().object_has("result");
+        if not unknown {
+            let result = value.root().object_get("result")?;
+            if result.object_has("outcome_unknown") { unknown = result.object_get("outcome_unknown")?.bool_value()?; };
+        };
+        card.activity.clear(); card.activity.push_str(pending_preview(name.as_str(), 48)?.as_str())?;
+        card.activity.push_str(if unknown { " outcome unknown" } else { if status.as_str() == "failed" { " failed" } else { " done" } })?;
+        if unknown { card.counters.set(2, 3); (); };
+        ();
+    };
+    tui_agent_paint(app, card)
+}
+
+def tui_agent_tool_event(agents: &UiAgents, app: &mut UiApp, event: &JsonDoc) -> Result<bool, i64> {
+    let result = tui_agent_tool_body(agents, app, event);
+    if result.is_ok() { return result; };
+    if result.error == 8 or result.error == 14 { return result; };
+    tui_status(app, "An Agent tool update could not be displayed")
+}
+
+// Parent success cannot manufacture a missing child's terminal outcome.
+def tui_agents_finish(agents: &UiAgents, app: &mut UiApp, success: bool) -> Result<bool, i64> {
+    let mut index = 0;
+    while index < agents.cards.len() {
+        let card: &UiAgentCard = agents.cards.get(index);
+        if tui_agent_count(card, 2) == 0 {
+            card.counters.set(9, time_monotonic_ms() - tui_agent_count(card, 8)); card.counters.set(2, 3); card.activity.clear(); card.activity.push_str(if success { "Terminal outcome unavailable" } else { "Interrupted" })?;
+            tui_agent_paint(app, card)?; ();
+        };
+        index = index + 1;
+    }; tui_true()
+}

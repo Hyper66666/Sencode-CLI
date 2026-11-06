@@ -1,0 +1,112 @@
+import tui;
+import tui_history;
+import tui_agents;
+import edit_diff;
+
+def reading_expect(ok: bool, label: &str) -> Result<bool, i64> {
+    if not ok { println(label); return Result { is_ok: false, value: false, error: 99 }; }; tui_true()
+}
+
+def reading_count(text: &str, needle: &str) -> i64 {
+    let source = cli_text(text); let parts = source.split(needle); let mut count = -1;
+    loop { if not parts.next().is_some { break; }; count = count + 1; }; parts.free(); count
+}
+
+def reading_diff_tests() -> Result<bool, i64> {
+    let before = string_new(); let after = string_new(); let mut index = 1;
+    while index <= 200 { before.push_str("line ")?; before.push_i64(index)?; before.push_str("\n")?;
+        if index == 10 or index == 190 { after.push_str("changed 中文 é 👨‍👩 ")?; } else { after.push_str("line ")?; }; after.push_i64(index)?; after.push_str("\n")?; index = index + 1;
+    };
+    let model = edit_model(before.as_str(), after.as_str())?;
+    reading_expect(not model.simplified and model.added == 2 and model.removed == 2, "two distant edits preserve the unchanged middle")?;
+    let diff = edit_diff("src/中文.sg", before.as_str(), after.as_str())?;
+    reading_expect(reading_count(diff.as_str(), "@@ -") == 2 and not str_contains(diff.as_str(), "-line 100"), "independent edits produce two three-context hunks")?;
+    let newline = edit_model("same", "same\n")?; reading_expect(newline.added == 1 and newline.removed == 1, "newline-only edits remain real changes")?;
+    let rows: Vec<UiLine> = vec_new(); md_edit_render(&rows, diff.as_str(), 70, 12)?;
+    reading_expect(rows.get(0).text.as_str() == "Edited src/中文.sg (+2 −2)" and rows.get(0).spans.len() == 3, "diff title has path and independent green/red counts")?;
+    let mut removed = 0; let mut added = 0; let mut blank = 0; index = 0;
+    while index < rows.len() { let row: &UiLine = rows.get(index); reading_expect(row.cells <= 70 and not str_contains(row.text.as_str(), "\x1b"), "diff text stays safe and bounded")?;
+        if row.style == 6 { removed = removed + 1; reading_expect(row.spans.len() == 1 and row.spans.get(0).style == 2 and str_contains(row.text.as_str(), " - "), "deleted line has one grey number gutter")?; (); };
+        if row.style == 5 { added = added + 1; reading_expect(row.spans.len() == 1 and row.spans.get(0).style == 2 and str_contains(row.text.as_str(), " + "), "added line has one grey number gutter")?; (); };
+        if row.text.len() == 0 { blank = blank + 1; }; index = index + 1;
+    };
+    reading_expect(removed == 2 and added == 2 and blank == 1, "separated hunks retain exactly their edited lines and one blank gap")?;
+    reading_expect(not str_contains(tui_style_sequence(5, false, false, true).as_str(), "48;") and not str_contains(tui_style_sequence(6, false, false, true).as_str(), "48;"), "diff never paints full red/green backgrounds")?;
+    let inline: Vec<UiLine> = vec_new(); md_render(&inline, "Use **bold** and `src/中文.sg` safely.", 80, 13)?;
+    reading_expect(inline.get(0).spans.len() == 2 and not str_contains(inline.get(0).text.as_str(), "`"), "inline emphasis and code retain semantic spans")?;
+    let long_old = string_new(); let long_new = string_new(); index = 0;
+    while index < 1100 { long_old.push_str("old\n")?; long_new.push_str("new\n")?; index = index + 1; };
+    let limited = edit_diff("large", long_old.as_str(), long_new.as_str())?;
+    reading_expect(str_contains(limited.as_str(), "Diff simplified: comparison budget exceeded.") and not str_contains(limited.as_str(), "@@ -"), "bounded fallback never invents exact hunks")?;
+    tui_true()
+}
+
+def reading_group_tests() -> Result<bool, i64> {
+    let mut app = tui_new("fixture", "fixture", "fixture", "session"); tui_resize(&mut app, 120, 45)?;
+    tui_message(&mut app, "user", "Inspect the project")?;
+    tui_tool(&mut app, "r/1", "read_file", "running", "one.sg", "")?; tui_tool(&mut app, "r/1", "read_file", "completed", "", "")?;
+    tui_tool(&mut app, "r/2", "read_file", "completed", "two.sg", "")?; tui_tool(&mut app, "r/3", "read_file", "completed", "one.sg", "")?;
+    tui_tool(&mut app, "r/4", "list_directory", "completed", "src", "")?; tui_tool(&mut app, "r/5", "search", "completed", "TODO", "")?;
+    let folded = tui_frame(&app)?;
+    reading_expect(str_contains(folded.as_str(), "Explored 2 files") and str_contains(folded.as_str(), "1 directory") and str_contains(folded.as_str(), "1 search") and not str_contains(folded.as_str(), "one.sg"), "consecutive reads collapse and deduplicate actual paths")?;
+    tui_set_draft(&mut app, "draft stays")?;
+    let toggle = TerminalEvent { kind: 1, code: 15, modifiers: 4, width: 120, height: 45, data: string_new() };
+    let action = tui_event(&mut app, &toggle)?;
+    reading_expect(action.kind == 0 and app.draft.as_str() == "draft stays" and str_contains(tui_frame(&app)?.as_str(), "one.sg"), "Ctrl+O expands without submitting or editing the draft")?;
+    tui_resize(&mut app, 80, 40)?; reading_expect(tui_group_open(&app, app.messages.get(1).id), "resize preserves stable group identity")?;
+    tui_paint_update(&mut app, true)?; let mut row = 0;
+    while row < app.visible_group_ids.len() and app.visible_group_ids.get(row).unwrap_or(0) == 0 { row = row + 1; };
+    reading_expect(row < app.visible_group_ids.len(), "visible group registers an exact mouse target")?;
+    let mouse = TerminalMouseEvent { row: row, column: 8, action: 1, button: 1, scroll_x: 0, scroll_y: 0, clicks: 1, modifiers: 0 };
+    tui_mouse(&mut app, &mouse)?;
+    reading_expect(not str_contains(tui_frame(&app)?.as_str(), "one.sg") and app.draft.as_str() == "draft stays", "click collapses only its group")?;
+    tui_message(&mut app, "assistant", "Now check another location")?;
+    tui_tool(&mut app, "r/6", "read_file", "failed", "missing.sg", "File does not exist")?;
+    let failed = tui_frame(&app)?;
+    reading_expect(reading_count(failed.as_str(), "Explored") == 2 and str_contains(failed.as_str(), "missing.sg") and str_contains(failed.as_str(), "File does not exist"), "answer ends the previous group and failed details remain visible")?;
+    tui_true()
+}
+
+def reading_activity_tests() -> Result<bool, i64> {
+    let mut app = tui_new("fixture", "fixture", "fixture", "session"); tui_resize(&mut app, 120, 30)?;
+    tui_begin(&mut app)?; tui_set_draft(&mut app, "kept draft")?;
+    reading_expect(str_contains(tui_frame(&app)?.as_str(), "Working") and not str_contains(tui_frame(&app)?.as_str(), "Thinking"), "no reasoning signal means Working")?;
+    tui_activity(&mut app, "thinking")?; let frame = tui_frame(&app)?;
+    reading_expect(reading_count(frame.as_str(), "Thinking") == 1 and str_index_of(frame.as_str(), "Thinking") < str_index_of(frame.as_str(), "╭"), "Thinking occurs once in the conversation, above the composer")?;
+    app.animation_tick = 0; tui_paint_update(&mut app, true)?; app.animation_tick = 1; let update = tui_paint_update(&mut app, true)?;
+    reading_expect(str_contains(update.as_str(), "Thinking") and not str_contains(update.as_str(), "╭") and not str_contains(update.as_str(), "\x1b[?25"), "activity animation repaints only its own row")?;
+    let rows = tui_frame_rows(&app)?; let composer_top = app.height - 5;
+    reading_expect(str_trim(rows.get(composer_top - 1).text.as_str())?.len() == 0 and str_contains(rows.get(composer_top).text.as_str(), "╭"), "one reserved blank row separates output from composer")?;
+    tui_set_approval(&mut app, "permission", "Allow?", false)?; reading_expect(str_contains(tui_frame(&app)?.as_str(), "Waiting for approval") and not tui_animation_due(&app, 2), "approval state is static and explicit")?;
+    app.approval.clear(); tui_delta(&mut app, "First segment")?; let started = app.turn_started; let identity = app.activity_id; tui_continuation(&mut app)?;
+    reading_expect(app.busy and app.turn_started == started and app.activity_id == identity and app.messages.len() == 1 and app.messages.get(0).text.as_str() == "First segment", "continuation seals text without completing or resetting the turn")?;
+    tui_delta(&mut app, "Done")?; tui_finish_elapsed(&mut app, true, 6191000)?;
+    reading_expect(str_contains(tui_frame(&app)?.as_str(), "Worked for 1h43min11s") and not tui_animation_due(&app, 10), "completion freezes compact duration")?;
+    tui_paint_update(&mut app, true)?; app.animation_tick = 20; reading_expect(tui_paint_update(&mut app, true)?.len() == 0, "completed frame and cursor generate zero idle writes")?;
+    let restored = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"Question\"},{\"role\":\"assistant\",\"content\":\"Saved answer\",\"cli_turn_elapsed_ms\":6191000,\"cli_turn_outcome\":\"completed\"}]}")?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &restored)?;
+    reading_expect(not app.busy and str_contains(tui_frame(&app)?.as_str(), "Worked for 1h43min11s") and not tui_animation_due(&app, 21), "restored duration is static historical metadata")?;
+    let before_answer = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"Cancelled before answer\",\"cli_turn_elapsed_ms\":2300,\"cli_turn_outcome\":\"interrupted\"}]}")?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &before_answer)?;
+    reading_expect(not app.busy and str_contains(tui_frame(&app)?.as_str(), "Cancelled after 2s"), "user-anchored cancellation duration restores before an assistant exists")?;
+    tui_clear(&mut app)?; tui_begin(&mut app)?; tui_finish_outcome(&mut app, false, 3100, "stopped")?;
+    reading_expect(str_contains(tui_frame(&app)?.as_str(), "Stopped after 3s") and not str_contains(tui_frame(&app)?.as_str(), "Cancelled after"), "ordinary failures have stopped durations, not user-cancellation labels")?;
+    let command = json_parse("{\"is_error\":true,\"content\":\"{\\\"exit_code\\\":2,\\\"stderr\\\":\\\"missing file 中文\\\",\\\"stdout\\\":\\\"\\\",\\\"timed_out\\\":false,\\\"cancelled\\\":false}\"}")?;
+    let human = tui_tool_error_text(command.root())?;
+    reading_expect(str_contains(human.as_str(), "Command exited with code 2") and str_contains(human.as_str(), "missing file 中文") and not str_contains(human.as_str(), "exit_code"), "command failures show readable status and stderr instead of serialized JSON")?;
+    let bad_command = json_parse("{\"exit_code\":2,\"stderr\":\"original diagnostic\",\"timed_out\":\"false\",\"cancelled\":null,\"stdout_lossy\":{},\"stderr_lossy\":5,\"truncated\":[]}")?;
+    let bad_result = json_doc_object()?; cli_put_bool(&bad_result, bad_result.root(), "is_error", true)?; cli_put_string(&bad_result, bad_result.root(), "content", bad_command.serialize_string()?.as_str())?;
+    let malformed = json_parse("{\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"badflags\",\"name\":\"run_command\",\"arguments\":\"{}\"}]},{\"role\":\"tool\",\"tool_call_id\":\"badflags\"}]}")?;
+    cli_put_string(&malformed, malformed.root().object_get("messages")?.array_get(1)?, "content", bad_result.serialize_string()?.as_str())?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &malformed)?;
+    reading_expect(app.messages.len() == 1 and app.messages.get(0).tool_status.as_str() == "failed" and str_contains(tui_frame(&app)?.as_str(), "original diagnostic"), "malformed optional command flags cannot break restored history or imply tool success")?;
+    let plain = tui_paint_update(&mut app, false)?; reading_expect(not str_contains(plain.as_str(), "\x1b[32m") and not str_contains(plain.as_str(), "\x1b[38;"), "NO_COLOR retains text without semantic SGR")?;
+    tui_true()
+}
+
+def main() -> i64 {
+    let diff = reading_diff_tests(); if not diff.is_ok { return 1; };
+    let groups = reading_group_tests(); if not groups.is_ok { return 1; };
+    let activity = reading_activity_tests(); if not activity.is_ok { return 1; };
+    println("reading experience: bounded multi-hunk diff, inline spans, stable groups, exact clicks, activity and historical duration passed"); 0
+}

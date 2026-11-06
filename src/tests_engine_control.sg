@@ -1,0 +1,82 @@
+import controller;
+import runtime_adapter;
+import command_line;
+
+def engine_expect(ok: bool, message: &str) -> Result<bool, i64> {
+    if not ok { cli_diagnostic(message); return Result { is_ok: false, value: false, error: 99 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_control_tests() -> Result<bool, i64> {
+    let input: Vec<TerminalEvent> = vec_new();
+    engine_control_init(&input)?;
+    engine_expect(engine_control_enabled(&input), "Host controls must be explicitly enabled")?;
+    engine_control_accept(&input, "{\"type\":\"submit\",\"id\":\"one\",\"text\":\"中文😀\"}")?;
+    engine_control_accept(&input, "{\"type\":\"submit\",\"id\":\"two\",\"text\":\"second\"}")?;
+    let first = engine_control_next(&input)?;
+    engine_expect(cli_json_string(first.root(), "text")?.as_str() == "中文😀", "Queued submissions preserve Unicode")?;
+    engine_control_begin(&input, "one")?;
+    engine_control_accept(&input, "{\"type\":\"approval\",\"id\":\"stale\",\"approved\":true}")?;
+    engine_expect(engine_control_slot(&input, 96) < 0, "No approval exists before a host interaction")?;
+    input.push(engine_control_record(95, 0, "one-approval-1"));
+    engine_control_accept(&input, "{\"type\":\"submit\",\"id\":\"three\",\"text\":\"yes\"}")?;
+    engine_expect(engine_control_slot(&input, 96) < 0, "A queued yes never grants tool permission")?;
+    engine_control_accept(&input, "{\"type\":\"approval\",\"id\":\"one-approval-1\",\"request_id\":\"other\",\"approved\":true}")?;
+    engine_expect(engine_control_slot(&input, 96) < 0, "Approval is scoped to the live submit id")?;
+    engine_control_accept(&input, "{\"type\":\"approval\",\"id\":\"one-approval-1\",\"request_id\":\"one\",\"approved\":true}")?;
+    engine_expect(engine_control_slot(&input, 96) >= 0, "Matching approval is accepted once")?;
+    engine_control_accept(&input, "{\"type\":\"cancel\",\"id\":\"old\"}")?;
+    engine_expect(engine_control_slot(&input, 92) < 0, "A stale cancel does not cancel a newer turn")?;
+    engine_control_accept(&input, "{\"type\":\"cancel\",\"id\":\"one\"}")?;
+    engine_expect(engine_control_slot(&input, 92) >= 0, "Active cancellation is retained during waits")?;
+    engine_control_end(&input);
+    engine_expect(engine_control_slot(&input, 92) < 0 and engine_control_slot(&input, 95) < 0 and engine_control_slot(&input, 96) < 0, "Turn end removes only its live interaction state")?;
+    let second = engine_control_next(&input)?;
+    engine_expect(cli_json_string(second.root(), "id")?.as_str() == "two", "Continuous host preserves FIFO submissions")?;
+    let third = engine_control_next(&input)?;
+    engine_expect(cli_json_string(third.root(), "id")?.as_str() == "three", "Busy input survives the previous turn")?;
+    let invalid_patch = json_parse("{\"path\":\"example.txt\",\"old\":\"before\"}")?;
+    engine_expect(not tool_spec_valid("apply_patch", &invalid_patch), "Tool validation rejects a missing replacement before side effects")?;
+    let invalid_child = json_parse("{\"role\":\"admin\",\"prompt\":\"do work\"}")?;
+    engine_expect(not tool_spec_valid("spawn_agent", &invalid_child), "Unknown child roles never acquire permissions")?;
+    let invalid_mcp = json_parse("{\"server\":\"fixture\",\"tool\":\"read\",\"arguments\":\"not an object\"}")?;
+    engine_expect(not tool_spec_valid("mcp__call", &invalid_mcp), "MCP arguments must match the advertised object contract")?;
+    let mut policy = policy_default();
+    policy.plan = true;
+    engine_expect(tool_spec_decision(&policy, "run_command", false) == 2 and tool_spec_decision(&policy, "mcp__call", false) == 2 and tool_spec_decision(&policy, "write_file", false) == 2, "Strict Plan rejects write/process/MCP tools")?;
+    let native = runtime_native_capabilities();
+    let unknown = runtime_unknown_capabilities();
+    engine_expect(runtime_validate_policy(&native, &policy, true, 0).is_ok(), "Native host can enforce Plan and request budgets")?;
+    engine_expect(not runtime_validate_policy(&native, &policy, true, 100).is_ok(), "Missing exact usage cannot satisfy a token-budget guarantee")?;
+    engine_expect(not runtime_validate_policy(&unknown, &policy, false, 0).is_ok(), "Unknown managed capabilities fail explicitly")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_admission_tests(database: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let session = cli_state_create_session(&state, cli_current_directory()?.as_str())?;
+    let mut execution = cli_state_begin(&state, session.as_str(), "fixture", "model-one")?;
+    controller_admit_request(&state, &execution, "stable-submit")?;
+    let duplicate = controller_admit_request(&state, &execution, "stable-submit");
+    engine_expect(not duplicate.is_ok() and duplicate.error == 12, "Accepted submission ids cannot be replayed in the same execution")?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    let reopened = cli_state_open(database)?;
+    let mut after_restart = cli_state_begin(&reopened, session.as_str(), "fixture", "model-two")?;
+    let restart_duplicate = controller_admit_request(&reopened, &after_restart, "stable-submit");
+    engine_expect(not restart_duplicate.is_ok() and restart_duplicate.error == 12, "Durable admission survives host restart and model changes")?;
+    controller_admit_request(&reopened, &after_restart, "next-submit")?;
+    cli_state_finish(&reopened, &mut after_restart, "idle")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let result = engine_control_tests();
+    if not result.is_ok() { println(result.error); return 1; };
+    let args = cli_arguments();
+    if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", "");
+    if not database.is_ok() { return 2; };
+    if database.value.len() > 0 { let persisted = engine_admission_tests(database.value.as_str()); if not persisted.is_ok() { println(persisted.error); return 1; }; };
+    println("engine control and durable admission acceptance passed");
+    0
+}

@@ -1,0 +1,170 @@
+import context_compaction;
+
+def compact_assert(value: bool, label: &str) -> Result<bool,i64> {
+    if not value { println(label); return Result { is_ok:false,value:false,error:99 }; };
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def compact_history(count: i64, repeats: i64) -> Result<JsonDoc,i64> {
+    let history = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":\"Original authority and AGENTS.md constraints 中文😀\"}]}")?;
+    let mut index = 0;
+    while index < count {
+        let message = history.new_object()?;
+        cli_put_string(&history,message,"role",if index % 2 == 0 { "user" } else { "assistant" })?;
+        let text = cli_text("Exact user intent and checked file path D:/fixture/source.sg. ");
+        let mut fragment = 0;
+        while fragment < repeats { text.push_str("Evidence 中文😀 and resource ownership; ")?; fragment = fragment + 1; };
+        text.push_i64(index)?;
+        cli_put_string(&history,message,"content",text.as_str())?;
+        history.root().object_get("messages")?.array_push(message)?;
+        index = index + 1;
+    };
+    Result { is_ok:true,value:history,error:0 }
+}
+
+def compact_summary() -> Result<String,i64> {
+    let result = cli_text("<analysis>private drafting must not survive</analysis><summary>\n1. User goal: preserve the requested task, scope and exact project constraints.\n");
+    let mut index = 0;
+    while index < 8 { result.push_str("Verified edits and checks remain in the complete public transcript. Keep pending tasks and uncertain tool outcomes distinct; continue without repeating side effects.\n")?; index = index + 1; };
+    result.push_str("7. Next step: finish the pending implementation and run its stated checks.\n</summary>")?;
+    Result { is_ok:true,value:result,error:0 }
+}
+
+def compact_policy_tests() -> Result<bool,i64> {
+    let defaults = context_defaults();
+    compact_assert(defaults.threshold_percent == 85 and defaults.target_percent == 50 and defaults.min_summary_chars == 500 and defaults.min_reduction_percent == 20,"Sencode defaults")?;
+    let old = json_parse("{\"schema\":1,\"threshold_percent\":80}")?;
+    compact_assert(context_limits_document(&old,"one","small")?.threshold_percent == 80,"old explicit threshold retained")?;
+    let thresholds = json_parse("[1,25,50,80,95]")?; let mut threshold_index = 0;
+    while threshold_index < thresholds.root().array_len()? {
+        let threshold = thresholds.root().array_get(threshold_index)?.number_i64()?;
+        let legacy = json_parse("{\"schema\":1}")?;
+        cli_put_i64(&legacy,legacy.root(),"threshold_percent",threshold)?;
+        let selected = context_limits_document(&legacy,"one","small")?;
+        compact_assert(selected.threshold_percent == threshold and selected.target_percent >= 1 and (selected.target_percent < threshold or threshold == 1),"all old threshold boundaries remain readable")?;
+        let models = json_parse("{\"schema\":1,\"models\":[{\"connection\":\"one\",\"model\":\"small\"}]}")?;
+        cli_put_i64(&models,models.root().object_get("models")?.array_get(0)?,"threshold_percent",threshold)?;
+        compact_assert(context_limits_document(&models,"one","small")?.threshold_percent == threshold,"model-specific old thresholds remain readable")?;
+        threshold_index = threshold_index + 1;
+    };
+    let explicit_equal = json_parse("{\"schema\":1,\"threshold_percent\":1,\"target_percent\":1}")?;
+    compact_assert(context_limits_document(&explicit_equal,"one","small").error == 2,"explicit target still must be below trigger")?;
+    let inherited = json_parse("{\"schema\":1,\"target_percent\":30,\"models\":[{\"connection\":\"one\",\"model\":\"small\",\"threshold_percent\":40}]}")?;
+    compact_assert(context_limits_document(&inherited,"one","small")?.target_percent == 30,"model validation inherits workspace defaults")?;
+    let invalid = json_parse("{\"schema\":1,\"target_percent\":85}")?;
+    compact_assert(not context_limits_document(&invalid,"one","small").is_ok,"target must be below trigger")?;
+    let nul = json_parse("{\"schema\":1,\"models\":[{\"connection\":\"one\\u0000other\",\"model\":\"small\"}]}")?;
+    compact_assert(not context_limits_document(&nul,"one","small").is_ok,"NUL target cannot select a different model")?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    let history = compact_history(20,30)?;
+    let quiet = context_plan(&history,&tools,&defaults,false)?;
+    compact_assert(not quiet.root().object_get("needed")?.bool_value()?,"below threshold skips automatic sampling")?;
+    let forced = context_plan(&history,&tools,&defaults,true)?;
+    compact_assert(forced.root().object_get("needed")?.bool_value()? and cli_json_string(forced.root(),"trigger")?.as_str() == "manual","manual force below threshold")?;
+    let prefix = context_prefix(&history,&forced)?;
+    let configured = context_summary_prompt_with_min(&prefix,4096)?;
+    compact_assert(str_contains(cli_json_string(configured.root().object_get("messages")?.array_get(1)?,"content")?.as_str(),"4096 Unicode characters"),"summary prompt uses configured quality minimum")?;
+    compact_assert(context_summary_prompt_with_min(&prefix,1).error == 2,"invalid prompt minimum rejected")?;
+    let summary = compact_summary()?;
+    let compacted = context_compacted(&history,summary.as_str(),&forced)?;
+    compact_assert(compacted.serialize_string()?.len() * 100 <= history.serialize_string()?.len() * 80,"minimum twenty percent reduction")?;
+    compact_assert(cli_json_string(compacted.root().object_get("messages")?.array_get(0)?,"content")? == cli_json_string(history.root().object_get("messages")?.array_get(0)?,"content")?,"system and embedded project instructions verbatim")?;
+    compact_assert(not context_compacted(&history,"ok",&forced).is_ok,"degenerate summary refused")?;
+    let stale_message = history.root().object_get("messages")?.array_get(1)?;
+    stale_message.object_set("content",history.new_string("changed after prefix capture")?)?;
+    compact_assert(context_prefix(&history,&forced).error == 12 and context_compacted(&history,summary.as_str(),&forced).error == 12,"same-count edit invalidates summary snapshot")?;
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def compact_boundary_tests() -> Result<bool,i64> {
+    let history = compact_history(20,20)?;
+    let messages = history.root().object_get("messages")?;
+    let call = json_parse("{\"role\":\"assistant\",\"content\":\"two operations\",\"tool_calls\":[{\"id\":\"A\",\"name\":\"read_file\",\"arguments\":\"{}\"},{\"id\":\"B\",\"name\":\"search\",\"arguments\":\"{}\"}]}")?;
+    let first = json_parse("{\"role\":\"tool\",\"tool_call_id\":\"B\",\"content\":\"B exact result\"}")?;
+    let second = json_parse("{\"role\":\"tool\",\"tool_call_id\":\"A\",\"content\":\"A exact result\"}")?;
+    messages.array_push(history.copy(call.root())?)?;
+    messages.array_push(history.copy(first.root())?)?;
+    let tools = json_parse("{\"tools\":[]}")?; let defaults = context_defaults();
+    compact_assert(context_plan(&history,&tools,&defaults,true).error == 12,"pending pair cannot be summarized")?;
+    messages.array_push(history.copy(second.root())?)?;
+    let structure = context_units(&history)?;
+    compact_assert(structure.root().object_get("units")?.array_len()? == 22,"multi-call block is one unit")?;
+    let plan = context_plan(&history,&tools,&defaults,true)?;
+    let summary = compact_summary()?;
+    let compacted = context_compacted(&history,summary.as_str(),&plan)?;
+    let serialized = compacted.serialize_string()?;
+    compact_assert(str_contains(serialized.as_str(),"B exact result") and str_contains(serialized.as_str(),"A exact result"),"newest entire pair preserved out of order")?;
+    let synthetic = compacted.root().object_get("messages")?.array_get(1)?;
+    compact_assert(synthetic.object_get("context_summary")?.bool_value()?,"summary is tagged as historical carrier")?;
+    let latest = context_units(&compacted)?.root().object_get("latest_user")?.number_i64()?;
+    compact_assert(latest > 1,"summary carrier never becomes latest real user task")?;
+    // A malicious/buggy splitter cannot cut inside a pair even with a matching hash.
+    plan.root().object_set("tail_start",plan.new_i64(22)?)?;
+    compact_assert(context_prefix(&history,&plan).error == 2,"unsafe tool boundary rejected")?;
+    let duplicate = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"same\"},{\"id\":\"same\"}]}]}")?;
+    compact_assert(context_units(&duplicate).error == 10,"duplicate call IDs refused")?;
+    let nul = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"A\\u0000B\"}]}]}")?;
+    compact_assert(context_units(&nul).error == 10,"NUL call identity refused")?;
+    let invalid_content = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":42}]}")?;
+    compact_assert(context_units(&invalid_content).error == 10,"nonstring content never silently discarded")?;
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def compact_cleaning_tests() -> Result<bool,i64> {
+    let cleaned = context_clean_summary("<analysis>scratch</analysis>\n<summary><analysis>nested</analysis>\n1. Real task\n6. Quote <summary> then </analysis> inside real evidence\n9. Next step\n</summary>")?;
+    compact_assert(not str_contains(cleaned.as_str(),"scratch") and not str_contains(cleaned.as_str(),"nested") and str_contains(cleaned.as_str(),"1. Real task") and str_contains(cleaned.as_str(),"9. Next step"),"strip only drafting before real sections")?;
+    compact_assert(not str_contains(cleaned.as_str(),"<summary>") and not str_contains(cleaned.as_str(),"</analysis>"),"neutralize control tags without deleting real sections")?;
+    let unclosed = context_clean_summary("<analysis>truncated draft");
+    compact_assert(not unclosed.is_ok,"unclosed drafting never becomes context")?;
+    let markdown = context_clean_summary("<summary>**Analysis** scratch </analysis>\n1. Real evidence with quoted </analysis> tag\n7. Exact next step\n</summary>")?;
+    compact_assert(not str_contains(markdown.as_str(),"scratch") and str_contains(markdown.as_str(),"Real evidence") and str_contains(markdown.as_str(),"Exact next step"),"explicit markdown drafting cleaned without deleting later quoted tags")?;
+    let recovered = context_clean_summary("<analysis>broken <summary>1. Real task</summary>")?;
+    compact_assert(str_contains(recovered.as_str(),"Real task"),"recover summary after unclosed leading drafting")?;
+    let empty = context_clean_summary("<summary> </summary>");
+    compact_assert(not empty.is_ok,"empty wrapper rejected")?;
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def compact_size_and_repeat_tests() -> Result<bool,i64> {
+    let tools = json_parse("{\"tools\":[]}")?; let defaults = context_defaults();
+    let sized = compact_history(20,100)?;
+    let tiny = json_parse("{\"role\":\"assistant\",\"content\":\"small verified response\"}")?;
+    let mut item = 0;
+    while item < 12 { sized.root().object_get("messages")?.array_push(sized.copy(tiny.root())?)?; item = item + 1; };
+    let sized_plan = context_plan(&sized,&tools,&defaults,true)?;
+    compact_assert(sized.root().object_get("messages")?.array_len()? - sized_plan.root().object_get("tail_start")?.number_i64()? > 4,"tail size follows bytes instead of fixed last four units")?;
+    println("size-budget selection passed");
+    let oversized = compact_summary()?;
+    let no_reduction = compact_history(2,1)?;
+    let permissive = json_parse("{\"schema\":2,\"needed\":true,\"tail_start\":2,\"latest_user\":1,\"min_summary_chars\":32,\"summary_max_bytes\":65536,\"min_reduction_percent\":20}")?;
+    cli_put_string(&permissive,permissive.root(),"source_sha256",context_fingerprint(&no_reduction)?.as_str())?;
+    compact_assert(context_compacted(&no_reduction,oversized.as_str(),&permissive).error == 13,"larger continuation cannot be accepted as compaction")?;
+    println("insufficient reduction refusal passed");
+    let additions = compact_history(20,20)?;
+    let incoming = additions.root().object_get("messages")?;
+    let mut history = compact_history(20,20)?;
+    let mut cycle = 0;
+    while cycle < 32 {
+        let plan = context_plan(&history,&tools,&defaults,true)?;
+        let fresh = context_compacted(&history,oversized.as_str(),&plan)?;
+        // The controller must likewise install the new owning JsonDoc only
+        // after its durable checkpoint succeeds. Copying into the old arena
+        // would accumulate unreachable nodes on every cycle.
+        history = fresh;
+        item = 1;
+        while item < incoming.array_len()? { history.root().object_get("messages")?.array_push(history.copy(incoming.array_get(item)?)?)?; item = item + 1; };
+        compact_assert(context_units(&history)?.root().object_get("pending")?.number_i64()? == 0,"fresh arena retains complete history on repeat")?;
+        cycle = cycle + 1;
+    };
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def tests() -> Result<bool,i64> {
+    compact_policy_tests()?; println("policy passed");
+    compact_boundary_tests()?; println("boundaries passed");
+    compact_cleaning_tests()?; println("cleaning passed");
+    compact_size_and_repeat_tests()?;
+    println("context refinements: Sencode policy, budgeted units, snapshot fencing, quality, cleaned summaries and tool pairs passed");
+    Result { is_ok:true,value:true,error:0 }
+}
+def main()->i64 { let result = tests(); if result.is_ok { 0 } else { println(result.error); result.error } }

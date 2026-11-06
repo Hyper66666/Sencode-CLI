@@ -1,0 +1,24 @@
+import references;
+import command_line;
+
+def references_tests(cwd: &str) -> Result<bool, i64> {
+    let nested = workspace_path(cwd, "目录")?; dir_create(nested.as_str())?;
+    let source = workspace_path(cwd, "目录/hello.sg")?; file_write_str(source.as_str(), "content is never loaded")?;
+    let ignored = workspace_path(cwd, "node_modules")?; dir_create(ignored.as_str())?;
+    let hidden = workspace_path(cwd, "node_modules/excluded.txt")?; file_write_str(hidden.as_str(), "ignored")?;
+    let mut catalog = references_new()?; let mut ticks = 0;
+    while not catalog.done and ticks < 1000 { references_step(&mut catalog, cwd)?; ticks = ticks + 1; };
+    let raw = catalog.items.serialize_string()?;
+    if not catalog.done or not str_contains(raw.as_str(), "目录/hello.sg") or str_contains(raw.as_str(), "excluded.txt") or str_contains(raw.as_str(), "content is never loaded") { return Result { is_ok: false, value: false, error: 99 }; };
+    if references_step(&mut catalog, cwd)? { return Result { is_ok: false, value: false, error: 99 }; };
+    file_remove(source.as_str()); file_remove(hidden.as_str()); dir_remove(nested.as_str())?; dir_remove(ignored.as_str())?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let cwd = cli_option(&args.value, "cwd", "").unwrap_or(string_new());
+    if cwd.len() == 0 { return 2; };
+    let result = references_tests(cwd.as_str()); if not result.is_ok() { println(result.error); return 1; };
+    println("bounded Unicode reference discovery passed"); 0
+}

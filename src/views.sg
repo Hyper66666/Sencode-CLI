@@ -1,0 +1,193 @@
+import state;
+import output;
+
+// These views consume allowlisted public metadata, never credential records.
+def view_selection(state: &CliState, requested: &str, model: &str) -> Result<JsonDoc, i64> {
+    let result = json_doc_object()?;
+    let records = cli_state_connections(state)?;
+    let items = records.root().object_get("connections")?;
+    let mut selected = cli_text(requested);
+    if selected.len() == 0 { selected = cli_state_default_connection(state)?; };
+    if selected.len() == 0 {
+        if items.array_len()? == 1 { selected = cli_json_string(items.array_get(0)?, "id")?; };
+    };
+    let mut label = cli_text("No connection selected");
+    let mut active_model = if model.len() > 0 { cli_text(model) } else { cli_text("not configured") };
+    if selected.len() > 0 {
+        label = cli_text("Connection unavailable");
+        let mut index = 0;
+        while index < items.array_len()? {
+            let record = items.array_get(index)?;
+            if cli_json_string(record, "id")?.as_str() == selected.as_str() {
+                label = cli_json_optional_string(record, "name");
+                if label.len() == 0 { label = selected.clone()?; };
+                if model.len() == 0 { active_model = cli_json_optional_string(record, "model"); };
+                break;
+            };
+            index = index + 1;
+        };
+    };
+    cli_put_string(&result, result.root(), "id", selected.as_str())?;
+    cli_put_string(&result, result.root(), "connection", label.as_str())?;
+    cli_put_string(&result, result.root(), "model", active_model.as_str())?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def view_status(plan: bool, goal: bool, auto_edit: bool, commands: bool, model: &str) -> Result<String, i64> {
+    let text = cli_text(if plan { "PLAN · read only" } else { if goal { "GOAL · foreground" } else { "BUILD" } });
+    if not plan {
+        text.push_str(if auto_edit { " · auto edit" } else { " · ask to edit" })?;
+        if commands { text.push_str(" · commands allowed")?; (); };
+    };
+    text.push_str("  /  ")?;
+    text.push_str(model)?;
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def view_line(out: &String, label: &str, text: &str) -> Result<bool, i64> {
+    out.push_str(label)?;
+    out.push_str(text)?;
+    out.push_str("\n")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def view_connections(document: &JsonDoc) -> Result<String, i64> {
+    let out = string_new();
+    let items = document.root().object_get("connections")?;
+    let current = cli_json_optional_string(document.root(), "current");
+    let mut index = 0;
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        let id = cli_json_string(item, "id")?;
+        out.push_str(if id.as_str() == current.as_str() { "  ● " } else { "  ○ " })?;
+        out.push_str(id.as_str())?;
+        out.push_str("  ")?;
+        out.push_str(cli_json_optional_string(item, "name").as_str())?;
+        out.push_str("\n      ")?;
+        out.push_str(cli_json_optional_string(item, "model").as_str())?;
+        out.push_str(" · ")?;
+        out.push_str(cli_json_optional_string(item, "protocol").as_str())?;
+        out.push_str("\n")?;
+        index = index + 1;
+    };
+    if index == 0 { out.push_str("No saved API connections.\nAdd one with: sen connections add custom-ID --base-url URL --model MODEL\n")?; (); };
+    out.push_str("/connections ID selects a connection for the next request.\n")?;
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def view_sessions(document: &JsonDoc, current: &str) -> Result<String, i64> {
+    let out = string_new();
+    let items = document.root().object_get("sessions")?;
+    let mut index = 0;
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        let id = cli_json_string(item, "id")?;
+        out.push_str(if id.as_str() == current { "  ● " } else { "  ○ " })?;
+        out.push_str(cli_json_optional_string(item, "title").as_str())?;
+        out.push_str("  ")?;
+        out.push_str(cli_json_optional_string(item, "status").as_str())?;
+        out.push_str("\n")?;
+        index = index + 1;
+    };
+    if index == 0 { out.push_str("No sessions in this project.\n")?; (); };
+    out.push_str("/resume selects a conversation. sen resume reopens the latest.\n")?;
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def view_context(document: &JsonDoc) -> Result<String, i64> {
+    let out = string_new();
+    let items = document.root().object_get("messages")?;
+    let total = cli_json_optional_i64(document.root(), "total_messages", items.array_len()?);
+    out.push_i64(total)?;
+    out.push_str(" saved messages · /compact summarizes context\n\n")?;
+    let mut index = if items.array_len()? > 12 { items.array_len()? - 12 } else { 0 };
+    if total > items.array_len()? - index { out.push_str("Showing the most recent ")?; out.push_i64(items.array_len()? - index)?; out.push_str(" messages.\n\n")?; (); };
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        out.push_str("[")?;
+        out.push_str(cli_json_optional_string(item, "role").as_str())?;
+        out.push_str("] ")?;
+        let content = cli_json_optional_string(item, "content");
+        // Keep this overview bounded; persisted history remains unchanged.
+        let chars = content.chars();
+        let mut count = 0;
+        loop { let ch = chars.next(); if not ch.is_some { break; }; if count == 800 { out.push_str(" …")?; break; }; out.push_char(ch.value)?; count = count + 1; };
+        out.push_str("\n\n")?;
+        index = index + 1;
+    };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def view_usage(document: &JsonDoc) -> Result<String, i64> {
+    let out = cli_text("Provider-reported tokens recorded locally; not remaining quota.\n\n");
+    let items = document.root().object_get("usage")?;
+    let mut index = 0;
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        out.push_str(cli_json_optional_string(item, "connection").as_str())?;
+        out.push_str(" / ")?;
+        out.push_str(cli_json_optional_string(item, "model").as_str())?;
+        out.push_str("\n  ")?;
+        out.push_i64(cli_json_optional_i64(item, "requests", 0))?;
+        out.push_str(" requests · ")?;
+        out.push_i64(cli_json_optional_i64(item, "input_tokens", 0))?;
+        out.push_str(" input · ")?;
+        out.push_i64(cli_json_optional_i64(item, "output_tokens", 0))?;
+        out.push_str(" output tokens\n")?;
+        index = index + 1;
+    };
+    if index == 0 { out.push_str("No recorded requests yet.\n")?; (); };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def view_skills(document: &JsonDoc) -> Result<String, i64> {
+    let out = string_new();
+    let items = document.root().object_get("skills")?;
+    let mut index = 0;
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        view_line(&out, "  /skills ", cli_json_optional_string(item, "name").as_str())?;
+        view_line(&out, "    ", cli_json_optional_string(item, "path").as_str())?;
+        index = index + 1;
+    };
+    if index == 0 { out.push_str("No file skills found. Add .sencode/skills/NAME/SKILL.md.\n")?; (); };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def view_consult(document: &JsonDoc) -> Result<String, i64> {
+    let out = string_new();
+    let items = document.root().object_get("reports")?;
+    let mut index = 0;
+    while index < items.array_len()? {
+        let item = items.array_get(index)?;
+        out.push_str("\n── ")?;
+        out.push_str(cli_json_optional_string(item, "connection_id").as_str())?;
+        out.push_str(" / ")?;
+        out.push_str(cli_json_optional_string(item, "model").as_str())?;
+        out.push_str(" ──\n")?;
+        let code = cli_json_optional_i64(item, "error", 0);
+        if code != 0 { out.push_str("Request stopped with code ")?; out.push_i64(code)?; out.push_str("\n")?; (); };
+        view_line(&out, "", cli_json_optional_string(item, "content").as_str())?;
+        index = index + 1;
+    };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def view_document(terminal: &Terminal, styled: bool, label: &str, document: &JsonDoc, current: &str) -> Result<bool, i64> {
+    if not styled { return output_document(document); };
+    let text = if label == "Connections" { view_connections(document)? } else {
+        if label == "Sessions" { view_sessions(document, current)? } else {
+            if label == "Context" { view_context(document)? } else {
+                if label == "Usage" { view_usage(document)? } else {
+                    if label == "Skills" { view_skills(document)? } else { view_consult(document)? }
+                }
+            }
+        }
+    };
+    ui_section(terminal, label, "")?;
+    ui_output(text.as_str())
+}
+
+def view_help() -> &str {
+    "  /model [MODEL]       Show or switch the next request's model\n  /connections [ID]    Show or select a saved API connection\n  /resume [ID]         Continue a project session\n  /context             Inspect saved context\n  /compact             Summarize the conversation\n  /agents              List project and child sessions\n  /consult QUESTION    Ask multiple connected models\n  /plan [TASK]         Enter read-only planning\n  /plan approve        Approve a plan for execution\n  /goal OBJECTIVE      Run a foreground goal\n  /goal pause|resume   Pause or explicitly continue a goal\n  /skills [NAME]       List or invoke a file skill\n  /permissions         Show permission choices\n  /usage               Show recorded token usage\n  /quit                Exit this session\n\nEnter sends · Shift+Enter adds a line · ↑/↓ recalls history\nCtrl+C cancels · Ctrl+D exits an empty prompt\n"
+}

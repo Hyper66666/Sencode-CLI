@@ -1,0 +1,11 @@
+[package]
+name = "sencode_sg"
+version = "0.1.0-dev.0"
+edition = "2026"
+description = "Sengoo-native Sencode terminal agent"
+
+[bin]
+path = "src/main.sg"
+
+[dependencies]
+sgsqlite = { path = "../Sengoo/packages/sgsqlite" }

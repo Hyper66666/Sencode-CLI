@@ -1,0 +1,94 @@
+import common;
+
+// Internal request content, not a shared-history schema or a permission grant.
+// The asset owner must validate copied bytes/MIME before constructing images.
+// Only a caller with a captured explicit target capability enables this path.
+def provider_media_error(code: i64) -> Result<JsonValue, i64> {
+    Result { is_ok: false, value: JsonValue { doc_handle: 0, node_id: 0 }, error: code }
+}
+
+def provider_media_c_string_safe(value: &String) -> bool {
+    // JSON owns length-aware bytes. The legacy `&str` view is C-terminated;
+    // reject embedded NUL before any provider field is serialized through it.
+    value.len() == value.as_str().len()
+}
+
+def provider_media_fields(value: JsonValue, allowed: &str) -> Result<bool, i64> {
+    let mut index = 0;
+    while index < value.object_len()? {
+        let key = value.object_key(index)?;
+        if not provider_media_c_string_safe(&key) { return Result { is_ok: false, value: false, error: 2 }; };
+        let wrapped = cli_join("|", key.as_str())?; wrapped.push_str("|")?;
+        if not str_contains(allowed, wrapped.as_str()) { return Result { is_ok: false, value: false, error: 2 }; };
+        index = index + 1;
+    }; Result { is_ok: true, value: true, error: 0 }
+}
+
+def provider_base64_digit(byte: i64) -> i64 {
+    if byte >= 65 and byte <= 90 { return byte - 65; };
+    if byte >= 97 and byte <= 122 { return byte - 71; };
+    if byte >= 48 and byte <= 57 { return byte + 4; };
+    if byte == 43 { return 62; }; if byte == 47 { return 63; }; -1
+}
+
+def provider_media_base64(value: &String, expected: i64) -> Result<bool, i64> {
+    if expected < 1 or expected > 8388608 { return Result { is_ok: false, value: false, error: 13 }; };
+    if value.len() != ((expected + 2) / 3) * 4 { return Result { is_ok: false, value: false, error: 2 }; };
+    let bytes = value.bytes(); let mut index = 0; let padding = if expected % 3 == 0 { 0 } else { 3 - expected % 3 };
+    loop {
+        let byte = bytes.next(); if not byte.is_some { break; };
+        let digit = provider_base64_digit(byte.value);
+        let pad = index >= value.len() - padding;
+        if pad and byte.value != 61 or not pad and digit < 0 { bytes.free(); return Result { is_ok: false, value: false, error: 2 }; };
+        if index == value.len() - padding - 1 and (padding == 2 and digit % 16 != 0 or padding == 1 and digit % 4 != 0) { bytes.free(); return Result { is_ok: false, value: false, error: 2 }; };
+        index = index + 1;
+    };
+    bytes.free(); Result { is_ok: true, value: true, error: 0 }
+}
+
+def provider_media_content(document: &JsonDoc, original: JsonValue, protocol: i64, enabled: bool) -> Result<JsonValue, i64> {
+    if not enabled { cli_diagnostic("Media content requires an explicitly captured target capability; nothing was sent."); return provider_media_error(7); };
+    let role = cli_json_string(original, "role")?;
+    if not provider_media_c_string_safe(&role) or role.as_str() != "user" or original.object_has("tool_calls") or original.object_has("tool_call_id") { return provider_media_error(2); };
+    if original.object_has("content") {
+        let content_value = original.object_get("content")?;
+        if not content_value.string_value().is_ok() { return provider_media_error(2); };
+        let content = content_value.string_value()?;
+        if not provider_media_c_string_safe(&content) or content.len() != 0 { return provider_media_error(2); };
+    };
+    let parts = original.object_get("content_parts")?; let count = parts.array_len()?;
+    if count < 1 or count > 64 { return provider_media_error(13); };
+    let output = document.new_array()?; let mut index = 0; let mut input_bytes = 0;
+    while index < count {
+        let part = parts.array_get(index)?; let kind = cli_json_string(part, "type")?; if not provider_media_c_string_safe(&kind) { return provider_media_error(2); }; let wire = document.new_object()?;
+        if kind.as_str() == "text" {
+            provider_media_fields(part, "|type||text|")?;
+            let text = cli_json_string(part, "text")?; if not provider_media_c_string_safe(&text) { return provider_media_error(2); }; input_bytes = input_bytes + text.len();
+            cli_put_string(document, wire, "type", if protocol == 1 { "input_text" } else { "text" })?;
+            cli_put_string(document, wire, "text", text.as_str())?;
+            ();
+        } else {
+            if kind.as_str() != "image" { return provider_media_error(8); };
+            provider_media_fields(part, "|type||mime||data||byte_length|")?;
+            let mime = cli_json_string(part, "mime")?; let data = cli_json_string(part, "data")?;
+            if not provider_media_c_string_safe(&mime) or not provider_media_c_string_safe(&data) { return provider_media_error(2); };
+            let size = part.object_get("byte_length")?.number_i64()?;
+            if mime.as_str() != "image/png" and mime.as_str() != "image/jpeg" { return provider_media_error(8); };
+            provider_media_base64(&data, size)?; input_bytes = input_bytes + data.len();
+            if protocol == 2 {
+                cli_put_string(document, wire, "type", "image")?; let source = document.new_object()?;
+                cli_put_string(document, source, "type", "base64")?; cli_put_string(document, source, "media_type", mime.as_str())?;
+                cli_put_string(document, source, "data", data.as_str())?; wire.object_set("source", source)?; ();
+            } else {
+                let url = cli_text("data:"); url.push_str(mime.as_str())?; url.push_str(";base64,")?; url.push_str(data.as_str())?;
+                cli_put_string(document, wire, "type", if protocol == 1 { "input_image" } else { "image_url" })?;
+                if protocol == 1 { cli_put_string(document, wire, "image_url", url.as_str())?; (); } else {
+                    let reference = document.new_object()?; cli_put_string(document, reference, "url", url.as_str())?; wire.object_set("image_url", reference)?; ();
+                };
+            };
+        };
+        if input_bytes > 16777216 { return provider_media_error(13); };
+        output.array_push(wire)?; index = index + 1;
+    };
+    Result { is_ok: true, value: output, error: 0 }
+}

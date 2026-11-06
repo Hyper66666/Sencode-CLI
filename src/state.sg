@@ -1,0 +1,838 @@
+import common;
+import state_schema;
+import session_metadata;
+import session_catalog_sql;
+import sgsqlite;
+import std::system;
+import std::time;
+import std::random;
+import std::process;
+import std::path;
+import std::dir;
+import std::file;
+import std::env;
+import std::hash;
+import std::encoding;
+
+struct CliState { db: SqliteDb, path: String, instance: String }
+struct CliExecution { session: String, id: String, fence: i64, lease: FileLock, active: bool }
+
+def state_bool_error(code: i64) -> Result<bool, i64> {
+    Result { is_ok: false, value: false, error: code }
+}
+
+def state_execution_error(code: i64) -> Result<CliExecution, i64> {
+    Result {is_ok:false,value:CliExecution {session:String {handle:0},id:String {handle:0},fence:0,lease:FileLock {handle:0},active:false},error:code}
+}
+
+def state_open_error(code: i64) -> Result<CliState, i64> {
+    Result {is_ok:false,value:CliState {db:SqliteDb {handle:0},path:String {handle:0},instance:String {handle:0}},error:code}
+}
+
+def state_id(prefix: &str) -> Result<String, i64> {
+    let result = string_from_str(prefix)?;
+    result.push_i64(process_id())?;
+    result.push_str("-")?;
+    result.push_i64(time_unix_ms())?;
+    result.push_str("-")?;
+    result.push_i64(random_i64())?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def state_digest(value: &str) -> Result<String, i64> {
+    let text = ffi_buffer_new(64)?;
+    hash_sha256_str(value, text)?;
+    string_from_buffer(text, 64)
+}
+
+def state_lock_path(db: &str, scope: &str, identity: &str) -> Result<String, i64> {
+    let directory = cli_join(db, ".locks")?;
+    dir_create_all(directory.as_str())?;
+    let key = cli_join(scope, ":")?;
+    key.push_str(identity)?;
+    let digest = state_digest(key.as_str())?;
+    let path = path_join_string(directory.as_str(), digest.as_str())?;
+    path.push_str(".lock")?;
+    Result { is_ok: true, value: path, error: 0 }
+}
+
+def cli_state_default_path() -> Result<String, i64> {
+    let home_buffer = ffi_buffer_new(32768)?;
+    let length = env_var_copy("USERPROFILE", home_buffer)?;
+    let home = string_from_buffer(home_buffer, length)?;
+    let directory = path_join_string(home.as_str(), ".sencode")?;
+    dir_create_all(directory.as_str())?;
+    path_join_string(directory.as_str(), "local-sessions.sqlite3")
+}
+
+def cli_state_open(path: &str) -> Result<CliState, i64> {
+    let parent = path_parent_string(path)?;
+    dir_create_all(parent.as_str())?;
+    // Create then canonicalize the actual file, including junctions.
+    let db = sqlite_open(path)?;
+    db.busy_timeout(2000)?;
+    let canonical = canonical_path_string(path)?;
+    let lock_path = state_lock_path(canonical.as_str(), "migration", "schema")?;
+    let migration_lock = file_lock(lock_path.as_str())?;
+    let instance = state_id("sg-")?;
+    db.set_context("instance_id", instance.as_str())?;
+    let version = {
+        let mut query = db.prepare("PRAGMA user_version")?;
+        query.step()?;
+        query.integer(0)?
+    };
+    if version == 0 {
+        // The generated base is the exact desktop schema, not a separate DB.
+        let mut migration = db.transaction()?;
+        migration.exec(cli_schema_base())?;
+        migration.exec(cli_schema_shared())?;
+        migration.exec(cli_schema_triggers())?;
+        migration.exec("WITH RECURSIVE versions(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM versions WHERE n<29) INSERT INTO schema_migrations(version,applied_at) SELECT n,CAST(unixepoch('subsec')*1000 AS INTEGER) FROM versions")?;
+        migration.exec("PRAGMA user_version=29")?;
+        migration.commit()?;
+        ();
+    } else {
+        // Existing schema 28 is migrated only by the coordinated desktop
+        // upgrade; the CLI never guesses whether an old desktop is active.
+        if version != 29 {
+            cli_diagnostic("Shared storage requires a coordinated schema 29 upgrade. Close older desktop clients, then use the matching desktop build to back up and upgrade the database. This CLI leaves older data unchanged.");
+            return state_open_error(8);
+        };
+    };
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON")?;
+    let mut contract = db.prepare("SELECT version,minimum_writer FROM shared_contract WHERE id=1")?;
+    if not contract.step()? or contract.integer(0)? != 1 or contract.integer(1)? > 1 {
+        return state_open_error(8);
+    };
+    Result { is_ok: true, value: CliState { db: db, path: canonical, instance: instance }, error: 0 }
+}
+
+def cli_state_connections(state: &CliState) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    let items = document.new_array()?;
+    document.root().object_set("connections", items)?;
+    let mut query = state.db.prepare("SELECT id,display_name,kind,config_json,COALESCE(selected_model_id,'') FROM connection_configs ORDER BY created_at,id")?;
+    while query.step()? {
+        let item = document.new_object()?;
+        let id = query.text(0)?;
+        let name = query.text(1)?;
+        let kind = query.text(2)?;
+        let raw = query.text(3)?;
+        let model = query.text(4)?;
+        cli_put_string(&document, item, "id", id.as_str())?;
+        cli_put_string(&document, item, "name", name.as_str())?;
+        cli_put_string(&document, item, "kind", kind.as_str())?;
+        cli_put_string(&document, item, "model", model.as_str())?;
+        let config = json_parse(raw.as_str())?;
+        // Only allowlisted metadata leaves the connection store.
+        let base = state_config_string(config.root(), "baseUrl", "base_url");
+        let protocol = state_config_protocol(config.root());
+        cli_put_string(&document, item, "base_url", base.as_str())?;
+        cli_put_string(&document, item, "protocol", protocol.as_str())?;
+        items.array_push(item)?;
+    };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def cli_state_connection(state: &CliState, id: &str) -> Result<JsonDoc, i64> {
+    let mut query = state.db.prepare("SELECT id,display_name,config_json,COALESCE(selected_model_id,''),kind FROM connection_configs WHERE id=?")?;
+    query.bind_text(1, id)?;
+    if not query.step()? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }; };
+    let kind = query.text(4)?;
+    if kind.as_str()!="customApi" {
+        cli_diagnostic("The selected connection uses an account runtime. This CLI candidate supports API-key connections; select a saved custom API connection explicitly.");
+        return Result {is_ok:false,value:JsonDoc {handle:0},error:8};
+    };
+    let raw = query.text(2)?;
+    let config = json_parse(raw.as_str())?;
+    let document = json_doc_object()?;
+    let key = query.text(0)?;
+    let name = query.text(1)?;
+    let model = query.text(3)?;
+    let base = state_config_string(config.root(), "baseUrl", "base_url");
+    let protocol = state_config_protocol(config.root());
+    cli_put_string(&document, document.root(), "id", key.as_str())?;
+    cli_put_string(&document, document.root(), "name", name.as_str())?;
+    cli_put_string(&document, document.root(), "model", model.as_str())?;
+    cli_put_string(&document, document.root(), "base_url", base.as_str())?;
+    cli_put_string(&document, document.root(), "protocol", protocol.as_str())?;
+    // Preserve the non-secret model capability contract for the captured
+    // request. The public connection projection must not erase image opt-in.
+    if config.root().object_has("enabledModels") { document.root().object_set("enabledModels", document.copy(config.root().object_get("enabledModels")?)?)?; (); };
+    if config.root().object_has("capabilities") { document.root().object_set("capabilities", document.copy(config.root().object_get("capabilities")?)?)?; (); };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def cli_state_credential(id: &str) -> Result<String, i64> {
+    let target = cli_join("Sencode/connection/", id)?;
+    credential_read(target.as_str())
+}
+
+// The desktop stores this preference as a plain connection ID. An unsupported
+// preferred connection is returned unchanged so dispatch fails explicitly;
+// selecting a different service implicitly would violate request attribution.
+def cli_state_default_connection(state: &CliState) -> Result<String, i64> {
+    let mut query = state.db.prepare("SELECT value FROM app_preferences WHERE key='preferred_connection_id'")?;
+    if not query.step()? { return Result {is_ok:true,value:string_new(),error:0}; };
+    query.text(0)
+}
+
+def cli_state_set_default_connection(state: &CliState, id: &str) -> Result<bool, i64> {
+    let path = state_lock_path(state.path.as_str(),"connection","preferred_connection_id")?;
+    let lease = file_lock(path.as_str())?;
+    let mut tx = state.db.transaction()?;
+    if id.len()==0 {
+        tx.exec("DELETE FROM app_preferences WHERE key='preferred_connection_id'")?;
+    } else {
+        let mut exists = tx.prepare("SELECT 1 FROM connection_configs WHERE id=? AND kind IN('customApi','codex','sencode')")?;
+        exists.bind_text(1,id)?;
+        if not exists.step()? { return state_bool_error(5); };
+        let mut save = tx.prepare("INSERT INTO app_preferences(key,value,updated_at) VALUES('preferred_connection_id',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")?;
+        save.bind_text(1,id)?; save.bind_i64(2,time_unix_ms())?; save.step()?;
+    };
+    tx.commit()?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def cli_state_create_session(state: &CliState, cwd: &str) -> Result<String, i64> {
+    state_create_session(state,cwd,"root","")
+}
+
+def cli_state_create_child_session(state: &CliState, cwd: &str, parent_session_id: &str) -> Result<String,i64> {
+    if parent_session_id.len()==0 or parent_session_id.len()>256 {return string_result_err(2);};
+    state_create_session(state,cwd,"child",parent_session_id)
+}
+
+def state_create_session(state: &CliState, cwd: &str, kind: &str, parent_session_id: &str) -> Result<String,i64> {
+    let canonical = canonical_path_string(cwd)?;
+    let project = state_digest(canonical.as_str())?;
+    let id = state_id("session-")?;
+    let now = time_unix_ms();
+    let mut tx = state.db.transaction()?;
+    let mut insert = tx.prepare("INSERT INTO projects(id,directory,display_name,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(directory) DO NOTHING")?;
+    insert.bind_text(1, project.as_str())?; insert.bind_text(2, canonical.as_str())?;
+    insert.bind_text(3, canonical.as_str())?; insert.bind_i64(4, now)?; insert.bind_i64(5, now)?; insert.step()?;
+    if kind=="child" {
+        let mut parent=tx.prepare("SELECT 1 FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.id=? AND p.directory=? AND s.archived=0")?;
+        parent.bind_text(1,parent_session_id)?;parent.bind_text(2,canonical.as_str())?;if not parent.step()?{return string_result_err(5);};
+    };
+    let mut session = tx.prepare("INSERT INTO sessions(id,project_id,title,created_at,updated_at) SELECT ?,id,'New task',?,? FROM projects WHERE directory=?")?;
+    session.bind_text(1, id.as_str())?; session.bind_i64(2, now)?; session.bind_i64(3, now)?; session.bind_text(4, canonical.as_str())?; session.step()?;
+    let metadata=json_doc_object()?;let origin=session_origin(kind,parent_session_id,"")?;
+    metadata.root().object_set("session_origin",metadata.copy(origin.root())?)?;
+    let mut save=tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,?,?)")?;
+    save.bind_text(1,id.as_str())?;save.bind_text(2,metadata.serialize_string()?.as_str())?;save.bind_i64(3,now)?;save.step()?;
+    tx.commit()?;
+    Result { is_ok: true, value: id, error: 0 }
+}
+
+def cli_state_sessions(state: &CliState, cwd: &str) -> Result<JsonDoc, i64> {
+    state_session_list(state,cwd,0)
+}
+
+// Resume, prompt recall and Agent views intentionally have distinct scopes.
+// Never tighten session_in_project: internal hosts and new empty drafts use it.
+def cli_state_resumable_sessions(state: &CliState, cwd: &str) -> Result<JsonDoc,i64> { state_session_list(state,cwd,1) }
+def cli_state_agent_sessions(state: &CliState, cwd: &str) -> Result<JsonDoc,i64> { state_session_list(state,cwd,2) }
+
+def state_session_user_sql() -> &str {
+    "EXISTS(SELECT 1 FROM messages u WHERE u.session_id=s.id AND u.role='user' AND u.cancelled=0 AND length(trim(u.text,char(9)||char(10)||char(11)||char(12)||char(13)||char(32)||char(133)||char(160)||char(5760)||char(8192)||char(8193)||char(8194)||char(8195)||char(8196)||char(8197)||char(8198)||char(8199)||char(8200)||char(8201)||char(8202)||char(8232)||char(8233)||char(8239)||char(8287)||char(12288)))>0 AND lower(trim(u.text))<>'[empty]')"
+}
+
+def state_session_display_title(state: &CliState, id: &str, title: &str, source: &str) -> Result<String,i64> {
+    if source!="placeholder" or not session_title_placeholder(title)? {return cli_terminal_safe(title);};
+    let mut first=state.db.prepare("SELECT substr(text,1,8192) FROM messages WHERE session_id=? AND role='user' AND cancelled=0 ORDER BY revision,created_at,id")?;
+    first.bind_text(1,id)?;
+    while first.step()? {let generated=session_title(first.text(0)?.as_str())?;if generated.len()>0{return Result{is_ok:true,value:generated,error:0};};};
+    cli_terminal_safe(title)
+}
+
+def state_session_list(state: &CliState, cwd: &str, scope: i64) -> Result<JsonDoc,i64> {
+    let canonical = canonical_path_string(cwd)?;
+    let document = json_doc_object()?;
+    let items = document.new_array()?;
+    document.root().object_set("sessions", items)?;
+    let sql=cli_text(session_children_sql());
+    sql.push_str(" SELECT s.id,s.title,s.run_state,s.title_source,s.updated_at,s.last_sent_at,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id) FROM sessions s JOIN projects p ON p.id=s.project_id WHERE p.directory=? AND s.archived=0")?;
+    if scope==1 {sql.push_str(" AND s.id NOT IN(SELECT id FROM child_sessions) AND ")?;sql.push_str(state_session_user_sql())?; ();};
+    if scope==2 {sql.push_str(" AND s.id IN(SELECT id FROM child_sessions)")?; ();};
+    sql.push_str(" ORDER BY s.updated_at DESC,s.id LIMIT 100")?;
+    let mut query = state.db.prepare(sql.as_str())?;
+    query.bind_text(1, canonical.as_str())?;
+    while query.step()? {
+        let item = document.new_object()?;
+        let id = query.text(0)?; let title = state_session_display_title(state,id.as_str(),query.text(1)?.as_str(),query.text(3)?.as_str())?; let status = query.text(2)?;
+        cli_put_string(&document, item, "id", id.as_str())?;
+        cli_put_string(&document, item, "title", title.as_str())?;
+        cli_put_string(&document, item, "status", status.as_str())?;
+        cli_put_i64(&document,item,"updated_at",query.integer(4)?)?;
+        cli_put_i64(&document,item,"last_sent_at",if query.is_null(5)?{0}else{query.integer(5)?})?;
+        cli_put_i64(&document,item,"message_count",query.integer(6)?)?;
+        items.array_push(item)?;
+    };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def cli_state_session_resumable(state: &CliState, cwd: &str, id: &str) -> Result<bool,i64> {
+    let canonical=canonical_path_string(cwd)?;let sql=cli_text(session_children_sql());
+    sql.push_str(" SELECT 1 FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.id=? AND p.directory=? AND s.archived=0 AND s.id NOT IN(SELECT id FROM child_sessions) AND ")?;sql.push_str(state_session_user_sql())?;
+    let mut query=state.db.prepare(sql.as_str())?;query.bind_text(1,id)?;query.bind_text(2,canonical.as_str())?;
+    Result{is_ok:true,value:query.step()?,error:0}
+}
+
+def cli_state_session_in_project(state: &CliState, cwd: &str, id: &str) -> Result<bool, i64> {
+    let canonical = canonical_path_string(cwd)?;
+    let mut query = state.db.prepare("SELECT 1 FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.id=? AND p.directory=? AND s.archived=0")?;
+    query.bind_text(1,id)?; query.bind_text(2,canonical.as_str())?;
+    let present = query.step()?;
+    Result {is_ok:true,value:present,error:0}
+}
+
+// Public history is complete or fails explicitly. Presentation windows never
+// become model context: offsets are absolute message counts, not revisions.
+def cli_state_history_count(state: &CliState, id: &str) -> Result<i64, i64> {
+    let mut query = state.db.prepare("SELECT COUNT(*) FROM messages WHERE session_id=?")?;
+    query.bind_text(1, id)?;
+    if not query.step()? { return cli_fail(10); };
+    query.integer(0)
+}
+
+// Legacy runtime node exhaustion reports parse10. Normalize only that exact
+// resource diagnostic; malformed JSON remains10 and is never window-shrunk.
+def state_history_json_error(code: i64) -> Result<i64, i64> {
+    if code != 10 { return cli_ok(code); };
+    let buffer = ffi_buffer_new(256)?;
+    let count = json_last_error_copy(buffer)?;
+    let message = string_from_buffer(buffer, count)?;
+    cli_ok(if message.as_str() == "json node limit exceeded" { 13 } else { code })
+}
+
+def state_history_window(state: &CliState, id: &str, start: i64, count: i64, total: i64, max_bytes: i64, max_rows: i64) -> Result<JsonDoc, i64> {
+    if start < 0 or count < 0 or start > total or count > total - start or max_bytes < 64 or max_bytes > 16777216 or max_rows < 0 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    // A bounded JSON document admits at most 4096 nodes/links. The row check
+    // avoids scanning arbitrarily large stores; structured rows may hit that
+    // node bound earlier, which also returns 13 without a partial document.
+    if count > max_rows or count > 4090 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    let input_bytes = {
+        let mut size = state.db.prepare("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (SELECT CASE WHEN h.message_json IS NULL THEN length(CAST(m.role AS BLOB))+length(CAST(m.text AS BLOB))+32 ELSE length(CAST(h.message_json AS BLOB)) END AS bytes FROM messages m LEFT JOIN shared_history h ON h.message_id=m.id WHERE m.session_id=? ORDER BY m.revision,m.created_at,m.id LIMIT ? OFFSET ?)")?;
+        size.bind_text(1, id)?; size.bind_i64(2, count)?; size.bind_i64(3, start)?; size.step()?;
+        if size.integer(0)? != count { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 12 }; };
+        size.integer(1)?
+    };
+    if input_bytes < 0 or input_bytes > max_bytes - 64 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    // Reserve for this window, not the global16MiB ceiling. Multiple UI/state
+    // snapshots must not exhaust aggregate admission merely by being small.
+    let mut document_bytes = input_bytes * 6 + 512;
+    if document_bytes > max_bytes { document_bytes = max_bytes; };
+    let document = json_doc_object_bounded(document_bytes)?;
+    let items = document.new_array()?;
+    document.root().object_set("messages", items)?;
+    cli_put_i64(&document, document.root(), "total_messages", total)?;
+    cli_put_i64(&document, document.root(), "offset", start)?;
+    let mut query = state.db.prepare("SELECT m.role,m.text,h.message_json,CASE WHEN h.message_json IS NULL THEN length(CAST(m.role AS BLOB))+length(CAST(m.text AS BLOB))+32 ELSE length(CAST(h.message_json AS BLOB)) END FROM messages m LEFT JOIN shared_history h ON h.message_id=m.id WHERE m.session_id=? ORDER BY m.revision,m.created_at,m.id LIMIT ? OFFSET ?")?;
+    query.bind_text(1, id)?; query.bind_i64(2, count)?; query.bind_i64(3, start)?;
+    let mut admitted = 64;
+    let mut rows = 0;
+    while query.step()? {
+        // Inspect SQL byte lengths before allocating an owned String or
+        // parsing a structured row. Serialization enforces escaped size too.
+        let bytes = query.integer(3)?;
+        if bytes < 0 or bytes > max_bytes - admitted { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        admitted = admitted + bytes;
+        if query.is_null(2)? {
+            let row = json_doc_object_bounded(if bytes * 6 + 64 < document_bytes { bytes * 6 + 64 } else { document_bytes })?;
+            let role = query.text(0)?; let text = query.text(1)?;
+            row.root().object_set("role", row.new_string_owned(&role)?)?;
+            row.root().object_set("content", row.new_string_owned(&text)?)?;
+            let copied = document.copy(row.root());
+            if not copied.is_ok() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: state_history_json_error(copied.error)? }; };
+            items.array_push(copied.value)?;
+        } else {
+            let raw = query.text(2)?;
+            if raw.len() != raw.as_str().len() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
+            let parsed = json_parse_bounded(raw.as_str(), if raw.len() > 0 { raw.len() } else { 1 });
+            if not parsed.is_ok() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: state_history_json_error(parsed.error)? }; };
+            let copied = document.copy(parsed.value.root());
+            if not copied.is_ok() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: state_history_json_error(copied.error)? }; };
+            items.array_push(copied.value)?;
+        };
+        rows = rows + 1;
+    };
+    if rows != count { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 12 }; };
+    // Never return a successful window which cannot be serialized within its
+    // declared bound, including control-character expansion in desktop text.
+    document.serialize_string()?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def cli_state_history_range(state: &CliState, id: &str, start: i64, count: i64) -> Result<JsonDoc, i64> {
+    let total = cli_state_history_count(state, id)?;
+    state_history_window(state, id, start, count, total, 16777216, 4090)
+}
+
+def cli_state_history_tail(state: &CliState, id: &str, messages_seen: i64) -> Result<JsonDoc, i64> {
+    let total = cli_state_history_count(state, id)?;
+    if messages_seen < 0 or messages_seen > total { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
+    state_history_window(state, id, messages_seen, total - messages_seen, total, 16777216, 4090)
+}
+
+def cli_state_history(state: &CliState, id: &str) -> Result<JsonDoc, i64> {
+    let total = cli_state_history_count(state, id)?;
+    state_history_window(state, id, 0, total, total, 16777216, 4090)
+}
+
+// UI-only projection. When rich tool rows exceed the bounded document, retry
+// a smaller window anchored to the newest row; never fall back to old rows.
+def cli_state_recent_history(state: &CliState, id: &str, limit: i64) -> Result<JsonDoc, i64> {
+    if limit < 1 or limit > 4090 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let total = cli_state_history_count(state, id)?;
+    let mut count = if limit < total { limit } else { total };
+    loop {
+        let result = state_history_window(state, id, total - count, count, total, 16777216, 4090);
+        if result.is_ok() { return result; };
+        if result.error != 13 or count <= 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: result.error }; };
+        count = count / 2;
+    };
+    Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }
+}
+
+def state_exec_valid(state: &CliState, execution: &CliExecution) -> Result<bool, i64> {
+    if not execution.active { return state_bool_error(3); };
+    let mut check = state.db.prepare("SELECT 1 FROM shared_executions WHERE session_id=? AND owner_instance_id=? AND execution_id=? AND fence=? AND active=1")?;
+    check.bind_text(1, execution.session.as_str())?; check.bind_text(2, state.instance.as_str())?;
+    check.bind_text(3, execution.id.as_str())?; check.bind_i64(4, execution.fence)?;
+    if not check.step()? { return state_bool_error(7); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def state_tx_exec_valid(tx: &SqliteTransaction, state: &CliState, execution: &CliExecution) -> Result<bool, i64> {
+    if not execution.active { return state_bool_error(3); };
+    let mut check = tx.prepare("SELECT 1 FROM shared_executions WHERE session_id=? AND owner_instance_id=? AND execution_id=? AND fence=? AND active=1")?;
+    check.bind_text(1,execution.session.as_str())?; check.bind_text(2,state.instance.as_str())?;
+    check.bind_text(3,execution.id.as_str())?; check.bind_i64(4,execution.fence)?;
+    if not check.step()? { return state_bool_error(7); };
+    Result {is_ok:true,value:true,error:0}
+}
+
+def cli_state_begin(state: &CliState, id: &str, connection: &str, model: &str) -> Result<CliExecution, i64> {
+    state_begin_execution(state, id, connection, model, false)
+}
+
+// File maintenance uses the same authority without changing the model target.
+def cli_state_begin_maintenance(state: &CliState, id: &str) -> Result<CliExecution, i64> {
+    state_begin_execution(state, id, "", "", true)
+}
+
+def state_begin_execution(state: &CliState, id: &str, connection: &str, model: &str, preserve_target: bool) -> Result<CliExecution, i64> {
+    let path = state_lock_path(state.path.as_str(), "session", id)?;
+    let mut lease = file_lock(path.as_str())?;
+    let execution = state_id("turn-")?;
+    let now = time_unix_ms();
+    let mut tx = state.db.transaction()?;
+    let mut orphan = tx.prepare("SELECT 1 FROM shared_executions e WHERE e.session_id=? AND (e.cleanup_required=1 OR (e.active=1 AND (e.engine<>'sengoo' OR EXISTS(SELECT 1 FROM shared_tool_ledger t WHERE t.session_id=e.session_id AND t.state='running'))))")?;
+    orphan.bind_text(1,id)?;
+    if orphan.step()? {
+        cli_diagnostic("The previous execution did not certify tool-process cleanup. Session recovery is paused; a released lock or elapsed heartbeat alone cannot authorize takeover.");
+        lease.close()?;
+        return state_execution_error(7);
+    };
+    let mut special = tx.prepare("SELECT 1 FROM meeting_runs WHERE session_id=? AND state NOT IN('completed','cancelled') UNION ALL SELECT 1 FROM fusion_runs WHERE session_id=? AND state NOT IN('decided','partial','interrupted','cancelled') LIMIT 1")?;
+    special.bind_text(1,id)?; special.bind_text(2,id)?;
+    if special.step()? {
+        lease.close()?;
+        return state_execution_error(7);
+    };
+    // An OS lock proves exclusivity, not that an old tool process has exited.
+    // Only idle executions and CLI turns with no pending tool can pass above.
+    let mut clear = tx.prepare("UPDATE shared_executions SET active=0 WHERE session_id=?")?;
+    clear.bind_text(1, id)?; clear.step()?;
+    let mut claim = tx.prepare("INSERT INTO shared_executions(session_id,owner_instance_id,execution_id,engine,fence,active,started_at,updated_at) VALUES(?,?,?,'sengoo',1,1,?,?) ON CONFLICT(session_id) DO UPDATE SET owner_instance_id=excluded.owner_instance_id,execution_id=excluded.execution_id,engine='sengoo',fence=shared_executions.fence+1,active=1,started_at=excluded.started_at,updated_at=excluded.updated_at")?;
+    claim.bind_text(1,id)?; claim.bind_text(2,state.instance.as_str())?; claim.bind_text(3,execution.as_str())?;
+    claim.bind_i64(4,now)?; claim.bind_i64(5,now)?; claim.step()?;
+    let mut fence_query = tx.prepare("SELECT fence FROM shared_executions WHERE session_id=?")?;
+    fence_query.bind_text(1,id)?; fence_query.step()?; let fence = fence_query.integer(0)?;
+    let mut recover = tx.prepare("UPDATE shared_tool_ledger SET state='interrupted' WHERE session_id=? AND state='running' AND fence<>?")?;
+    recover.bind_text(1,id)?; recover.bind_i64(2,fence)?; recover.step()?;
+    let mut incomplete = tx.prepare("UPDATE messages SET completed_at=?,cancelled=1 WHERE session_id=? AND role='assistant' AND completed_at IS NULL")?;
+    incomplete.bind_i64(1,now)?; incomplete.bind_text(2,id)?; incomplete.step()?;
+    let mut update = tx.prepare(if preserve_target { "UPDATE sessions SET run_state='running',updated_at=?,last_sent_at=? WHERE id=?" } else { "UPDATE sessions SET run_state='running',updated_at=?,last_sent_at=?,selected_connection_id=?,selected_model_id=? WHERE id=?" })?;
+    update.bind_i64(1,now)?; update.bind_i64(2,now)?;
+    if preserve_target { update.bind_text(3,id)?; (); } else { update.bind_text(3,connection)?; update.bind_text(4,model)?; update.bind_text(5,id)?; (); };
+    update.step()?;
+    tx.commit()?;
+    Result { is_ok: true, value: CliExecution { session: cli_text(id), id: execution, fence: fence, lease: lease, active: true }, error: 0 }
+}
+
+def cli_state_append(state: &CliState, execution: &CliExecution, message: &JsonDoc) -> Result<bool, i64> {
+    state_exec_valid(state,execution)?;
+    let role = cli_json_string(message.root(),"role")?;
+    let content = cli_json_optional_string(message.root(),"content");
+    let raw = message.serialize_string()?;
+    let id = state_id("message-")?;
+    let now = time_unix_ms();
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut row = tx.prepare("INSERT INTO messages(id,session_id,role,text,created_at,completed_at,revision,shared_fence) SELECT ?,?,?,?, ?,?,COALESCE(MAX(revision),0)+1,? FROM messages WHERE session_id=?")?;
+    row.bind_text(1,id.as_str())?; row.bind_text(2,execution.session.as_str())?;
+    row.bind_text(3,role.as_str())?; row.bind_text(4,content.as_str())?;
+    row.bind_i64(5,now)?; row.bind_i64(6,now)?; row.bind_i64(7,execution.fence)?; row.bind_text(8,execution.session.as_str())?; row.step()?;
+    let mut structured = tx.prepare("INSERT INTO shared_history(message_id,session_id,message_json,execution_id,fence) VALUES(?,?,?,?,?)")?;
+    structured.bind_text(1,id.as_str())?; structured.bind_text(2,execution.session.as_str())?;
+    structured.bind_text(3,raw.as_str())?; structured.bind_text(4,execution.id.as_str())?; structured.bind_i64(5,execution.fence)?; structured.step()?;
+    if role.as_str()=="user" {
+        let generated=session_title(content.as_str())?;
+        if generated.len()>0 {
+            let mut title=tx.prepare("UPDATE sessions SET title=?,title_source='first_message',updated_at=MAX(updated_at,?) WHERE id=? AND title_source='placeholder' AND (trim(title)='' OR lower(replace(trim(title),' ','')) IN('newchat','newtask'))")?;
+            title.bind_text(1,generated.as_str())?;title.bind_i64(2,now)?;title.bind_text(3,execution.session.as_str())?;title.step()?; ();
+        };
+    };
+    tx.commit()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def cli_state_tool_claim(state: &CliState, execution: &CliExecution, call_id: &str, name: &str, arguments: &str) -> Result<bool, i64> {
+    state_exec_valid(state,execution)?;
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut insert = tx.prepare("INSERT INTO shared_tool_ledger(session_id,call_id,execution_id,fence,name,arguments,state,updated_at) VALUES(?,?,?,?,?,?,'running',?) ON CONFLICT(session_id,call_id) DO NOTHING")?;
+    insert.bind_text(1,execution.session.as_str())?; insert.bind_text(2,call_id)?;
+    insert.bind_text(3,execution.id.as_str())?; insert.bind_i64(4,execution.fence)?;
+    insert.bind_text(5,name)?; insert.bind_text(6,arguments)?; insert.bind_i64(7,time_unix_ms())?; insert.step()?;
+    let mut changes = tx.prepare("SELECT changes()")?; changes.step()?;
+    let claimed = changes.integer(0)?==1;
+    tx.commit()?;
+    Result { is_ok: true, value: claimed, error: 0 }
+}
+
+def cli_state_tool_complete(state: &CliState, execution: &CliExecution, call_id: &str, result: &str) -> Result<bool, i64> {
+    state_exec_valid(state,execution)?;
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut update = tx.prepare("UPDATE shared_tool_ledger SET state='complete',result=?,updated_at=? WHERE session_id=? AND call_id=? AND execution_id=? AND fence=? AND state='running'")?;
+    update.bind_text(1,result)?; update.bind_i64(2,time_unix_ms())?; update.bind_text(3,execution.session.as_str())?;
+    update.bind_text(4,call_id)?; update.bind_text(5,execution.id.as_str())?; update.bind_i64(6,execution.fence)?; update.step()?;
+    let mut changes = tx.prepare("SELECT changes()")?; changes.step()?;
+    if changes.integer(0)?!=1 { return state_bool_error(7); };
+    tx.commit()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def cli_state_tool_result(state: &CliState, session: &str, call_id: &str) -> Result<String, i64> {
+    let mut query = state.db.prepare("SELECT result FROM shared_tool_ledger WHERE session_id=? AND call_id=? AND state='complete'")?;
+    query.bind_text(1,session)?; query.bind_text(2,call_id)?;
+    if not query.step()? { return string_result_err(12); };
+    query.text(0)
+}
+
+def cli_state_finish(state: &CliState, execution: &mut CliExecution, status: &str) -> Result<bool, i64> {
+    state_exec_valid(state,execution)?;
+    if status != "idle" and status != "error" and status != "interrupted" { return state_bool_error(2); };
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut pending = tx.prepare("UPDATE messages SET completed_at=?,cancelled=1 WHERE session_id=? AND shared_fence=? AND completed_at IS NULL")?;
+    pending.bind_i64(1,time_unix_ms())?; pending.bind_text(2,execution.session.as_str())?; pending.bind_i64(3,execution.fence)?; pending.step()?;
+    let mut update = tx.prepare("UPDATE sessions SET run_state=?,updated_at=? WHERE id=?")?;
+    update.bind_text(1,status)?; update.bind_i64(2,time_unix_ms())?; update.bind_text(3,execution.session.as_str())?; update.step()?;
+    let mut release = tx.prepare("UPDATE shared_executions SET active=0,updated_at=? WHERE session_id=? AND owner_instance_id=? AND execution_id=? AND fence=?")?;
+    release.bind_i64(1,time_unix_ms())?; release.bind_text(2,execution.session.as_str())?; release.bind_text(3,state.instance.as_str())?;
+    release.bind_text(4,execution.id.as_str())?; release.bind_i64(5,execution.fence)?; release.step()?;
+    tx.commit()?;
+    execution.active = false;
+    execution.lease.close()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def cli_state_stream_start(state: &CliState, execution: &CliExecution) -> Result<String,i64> {
+    let id = state_id("message-")?;
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut insert = tx.prepare("INSERT INTO messages(id,session_id,role,text,created_at,revision,shared_fence) SELECT ?,?,'assistant','',?,COALESCE(MAX(revision),0)+1,? FROM messages WHERE session_id=?")?;
+    insert.bind_text(1,id.as_str())?; insert.bind_text(2,execution.session.as_str())?;
+    insert.bind_i64(3,time_unix_ms())?; insert.bind_i64(4,execution.fence)?; insert.bind_text(5,execution.session.as_str())?; insert.step()?;
+    tx.commit()?;
+    Result {is_ok:true,value:id,error:0}
+}
+
+def cli_state_stream_delta(state: &CliState,execution: &CliExecution,id: &str,text: &str) -> Result<bool,i64> {
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut update = tx.prepare("UPDATE messages SET text=text||? WHERE id=? AND session_id=? AND shared_fence=? AND completed_at IS NULL")?;
+    update.bind_text(1,text)?; update.bind_text(2,id)?; update.bind_text(3,execution.session.as_str())?;
+    update.bind_i64(4,execution.fence)?; update.step()?;
+    let mut count = tx.prepare("SELECT changes()")?; count.step()?;
+    if count.integer(0)?!=1 { return state_bool_error(7); };
+    tx.commit()?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def cli_state_stream_finish(state: &CliState,execution: &CliExecution,id: &str,message: &JsonDoc) -> Result<bool,i64> {
+    // Keep the complete canonical assistant record, including scoped
+    // responses_output, responses_end_turn and requires_continuation. These
+    // control fields survive recovery without becoming visible message text.
+    let raw = message.serialize_string()?;
+    let content = cli_json_optional_string(message.root(),"content");
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut update = tx.prepare("UPDATE messages SET text=?,completed_at=? WHERE id=? AND session_id=? AND shared_fence=? AND completed_at IS NULL")?;
+    update.bind_text(1,content.as_str())?; update.bind_i64(2,time_unix_ms())?;
+    update.bind_text(3,id)?; update.bind_text(4,execution.session.as_str())?; update.bind_i64(5,execution.fence)?; update.step()?;
+    let mut count = tx.prepare("SELECT changes()")?; count.step()?;
+    if count.integer(0)?!=1 { return state_bool_error(7); };
+    let mut structured = tx.prepare("INSERT INTO shared_history(message_id,session_id,message_json,execution_id,fence) VALUES(?,?,?,?,?)")?;
+    structured.bind_text(1,id)?; structured.bind_text(2,execution.session.as_str())?;
+    structured.bind_text(3,raw.as_str())?; structured.bind_text(4,execution.id.as_str())?; structured.bind_i64(5,execution.fence)?; structured.step()?;
+    tx.commit()?;
+    Result {is_ok:true,value:true,error:0}
+}
+
+def cli_state_workspace_lock(state: &CliState, cwd: &str) -> Result<FileLock, i64> {
+    let canonical = canonical_path_string(cwd)?;
+    let path = state_lock_path(state.path.as_str(),"workspace",canonical.as_str())?;
+    file_lock(path.as_str())
+}
+
+def state_config_string(value: JsonValue, key: &str, fallback: &str) -> String {
+    if value.object_has(key) { return cli_json_optional_string(value,key); };
+    cli_json_optional_string(value,fallback)
+}
+
+def state_config_protocol(value: JsonValue) -> String {
+    let protocol = cli_json_optional_string(value,"protocol");
+    if protocol.as_str() == "auto" { return cli_json_optional_string(value,"successfulProtocol"); };
+    protocol
+}
+
+def state_connection_id_valid(id: &str) -> bool {
+    if not str_starts_with(id,"custom-") or id.len()>128 { return false; };
+    let text = cli_text(id);
+    let bytes = text.bytes();
+    loop {
+        let byte = bytes.next();
+        if not byte.is_some { break; };
+        let c = byte.value;
+        if not (c>=48 and c<=57 or c>=65 and c<=90 or c>=97 and c<=122 or c==45 or c==95 or c==46) { return false; };
+    };
+    true
+}
+
+def cli_state_connection_save(state: &CliState, id: &str, name: &str, base_url: &str, protocol: &str, model: &str, secret: &str) -> Result<bool,i64> {
+    if not state_connection_id_valid(id) or name.len()==0 or model.len()==0 or model.len()>256 { return state_bool_error(2); };
+    if protocol!="chatCompletions" and protocol!="responses" and protocol!="messages" { return state_bool_error(2); };
+    if str_contains(base_url,"\r") or str_contains(base_url,"\n") or str_contains(base_url,"@") { return state_bool_error(2); };
+    if not str_starts_with(base_url,"https://") and not str_starts_with(base_url,"http://127.0.0.1:") and not str_starts_with(base_url,"http://localhost:") and not str_starts_with(base_url,"http://[::1]:") { return state_bool_error(7); };
+    let path = state_lock_path(state.path.as_str(),"connection",id)?;
+    let lease = file_lock(path.as_str())?;
+    let target = cli_join("Sencode/connection/",id)?;
+    let config = json_doc_object()?;
+    let root = config.root();
+    cli_put_i64(&config,root,"version",2)?;
+    cli_put_string(&config,root,"baseUrl",base_url)?;
+    cli_put_string(&config,root,"credentialRef",target.as_str())?;
+    cli_put_string(&config,root,"protocol",protocol)?;
+    cli_put_string(&config,root,"successfulProtocol",protocol)?;
+    cli_put_string(&config,root,"apiKeyMasked","[stored]")?;
+    cli_put_string(&config,root,"selectedModelId",model)?;
+    let enabled = config.new_array()?;
+    let item = config.new_object()?;
+    cli_put_string(&config,item,"id",model)?;
+    let capabilities = config.new_object()?;
+    cli_put_bool(&config,capabilities,"visionSupported",false)?;
+    item.object_set("capabilities",capabilities)?;
+    enabled.array_push(item)?;
+    root.object_set("enabledModels",enabled)?;
+    let raw = config.serialize_string()?;
+    let mut insert = state.db.prepare("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES(?,'customApi','managed',?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,config_json=excluded.config_json,selected_model_id=excluded.selected_model_id,updated_at=excluded.updated_at")?;
+    insert.bind_text(1,id)?; insert.bind_text(2,name)?; insert.bind_text(3,raw.as_str())?;
+    insert.bind_text(4,model)?; insert.bind_i64(5,time_unix_ms())?; insert.bind_i64(6,time_unix_ms())?;
+    let old = credential_read(target.as_str());
+    if secret.len()>0 { credential_write(target.as_str(),secret)?; (); } else { if not old.is_ok() { return state_bool_error(5); }; (); };
+    let result = insert.step();
+    if not result.is_ok() {
+        if secret.len()>0 { if old.is_ok() { credential_write(target.as_str(),old.value.as_str()); (); } else { credential_delete(target.as_str()); (); }; (); };
+        return state_bool_error(result.error);
+    };
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def cli_state_connection_remove(state: &CliState,id: &str) -> Result<bool,i64> {
+    if not state_connection_id_valid(id) { return state_bool_error(2); };
+    let path = state_lock_path(state.path.as_str(),"connection",id)?;
+    let lease = file_lock(path.as_str())?;
+    let target = cli_join("Sencode/connection/",id)?;
+    let mut tx = state.db.transaction()?;
+    let mut remove = tx.prepare("DELETE FROM connection_configs WHERE id=?")?;
+    remove.bind_text(1,id)?;
+    let mut preference = tx.prepare("DELETE FROM app_preferences WHERE key='preferred_connection_id' AND value=?")?;
+    preference.bind_text(1,id)?;
+    let previous = credential_read(target.as_str());
+    if previous.is_ok() { credential_delete(target.as_str())?; (); };
+    let result = remove.step();
+    if not result.is_ok() {
+        if previous.is_ok() { credential_write(target.as_str(),previous.value.as_str()); (); };
+        return state_bool_error(result.error);
+    };
+    let changed = preference.step();
+    if not changed.is_ok() {
+        if previous.is_ok() { credential_write(target.as_str(),previous.value.as_str()); (); };
+        return state_bool_error(changed.error);
+    };
+    let committed = tx.commit();
+    if not committed.is_ok() {
+        if previous.is_ok() { credential_write(target.as_str(),previous.value.as_str()); (); };
+        return state_bool_error(committed.error);
+    };
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def cli_state_mode_save(state: &CliState,execution: &CliExecution,kind: &str,value: &JsonDoc) -> Result<bool,i64> {
+    state_exec_valid(state,execution)?;
+    let mut current = cli_state_modes(state,execution.session.as_str())?;
+    current.root().object_set(kind,current.copy(value.root())?)?;
+    let raw = current.serialize_string()?;
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET mode_json=excluded.mode_json,updated_at=excluded.updated_at")?;
+    save.bind_text(1,execution.session.as_str())?; save.bind_text(2,raw.as_str())?; save.bind_i64(3,time_unix_ms())?; save.step()?;
+    tx.commit()?;
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def cli_state_modes(state: &CliState,session: &str) -> Result<JsonDoc,i64> {
+    let mut query = state.db.prepare("SELECT mode_json FROM shared_modes WHERE session_id=?")?;
+    query.bind_text(1,session)?;
+    if not query.step()? { return json_doc_object(); };
+    let raw = query.text(0)?;
+    json_parse(raw.as_str())
+}
+
+def cli_state_mode_load(state: &CliState,session: &str,kind: &str) -> Result<JsonDoc,i64> {
+    let modes = cli_state_modes(state,session)?;
+    if not modes.root().object_has(kind) { return json_doc_object(); };
+    let result = json_doc_object()?;
+    // Copy members using a wrapper to preserve arbitrary structured mode state.
+    result.root().object_set("value",result.copy(modes.root().object_get(kind)?)?)?;
+    Result { is_ok:true,value:result,error:0 }
+}
+
+def cli_state_usage(state: &CliState,execution: &CliExecution,request_id: &str,connection: &str,model: &str,input_tokens: i64,output_tokens: i64) -> Result<bool,i64> {
+    state_exec_valid(state,execution)?;
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx,state,execution)?;
+    let mut record = tx.prepare("INSERT INTO shared_usage(request_id,session_id,connection_id,model_id,input_tokens,output_tokens,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(request_id) DO NOTHING")?;
+    record.bind_text(1,request_id)?; record.bind_text(2,execution.session.as_str())?;
+    record.bind_text(3,connection)?; record.bind_text(4,model)?; record.bind_i64(5,input_tokens)?; record.bind_i64(6,output_tokens)?;
+    record.bind_i64(7,time_unix_ms())?; record.step()?;
+    tx.commit()?;
+    Result { is_ok:true,value:true,error:0 }
+}
+
+def cli_state_usage_summary(state: &CliState) -> Result<JsonDoc,i64> {
+    let document = json_doc_object()?;
+    let items = document.new_array()?;
+    document.root().object_set("usage",items)?;
+    cli_put_string(&document,document.root(),"source","provider-reported tokens recorded locally; not remaining quota")?;
+    let mut query = state.db.prepare("SELECT connection_id,model_id,COUNT(*),SUM(input_tokens),SUM(output_tokens) FROM shared_usage GROUP BY connection_id,model_id ORDER BY connection_id,model_id")?;
+    while query.step()? {
+        let item = document.new_object()?;
+        let connection = query.text(0)?; let model = query.text(1)?;
+        cli_put_string(&document,item,"connection",connection.as_str())?;
+        cli_put_string(&document,item,"model",model.as_str())?;
+        cli_put_i64(&document,item,"requests",query.integer(2)?)?;
+        cli_put_i64(&document,item,"input_tokens",query.integer(3)?)?;
+        cli_put_i64(&document,item,"output_tokens",query.integer(4)?)?;
+        items.array_push(item)?;
+    };
+    Result {is_ok:true,value:document,error:0}
+}
+
+// Only public connection identity is read here. Provider configuration and
+// credential contents never determine an executable or enter this document.
+def cli_state_connection_metadata(state: &CliState, id: &str) -> Result<JsonDoc, i64> {
+    let mut query = state.db.prepare("SELECT kind,profile_scope,COALESCE(selected_model_id,'') FROM connection_configs WHERE id=?")?;
+    query.bind_text(1, id)?;
+    if not query.step()? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }; };
+    let kind = query.text(0)?;
+    let scope = query.text(1)?;
+    let model = query.text(2)?;
+    if kind.as_str() != "customApi" and kind.as_str() != "codex" and kind.as_str() != "sencode" { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    if scope.as_str() != "shared" and scope.as_str() != "managed" { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let document = json_doc_object()?;
+    let engine = if kind.as_str() == "customApi" { "sengoo-native-api" } else { if kind.as_str() == "codex" { "codex-app-server" } else { "sencode-acp" } };
+    cli_put_string(&document, document.root(), "engine", engine)?;
+    cli_put_string(&document, document.root(), "connection_id", id)?;
+    cli_put_string(&document, document.root(), "model", model.as_str())?;
+    cli_put_string(&document, document.root(), "profile_scope", scope.as_str())?;
+    if kind.as_str() == "customApi" { return Result { is_ok: true, value: document, error: 0 }; };
+    let directory = path_parent_string(current_executable_string()?.as_str())?;
+    let manifest_path = path_join_string(directory.as_str(), "package-manifest.json")?;
+    if not file_exists(manifest_path.as_str()) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let size = file_len(manifest_path.as_str())?;
+    if size < 1 or size > 262144 or file_kind(manifest_path.as_str())? != PATH_KIND_FILE() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let buffer = ffi_buffer_new(size + 1)?;
+    let count = file_read_into(manifest_path.as_str(), buffer)?;
+    let manifest = json_parse_buffer(buffer, count)?;
+    if cli_json_optional_i64(manifest.root(), "schema", 0) != 1 or cli_json_optional_string(manifest.root(), "product").as_str() != "sencode-cli" or cli_json_optional_string(manifest.root(), "target").as_str() != "windows-x64" or not manifest.root().object_has("managedRuntimes") { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let entries = manifest.root().object_get("managedRuntimes")?;
+    if entries.array_len()? > 2 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let version = if kind.as_str() == "codex" { "0.144.4" } else { "0.2.102" };
+    let protocol = if kind.as_str() == "codex" { "0.144.4" } else { "1" };
+    let basename = if kind.as_str() == "codex" { "codex-app-server.exe" } else { "sencode-agent.exe" };
+    let mut matched = 0;
+    let mut index = 0;
+    while index < entries.array_len()? {
+        let entry = entries.array_get(index)?;
+        if cli_json_optional_string(entry, "engine").as_str() == engine {
+            matched = matched + 1;
+            if cli_json_optional_string(entry, "runtime_version").as_str() != version or cli_json_optional_string(entry, "protocol_version").as_str() != protocol or cli_json_optional_string(entry, "executable").as_str() != basename { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            let expected = cli_json_string(entry, "sha256")?;
+            if expected.len() != 64 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            let executable = path_join_string(directory.as_str(), basename)?;
+            if file_kind(executable.as_str())? != PATH_KIND_FILE() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            let actual = hash_sha256_file(executable.as_str(), 536870912)?;
+            if actual.as_str() != expected.as_str() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            cli_put_string(&document, document.root(), "executable", executable.as_str())?;
+            ();
+        };
+        index = index + 1;
+    };
+    if matched != 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let env_name = if kind.as_str() == "codex" { "CODEX_HOME" } else { "GROK_HOME" };
+    let mut profile = string_new();
+    if scope.as_str() == "shared" {
+        if env_has_var(env_name) {
+            let env_buffer = ffi_buffer_new(32768)?;
+            let env_count = env_var_copy(env_name, env_buffer)?;
+            profile = string_from_buffer(env_buffer, env_count)?;
+        };
+        if profile.len() == 0 {
+            let home_buffer = ffi_buffer_new(32768)?;
+            let home_count = env_var_copy("USERPROFILE", home_buffer)?;
+            let home = string_from_buffer(home_buffer, home_count)?;
+            profile = path_join_string(home.as_str(), if kind.as_str() == "codex" { ".codex" } else { ".grok" })?;
+        };
+    } else {
+        let profiles = path_join_string(path_parent_string(state.path.as_str())?.as_str(), "profiles")?;
+        if kind.as_str() == "codex" {
+            // Account IDs use the desktop identity, not the custom-API prefix.
+            if id.len() < 1 or id.len() > 128 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            let identity = cli_text(id);
+            let bytes = identity.bytes();
+            loop {
+                let byte = bytes.next();
+                if not byte.is_some { break; };
+                let c = byte.value;
+                if not (c>=48 and c<=57 or c>=65 and c<=90 or c>=97 and c<=122 or c==45 or c==95) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+            };
+            profile = path_join_string(path_join_string(profiles.as_str(), "codex")?.as_str(), id)?;
+        } else { profile = path_join_string(profiles.as_str(), "sencode-managed/sencode-managed")?; };
+    };
+    if not path_is_absolute(profile.as_str()) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    cli_put_string(&document, document.root(), "profile_env_name", env_name)?;
+    cli_put_string(&document, document.root(), "profile_directory", profile.as_str())?;
+    cli_put_string(&document, document.root(), "runtime_version", version)?;
+    cli_put_string(&document, document.root(), "protocol_version", protocol)?;
+    let arguments = document.new_array()?;
+    if kind.as_str() == "sencode" { arguments.array_push(document.new_string("agent")?)?; arguments.array_push(document.new_string("--leader")?)?; arguments.array_push(document.new_string("stdio")?)?; (); };
+    document.root().object_set("arguments", arguments)?;
+    Result { is_ok: true, value: document, error: 0 }
+}

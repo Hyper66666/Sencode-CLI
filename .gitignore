@@ -1,0 +1,17 @@
+target/
+dist/
+.cache/
+build/
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+*.exe
+*.dll
+*.pdb
+*.obj
+*.ll
+.env
+.env.*
+!.env.example
+.sencode/

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "ripgrep",
+  "version": "14.1.1",
+  "target": "windows-x64",
+  "archive_url": "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip",
+  "archive_sha256": "d0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1",
+  "archive_prefix": "ripgrep-14.1.1-x86_64-pc-windows-msvc/",
+  "files": [
+    {"entry": "rg.exe", "name": "rg.exe", "sha256": "f162b54de2adfc72d78adb1dbada2dedda111ae0a5e2f6e9500f4f909664c5d2"},
+    {"entry": "COPYING", "name": "ripgrep.COPYING.txt", "sha256": "dfe7d0a6134a17d3de7409762e08dc02133303912875cab40a74ba07a390f85a"},
+    {"entry": "LICENSE-MIT", "name": "ripgrep.LICENSE-MIT.txt", "sha256": "970813655a1bf777d2ead189cef71ab73ab92ce04dc864027d61a45de03e6728"},
+    {"entry": "UNLICENSE", "name": "ripgrep.UNLICENSE.txt", "sha256": "640514163b17f977adc997cb16f51871122cfb0555ebad1a3f01e167b7ba8857"}
+  ]
+}

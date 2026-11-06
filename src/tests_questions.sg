@@ -1,0 +1,87 @@
+import agent;
+
+def question_expect(condition: bool, label: &str) -> Result<bool, i64> {
+    if not condition { cli_diagnostic(label); return Result { is_ok: false, value: false, error: 99 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def question_reject(encoded: &str) -> Result<bool, i64> {
+    let arguments = json_parse(encoded)?;
+    question_expect(not tool_spec_valid("ask_user", &arguments), "Malformed question/options must be rejected before the interaction")
+}
+
+def question_contract_tests() -> Result<i64, i64> {
+    let plain = json_parse("{\"question\":\"Which approach?\"}")?;
+    question_expect(tool_spec_valid("ask_user", &plain), "Legacy plain questions remain valid")?;
+    let valid = json_parse("{\"question\":\"选择方案😀\",\"options\":[{\"label\":\"方案一\",\"description\":\"第一行\\n第二行\"},{\"label\":\"方案二\"}]}")?;
+    question_expect(tool_spec_valid("ask_user", &valid), "Unicode options and multiline descriptions remain valid")?;
+    let event = engine_control_interaction_event("nonce", "request", "ask_user", "选择方案😀", true, &valid)?;
+    question_expect(cli_json_string(event.root(), "mode")?.as_str() == "question" and event.root().object_get("options")?.array_len()? == 2 and cli_json_string(event.root().object_get("options")?.array_get(0)?, "label")?.as_str() == "方案一", "Question events preserve options without replacing the question or nonce")?;
+    let legacy_event = engine_control_interaction_event("nonce", "request", "ask_user", "Which approach?", true, &plain)?;
+    question_expect(not legacy_event.root().object_has("options"), "Legacy events omit the new optional field")?;
+    let mut plan = policy_default(); plan.plan = true;
+    question_expect(tool_spec_decision(&plan, "ask_user", false) == 0, "Strict Plan still permits clarification")?;
+    question_reject("{\"question\":\"Q\",\"options\":[]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":{}}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":1},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\",\"description\":1},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\",\"extra\":\"hidden\\u0000text\"},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\"},{\"label\":\" one \"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\" \"},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\\nline\"},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\\u001b[2J\"},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\\u0000hidden\"},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"Q\",\"options\":[{\"label\":\"one\",\"description\":\"visible\\u0000hidden\"},{\"label\":\"two\"}]}")?;
+    question_reject("{\"question\":\"visible\\u0000hidden\"}")?;
+    question_reject("{\"question\":\"\"}")?;
+    question_reject("{\"options\":[{\"label\":\"one\"},{\"label\":\"two\"}]}")?;
+    let options = valid.root().object_get("options")?;
+    let label = string_new(); let description = string_new(); let mut count = 0;
+    while count < 120 { label.push_str("中")?; count = count + 1; };
+    count = 0; while count < 400 { description.push_str("文")?; count = count + 1; };
+    cli_put_string(&valid, options.array_get(0)?, "label", label.as_str())?;
+    cli_put_string(&valid, options.array_get(0)?, "description", description.as_str())?;
+    question_expect(tool_spec_valid("ask_user", &valid), "Schema length limits count Unicode scalars instead of UTF-8 bytes")?;
+    label.push_str("中")?; cli_put_string(&valid, options.array_get(0)?, "label", label.as_str())?;
+    question_expect(not tool_spec_valid("ask_user", &valid), "Labels above 120 scalars are refused")?;
+    cli_put_string(&valid, options.array_get(0)?, "label", "one")?;
+    description.push_str("文")?; cli_put_string(&valid, options.array_get(0)?, "description", description.as_str())?;
+    question_expect(not tool_spec_valid("ask_user", &valid), "Descriptions above 400 scalars are refused")?;
+    cli_put_string(&valid, options.array_get(0)?, "description", "bounded")?;
+    count = 2; while count < 7 { let item = valid.new_object()?; let text = cli_text("option-"); text.push_i64(count)?; cli_put_string(&valid, item, "label", text.as_str())?; options.array_push(item)?; count = count + 1; };
+    question_expect(not tool_spec_valid("ask_user", &valid), "More than six choices are refused")?;
+    let selected = json_parse("{\"text\":\"方案二\"}")?;
+    let custom = json_parse("{\"text\":\"自定义答案😀\"}")?;
+    question_expect(engine_control_question_answer(&selected)?.as_str() == "方案二" and engine_control_question_answer(&custom)?.as_str() == "自定义答案😀", "Selected labels and custom text use the existing answer contract")?;
+    let empty = json_parse("{\"text\":\"\"}")?;
+    let invalid = json_parse("{\"text\":\"visible\\u0000hidden\"}")?;
+    let cancelled = json_parse("{\"cancelled\":true,\"text\":\"no\"}")?;
+    question_expect(not engine_control_question_answer(&empty).is_ok() and not engine_control_question_answer(&invalid).is_ok(), "No implicit empty or truncated answer is accepted")?;
+    let stopped = engine_control_question_answer(&cancelled);
+    question_expect(not stopped.is_ok() and stopped.error == 19, "Cancellation is distinct from answering no")?;
+    let input: Vec<TerminalEvent> = vec_new(); engine_control_init(&input)?; engine_control_begin(&input, "question-turn")?;
+    let id = engine_control_interaction_start_details(&input, "ask_user", "Question?", true, &plain)?;
+    engine_control_accept(&input, "{\"type\":\"approval\",\"id\":\"wrong\",\"request_id\":\"question-turn\",\"cancelled\":true}")?;
+    question_expect(engine_control_slot(&input, 96) < 0, "Stale cancellation cannot answer the active question")?;
+    let reply = json_doc_object()?; cli_put_string(&reply, reply.root(), "type", "approval")?; cli_put_string(&reply, reply.root(), "id", id.as_str())?; cli_put_string(&reply, reply.root(), "request_id", "question-turn")?; cli_put_bool(&reply, reply.root(), "cancelled", true)?;
+    engine_control_accept(&input, reply.serialize_string()?.as_str())?;
+    let accepted = engine_control_interaction_take(&input)?;
+    let cancelled_answer = engine_control_question_answer(&accepted);
+    question_expect(not cancelled_answer.is_ok() and cancelled_answer.error == 19 and engine_control_slot(&input, 95) < 0, "Only a fresh matching nonce consumes cancellation")?;
+    let tools = agent_tools()?; let catalog = tools.root().object_get("tools")?; count = 0; let mut advertised = false;
+    while count < catalog.array_len()? { let tool = catalog.array_get(count)?; if cli_json_string(tool, "name")?.as_str() == "ask_user" { advertised = tool.object_get("parameters")?.object_get("properties")?.object_has("options"); }; count = count + 1; };
+    question_expect(advertised, "All providers receive the optional choice schema")?;
+    let terminal = terminal_open()?; let pending: Vec<TerminalEvent> = vec_new();
+    let mut noninteractive = policy_default(); noninteractive.interactive = false;
+    let refused = agent_execute_tool(".", "", "ask_user", &plain, &noninteractive, false, &terminal, &pending)?;
+    question_expect(refused.root().object_get("is_error")?.bool_value()? and refused.root().object_get("permission_required")?.bool_value()?, "Noninteractive execution refuses clarification without consuming stdin")?;
+    cli_ok(0)
+}
+
+def main() -> i64 {
+    let result = question_contract_tests();
+    if not result.is_ok() { println(result.error); return 1; };
+    println("question choices, schema validation, custom answers and fresh cancellation acceptance passed");
+    result.value
+}

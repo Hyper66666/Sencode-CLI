@@ -1,0 +1,23 @@
+import hook_store;
+import hook_client;
+import command_line;
+import output;
+import hook_management;
+
+// Private fixture driver. Production admission/permissions live in hook_host.
+def hook_probe_main()->Result<i64,i64>{
+    let command=cli_argument(0)?;let database=cli_argument(1)?;let state=cli_state_open(database.as_str())?;
+    if command.as_str()=="manage"{let action=cli_argument(2)?;let target=cli_argument(3)?;let review=cli_argument(4)?;let terminal=terminal_open()?;let input:Vec<TerminalEvent> = vec_new();let result=hook_management(&state,action.as_str(),target.as_str(),review.as_str()=="yes",&terminal,&input)?;output_document(&result)?;return cli_ok(if result.root().object_has("permission_required"){2}else{0});};
+    let store=hook_store_open(&state)?;
+    if command.as_str()=="list"{output_document(&hook_store_list(&store)?)?;return cli_ok(0);};
+    let path=cli_argument(2)?;
+    if command.as_str()=="add"{let manifest=hook_manifest_load(path.as_str())?;hook_store_add(&store,&manifest)?;output_document(&hook_store_list(&store)?)?;return cli_ok(0);};
+    if command.as_str()=="enable"{let manifest=hook_store_manifest(&store,path.as_str(),false)?;hook_store_enable(&store,&manifest)?;return cli_ok(0);};
+    if command.as_str()=="disable" or command.as_str()=="remove"{hook_store_disable(&store,path.as_str(),command.as_str()=="remove")?;return cli_ok(0);};
+    if command.as_str()=="transport"{
+        let manifest=hook_store_manifest(&store,path.as_str(),true)?;let cwd=cli_argument(3)?;let event_path=cli_argument(4)?;let event=json_parse(workspace_read(event_path.as_str(),262144)?.as_str())?;let id=cli_json_string(event.root(),"id")?;
+        let builder=process_command(manifest.executable.as_str())?;builder.cwd(cwd.as_str())?;builder.env_clear()?;
+        let terminal=terminal_open()?;let input:Vec<TerminalEvent> = vec_new();let result=hook_worker_run(&builder,&manifest,id.as_str(),&event,&terminal,&input)?;output_document(&result)?;return cli_ok(0);
+    };cli_fail(2)
+}
+def main()->i64{let result=hook_probe_main();if result.is_ok(){result.value}else{let message=cli_text("hook probe error ");message.push_i64(result.error);cli_diagnostic(message.as_str());let detail=sqlite_error_message();if detail.is_ok(){cli_diagnostic(detail.value.as_str());};1}}

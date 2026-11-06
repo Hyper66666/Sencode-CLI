@@ -1,0 +1,69 @@
+import workspace;
+
+def skill_valid_name(name: &str) -> bool {
+    if name.len() < 1 or name.len() > 64 { return false; };
+    let owned = cli_text(name);
+    let bytes = owned.bytes();
+    loop {
+        let byte = bytes.next();
+        if not byte.is_some { break; };
+        let value = byte.value;
+        if not (value >= 48 and value <= 57 or value >= 65 and value <= 90 or value >= 97 and value <= 122 or value == 45 or value == 95) { return false; };
+    };
+    true
+}
+
+def skills_add_root(document: &JsonDoc, directory: &str) -> Result<bool, i64> {
+    if not dir_exists(directory) { return Result { is_ok: true, value: true, error: 0 }; };
+    let output = document.root().object_get("skills")?;
+    let count = dir_entry_count(directory)?;
+    let mut index = 0;
+    while index < count and index < 256 {
+        let name = dir_entry_name_string(directory, index)?;
+        index = index + 1;
+        if not skill_valid_name(name.as_str()) { continue; };
+        let skill = path_join_string(path_join_string(directory, name.as_str())?.as_str(), "SKILL.md")?;
+        if not file_exists(skill.as_str()) { continue; };
+        let mut duplicate = false;
+        let mut existing = 0;
+        while existing < output.array_len()? { let previous = output.array_get(existing)?; if cli_json_string(previous, "name")?.as_str() == name.as_str() { duplicate = true; }; existing = existing + 1; };
+        if duplicate { continue; };
+        let item = document.new_object()?;
+        cli_put_string(document, item, "name", name.as_str())?;
+        cli_put_string(document, item, "path", skill.as_str())?;
+        output.array_push(item)?;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def skills_discover(cwd: &str, home: &str) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    document.root().object_set("skills", document.new_array()?)?;
+    let mut current = cli_text(cwd);
+    let mut depth = 0;
+    loop {
+        let local = path_join_string(current.as_str(), ".sencode/skills")?;
+        skills_add_root(&document, local.as_str())?;
+        let agents = path_join_string(current.as_str(), ".agents/skills")?;
+        skills_add_root(&document, agents.as_str())?;
+        if dir_exists(path_join_string(current.as_str(), ".git")?.as_str()) or file_exists(path_join_string(current.as_str(), ".git")?.as_str()) { break; };
+        let parent = path_parent_string(current.as_str())?;
+        if parent.as_str() == current.as_str() or depth >= 32 { break; };
+        current = parent;
+        depth = depth + 1;
+    };
+    if home.len() > 0 { skills_add_root(&document, path_join_string(home, ".sencode/skills")?.as_str())?; (); };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def skills_load(catalog: &JsonDoc, name: &str) -> Result<String, i64> {
+    if not skill_valid_name(name) { return string_result_err(2); };
+    let skills = catalog.root().object_get("skills")?;
+    let mut index = 0;
+    while index < skills.array_len()? {
+        let item = skills.array_get(index)?;
+        if cli_json_string(item, "name")?.as_str() == name { let path = cli_json_string(item, "path")?; return workspace_read(path.as_str(), 65536); };
+        index = index + 1;
+    };
+    string_result_err(5)
+}

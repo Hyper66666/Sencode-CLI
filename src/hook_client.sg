@@ -1,0 +1,70 @@
+import hook_contract;
+import terminal;
+import std::process;
+import std::time;
+
+struct HookTransport{child:ProcessHandle,pending:Buffer,stdout:Buffer,stderr:Buffer,output_bytes:i64,error_bytes:i64}
+
+def hook_transport_drain(transport:&mut HookTransport)->Result<bool,i64>{
+    let errors=transport.child.read_stderr(&mut transport.stderr)?;transport.error_bytes=transport.error_bytes+errors;
+    let count=transport.child.read_stdout(&mut transport.stdout)?;transport.output_bytes=transport.output_bytes+count;
+    if transport.error_bytes>65536 or transport.output_bytes>1048576 or transport.pending.used_len()+count>524288{return Result{is_ok:false,value:false,error:13};};
+    if count>0{transport.pending.append_copy(&transport.stdout,0,count)?; ();};hook_true()
+}
+def hook_transport_tick(transport:&mut HookTransport,started:i64,timeout:i64,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<bool,i64>{
+    if ui_poll_busy(terminal,input)?{return Result{is_ok:false,value:false,error:19};};
+    if time_since_ms(started)>=timeout{return Result{is_ok:false,value:false,error:9};};hook_transport_drain(transport)
+}
+def hook_transport_write(transport:&mut HookTransport,document:&JsonDoc,started:i64,timeout:i64,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<bool,i64>{
+    let encoded=document.serialize_string()?;if encoded.len()>262144{return Result{is_ok:false,value:false,error:13};};encoded.push_str("\n")?;let bytes=ffi_buffer_from_bytes(encoded.as_str())?;let mut offset=0;
+    while offset<bytes.used_len(){hook_transport_tick(transport,started,timeout,terminal,input)?;let part=ffi_buffer_new(bytes.used_len()-offset)?;part.append_copy(&bytes,offset,bytes.used_len()-offset)?;let count=transport.child.try_write_stdin(&part,part.used_len())?;offset=offset+count;if count==0{time_sleep_ms(1); ();};};hook_true()
+}
+def hook_transport_receive(transport:&mut HookTransport,manifest:&HookManifest,id:&str,started:i64,timeout:i64,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<JsonDoc,i64>{
+    let mut unsupported=0;
+    loop{
+        hook_transport_tick(transport,started,timeout,terminal,input)?;let frame=hook_frame_take(&transport.pending)?;
+        if frame.root().object_has("type"){
+            if cli_json_string(frame.root(),"type")?.as_str()!="host_call"{return Result{is_ok:true,value:frame,error:0};};
+            hook_keys(&frame,"|schema|protocol|type|id|worker_id|manifest_sha256|")?;
+            hook_frame_identity(&frame,"host_call",id,manifest.id.as_str(),manifest.digest.as_str())?;unsupported=unsupported+1;if unsupported>4{return hook_error(13);};
+            let response=hook_frame("unsupported",id,manifest.id.as_str(),manifest.digest.as_str())?;cli_put_string(&response,response.root(),"feature","host_call")?;hook_transport_write(transport,&response,started,timeout,terminal,input)?; ();
+        };
+        if transport.child.try_wait()? and transport.child.stdout_eof()?{return hook_error(10);};time_sleep_ms(1);
+    };hook_error(10)
+}
+def hook_transport_protocol(transport:&mut HookTransport,manifest:&HookManifest,id:&str,event:&JsonDoc,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<JsonDoc,i64>{
+    let started=time_unix_ms();let initialize=hook_frame("initialize",id,manifest.id.as_str(),manifest.digest.as_str())?;
+    hook_transport_write(transport,&initialize,started,manifest.timeout_ms,terminal,input)?;
+    let ready=hook_transport_receive(transport,manifest,id,started,if manifest.timeout_ms<2000{manifest.timeout_ms}else{2000},terminal,input)?;
+    hook_keys(&ready,"|schema|protocol|type|id|worker_id|manifest_sha256|")?;hook_frame_identity(&ready,"ready",id,manifest.id.as_str(),manifest.digest.as_str())?;
+    hook_transport_write(transport,event,started,manifest.timeout_ms,terminal,input)?;
+    let result=hook_transport_receive(transport,manifest,id,started,manifest.timeout_ms,terminal,input)?;
+    let phase=cli_json_string(event.root(),"event")?;hook_frame_result(&result,id,manifest.id.as_str(),manifest.digest.as_str(),phase.as_str())?;
+    transport.child.close_stdin()?;let ending=time_unix_ms();
+    loop{
+        hook_transport_tick(transport,started,manifest.timeout_ms,terminal,input)?;
+        if transport.pending.used_len()>0{return hook_error(10);};
+        if transport.child.try_wait()? and transport.child.stdout_eof()? and transport.child.stderr_eof()?{
+            if transport.child.exit_code()?!=0 or not transport.child.tree_quiescent()?{return hook_error(10);};
+            return Result{is_ok:true,value:result,error:0};
+        };
+        if time_since_ms(ending)>500{return hook_error(9);};time_sleep_ms(1);
+    };hook_error(10)
+}
+def hook_transport_cleanup(child:&ProcessHandle)->bool{
+    child.close_stdin();let quiet=child.tree_quiescent();
+    if not quiet.is_ok() or not quiet.value{let stopped=child.terminate_tree();if not stopped.is_ok(){return false;};};
+    let reaped=child.reap(3000);if not reaped.is_ok(){return false;};let final=child.tree_quiescent();final.is_ok() and final.value
+}
+// Only the pinned-image, fresh-approved host path may supply this builder.
+// The public model tool catalog never exposes this transport function.
+def hook_worker_run(builder:&ProcessCommand,manifest:&HookManifest,id:&str,event:&JsonDoc,terminal:&Terminal,input:&Vec<TerminalEvent>)->Result<JsonDoc,i64>{
+    let child=builder.spawn_piped()?;
+    let mut transport=HookTransport{child:child,pending:cli_bytes(524288),stdout:cli_bytes(8192),stderr:cli_bytes(8192),output_bytes:0,error_bytes:0};
+    let performed=hook_transport_protocol(&mut transport,manifest,id,event,terminal,input);
+    let clean=hook_transport_cleanup(&transport.child);if not clean{transport.child.handle=0;};let document=json_doc_object()?;
+    cli_put_string(&document,document.root(),"status",if performed.is_ok() and clean{if cli_json_string(performed.value.root(),"decision")?.as_str()=="block"{"blocked"}else{"continued"}}else{if not performed.is_ok() and performed.error==19{"cancelled"}else{"failed"}})?;
+    cli_put_bool(&document,document.root(),"cleanup_confirmed",clean)?;cli_put_i64(&document,document.root(),"error",if performed.is_ok(){if clean{0}else{9}}else{performed.error})?;
+    if performed.is_ok(){cli_put_string(&document,document.root(),"reason",cli_json_string(performed.value.root(),"reason")?.as_str())?;cli_put_string(&document,document.root(),"notice",cli_json_string(performed.value.root(),"notice")?.as_str())?; ();};
+    Result{is_ok:true,value:document,error:0}
+}

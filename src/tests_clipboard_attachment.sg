@@ -1,0 +1,17 @@
+import clipboard_attachment;
+
+def attachment_tests() -> Result<i64, i64> {
+    let invalid_capacity = clipboard_attachment("D:/fixture", -1);
+    if invalid_capacity.is_ok() or invalid_capacity.error != 2 { return cli_fail(99); };
+    let output = attachment_parse_paths("D:/fixture 中文", "ordinary text")?;
+    if output.root().object_get("matched")?.bool_value()? or cli_json_string(output.root(), "text")?.as_str() != "ordinary text" { return cli_fail(99); };
+    let quoted = attachment_parse_paths("D:/fixture", "\"C:/missing image.png\"")?;
+    if quoted.root().object_get("matched")?.bool_value()? { return cli_fail(99); };
+    let partial = attachment_parse_paths("D:/fixture", "\"unterminated.png")?;
+    if partial.root().object_get("matched")?.bool_value()? { return cli_fail(99); };
+    let invalid = cli_text("C:/bad\x00.png");
+    if attachment_image_path("D:/fixture", &invalid).is_ok() { return cli_fail(99); };
+    println("clipboard original-path recognition and text fallback passed"); cli_ok(0)
+}
+
+def main() -> i64 { let result = attachment_tests(); if not result.is_ok() { println(result.error); return 1; }; result.value }

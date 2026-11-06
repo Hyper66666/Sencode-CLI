@@ -1,0 +1,5 @@
+- [x] Implement effective policy and target-source allowlisted config report.
+- [x] Reuse doctor builder in command-line and fullscreen entry points.
+- [x] Display bounded project instructions and disclose missing learned memory.
+- [x] Verify synthetic DB config secret omitted, sources/policy and reopen unchanged.
+- [ ] Run production fullscreen command views and candidate strict validation.

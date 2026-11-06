@@ -1,0 +1,254 @@
+import tool_schedule;
+import executor;
+
+// Included by controller.sg: AgentOptions and controller lifecycle helpers are
+// supplied by the same module graph. No second Agent state or SQLite owner.
+struct ControllerBatchJob {
+    ordinal: i64,
+    lease: i64,
+    id: String,
+    name: String,
+    git: ExecutorGitJob,
+}
+
+struct ControllerReadBatch {
+    schedule: ToolSchedule,
+    jobs: Vec<ControllerBatchJob>,
+    results: Vec<String>,
+    first: i64,
+    published: i64,
+}
+
+def controller_batch_error(code: i64) -> Result<bool, i64> { Result { is_ok: false, value: false, error: code } }
+
+def controller_batch_read_eligible(state: &CliState, options: &AgentOptions, call: JsonValue) -> bool {
+    let path = hook_store_path(state);
+    // Even disabled or malformed hook configuration takes the established
+    // serial path, preserving trust review and before/after hook semantics.
+    if not path.is_ok() or file_exists(path.value.as_str()) { return false; };
+    let name = cli_json_string(call, "name");
+    let encoded = cli_json_string(call, "arguments");
+    if not name.is_ok() or not encoded.is_ok() { return false; };
+    let parsed = json_parse(encoded.value.as_str());
+    if not parsed.is_ok() { return false; };
+    tool_spec_decision(&options.policy, name.value.as_str(), false) == 0 and tool_schedule_safe_read(name.value.as_str(), &parsed.value, false)
+}
+
+// The parallel specialization is restricted to built-in Git reads with no
+// hook configuration. Every durable and visible admission step mirrors the
+// controller_tool contract. Other tools always reuse controller_tool itself.
+def controller_batch_prepare_read(state: &CliState, execution: &CliExecution, options: &AgentOptions, call: JsonValue, terminal: &Terminal) -> Result<bool, i64> {
+    if ui_poll_busy(terminal, &options.input)? { return controller_batch_error(19); };
+    state_exec_valid(state, execution)?;
+    let id = cli_json_string(call, "id")?;
+    let name = cli_json_string(call, "name")?;
+    let encoded = cli_json_string(call, "arguments")?;
+    let prior = controller_tool_prior(state, execution, id.as_str())?;
+    if prior == 1 {
+        let saved = cli_state_tool_result(state, options.session.as_str(), id.as_str())?;
+        let recorded = json_parse(saved.as_str())?;
+        if recorded.root().object_has("host_error") and recorded.root().object_get("host_error")?.bool_value()? or recorded.root().object_has("outcome_unknown") and recorded.root().object_get("outcome_unknown")?.bool_value()? { return controller_batch_error(12); };
+        return Result { is_ok: true, value: false, error: 0 };
+    };
+    if prior != 0 { return controller_batch_error(12); };
+    if not controller_batch_read_eligible(state, options, call) or (name.as_str() != "git_status" and name.as_str() != "git_diff") { return controller_batch_error(7); };
+    let args = json_parse(encoded.as_str())?;
+    if not cli_state_tool_claim(state, execution, id.as_str(), name.as_str(), encoded.as_str())? { return controller_batch_error(12); };
+    let started = json_doc_object()?;
+    cli_put_string(&started, started.root(), "name", name.as_str())?;
+    cli_put_string(&started, started.root(), "status", "running")?;
+    started.root().object_set("arguments", started.copy(args.root())?)?;
+    controller_event(options, execution, id.as_str(), "tool", options.connection.as_str(), options.model.as_str(), started.serialize_string()?.as_str())?;
+    if terminal.is_tty() and options.format.as_str() == "text" { ui_section(terminal, "Tool", name.as_str())?; (); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def controller_batch_finish_read(state: &CliState, execution: &CliExecution, options: &AgentOptions, id: &str, name: &str, outcome: &Result<JsonDoc, i64>, terminal: &Terminal) -> Result<String, i64> {
+    let result = if outcome.is_ok() { json_parse(outcome.value.serialize_string()?.as_str())? } else { executor_tool_failure(name, outcome.error, false)? };
+    let text = result.serialize_string()?;
+    cli_state_tool_complete(state, execution, id, text.as_str())?;
+    let failed = result.root().object_has("is_error") and result.root().object_get("is_error")?.bool_value()?;
+    let completed = json_doc_object()?;
+    cli_put_string(&completed, completed.root(), "name", name)?;
+    cli_put_string(&completed, completed.root(), "status", if failed { "failed" } else { "completed" })?;
+    completed.root().object_set("result", completed.copy(result.root())?)?;
+    controller_event(options, execution, id, "tool", options.connection.as_str(), options.model.as_str(), completed.serialize_string()?.as_str())?;
+    if terminal.is_tty() and options.format.as_str() == "text" { ui_section(terminal, if failed { "Tool failed" } else { "Tool finished" }, name)?; (); };
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def controller_batch_stop_local(job: &mut ControllerBatchJob, scheduler: &Scheduler, task_id: i64) {
+    executor_git_job_cancel(&mut job.git);
+    loop {
+        if executor_git_job_poll(&mut job.git) { break; };
+        time_sleep_ms(1);
+    };
+    scheduler_end_tool(scheduler, task_id, job.lease, true);
+    ();
+}
+
+// A step may fail at any persistence/event/UI boundary; its caller still owns
+// the complete live-job vector and must drain it before propagating failure.
+def controller_batch_step(state: &CliState, execution: &CliExecution, options: &AgentOptions, history: &JsonDoc, calls: JsonValue, batch: &mut ControllerReadBatch, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<bool, i64> {
+    if ui_poll_busy(terminal, &options.input)? or scheduler_is_cancelled(scheduler, task_id) { return controller_batch_error(19); };
+    state_exec_valid(state, execution)?;
+    let mut admitted = 0;
+    while admitted < 4 {
+        let ordinal = tool_schedule_next(&batch.schedule)?;
+        if ordinal < 0 { break; };
+        let call = calls.array_get(batch.first + ordinal)?;
+        let id = cli_json_string(call, "id")?;
+        let name = cli_json_string(call, "name")?;
+        if name.as_str() == "git_status" or name.as_str() == "git_diff" {
+            let prepared = controller_batch_prepare_read(state, execution, options, call, terminal)?;
+            if not prepared {
+                let saved = cli_state_tool_result(state, options.session.as_str(), id.as_str())?;
+                batch.results.set(ordinal, saved);
+                tool_schedule_complete(&batch.schedule, ordinal, true, true)?;
+                ();
+            } else {
+                let lease = scheduler_begin_tool(scheduler, task_id)?;
+                let started = executor_git_job_start(options.cwd.as_str(), name.as_str() == "git_diff");
+                if not started.is_ok() {
+                    scheduler_end_tool(scheduler, task_id, lease, true)?;
+                    tool_schedule_complete(&batch.schedule, ordinal, false, true)?;
+                    let failed: Result<JsonDoc, i64> = Result { is_ok: false, value: JsonDoc { handle: 0 }, error: started.error };
+                    let text = controller_batch_finish_read(state, execution, options, id.as_str(), name.as_str(), &failed, terminal)?;
+                    batch.results.set(ordinal, text);
+                    if not executor_read_error_recoverable(name.as_str(), started.error) { return controller_batch_error(started.error); };
+                    admitted = admitted + 1;
+                    continue;
+                };
+                let mut job = ControllerBatchJob { ordinal: ordinal, lease: lease, id: id, name: name, git: started.value };
+                // A failed ownership transfer retains the scheduler lease;
+                // it cannot be mistaken for certified process cleanup.
+                if batch.jobs.len() >= 4 { controller_batch_stop_local(&mut job, scheduler, task_id); return controller_batch_error(13); };
+                if not batch.jobs.push(job) { return controller_batch_error(8); };
+                ();
+            };
+        } else {
+            let result = controller_tool(state, execution, options, call, scheduler, task_id, goal, terminal, &options.input, children, child_states);
+            tool_schedule_complete(&batch.schedule, ordinal, result.is_ok(), true)?;
+            if not result.is_ok() { return controller_batch_error(result.error); };
+            batch.results.set(ordinal, result.value);
+            ();
+        };
+        admitted = admitted + 1;
+    };
+    let mut remaining = batch.jobs.len();
+    while remaining > 0 {
+        let removed = batch.jobs.remove(0);
+        if not removed.is_some { return controller_batch_error(3); };
+        let mut job = removed.value;
+        let quiet = executor_git_job_poll(&mut job.git);
+        if quiet {
+            scheduler_end_tool(scheduler, task_id, job.lease, true)?;
+            let outcome = executor_git_job_result(&job.git);
+            tool_schedule_complete(&batch.schedule, job.ordinal, outcome.is_ok(), true)?;
+            let text = controller_batch_finish_read(state, execution, options, job.id.as_str(), job.name.as_str(), &outcome, terminal)?;
+            batch.results.set(job.ordinal, text);
+            if not outcome.is_ok() and not executor_read_error_recoverable(job.name.as_str(), outcome.error) { return controller_batch_error(outcome.error); };
+            ();
+        } else { if not batch.jobs.push(job) { return controller_batch_error(8); }; };
+        remaining = remaining - 1;
+    };
+    // Child streams advance without acquiring a foreground model slot. Tools
+    // are handled by the normal controller pump after this read block settles.
+    children_poll(children, scheduler, goal)?;
+    while batch.published < batch.schedule.calls.len() and tool_schedule_state(&batch.schedule, batch.published) >= 3 {
+        let call = calls.array_get(batch.first + batch.published)?;
+        let text = batch.results.get(batch.published)?;
+        controller_append_message(state, execution, history, "tool", text.as_str(), cli_json_string(call, "id")?.as_str())?;
+        batch.published = batch.published + 1;
+    };
+    Result { is_ok: true, value: tool_schedule_quiescent(&batch.schedule), error: 0 }
+}
+
+def controller_batch_drain(state: &CliState, execution: &CliExecution, options: &AgentOptions, batch: &mut ControllerReadBatch, scheduler: &Scheduler, task_id: i64, terminal: &Terminal) {
+    tool_schedule_cancel(&batch.schedule);
+    let mut index = batch.jobs.len();
+    while index > 0 {
+        let removed = batch.jobs.remove(0);
+        if not removed.is_some { return; };
+        let mut job = removed.value;
+        executor_git_job_cancel(&mut job.git);
+        if not batch.jobs.push(job) { return; };
+        index = index - 1;
+    };
+    while batch.jobs.len() > 0 {
+        let removed = batch.jobs.remove(0);
+        if not removed.is_some { return; };
+        let mut job = removed.value;
+        let quiet = executor_git_job_poll(&mut job.git);
+        if quiet {
+            scheduler_end_tool(scheduler, task_id, job.lease, true);
+            tool_schedule_complete(&batch.schedule, job.ordinal, false, true);
+            let outcome = executor_git_job_result(&job.git);
+            controller_batch_finish_read(state, execution, options, job.id.as_str(), job.name.as_str(), &outcome, terminal);
+            ();
+        } else {
+            if not batch.jobs.push(job) { return; };
+            time_sleep_ms(1);
+            ();
+        };
+    };
+    ();
+}
+
+def controller_execute_batch(state: &CliState, execution: &CliExecution, options: &AgentOptions, history: &JsonDoc, calls: JsonValue, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<bool, i64> {
+    let count = calls.array_len()?;
+    if count > 128 { controller_interrupted_tools(state, execution, history, calls, 0)?; return controller_batch_error(13); };
+    // Reject the entire duplicate batch before hooks, permissions or claims.
+    let ids: Vec<String> = vec_new();
+    let mut index = 0;
+    while index < count {
+        let id = cli_json_string(calls.array_get(index)?, "id")?;
+        let mut prior = 0;
+        while prior < ids.len() {
+            let existing = ids.get(prior)?;
+            if existing.as_str() == id.as_str() { controller_interrupted_tools(state, execution, history, calls, 0)?; return controller_batch_error(2); };
+            prior = prior + 1;
+        };
+        if id.len() == 0 or id.len() > 256 { return controller_batch_error(2); };
+        if not ids.push(id) { return controller_batch_error(8); };
+        index = index + 1;
+    };
+    index = 0;
+    while index < count {
+        let call = calls.array_get(index)?;
+        if not controller_batch_read_eligible(state, options, call) {
+            let result = controller_tool(state, execution, options, call, scheduler, task_id, goal, terminal, &options.input, children, child_states);
+            if not result.is_ok() { controller_interrupted_tools(state, execution, history, calls, index)?; return controller_batch_error(result.error); };
+            controller_append_message(state, execution, history, "tool", result.value.as_str(), cli_json_string(call, "id")?.as_str())?;
+            index = index + 1;
+        } else {
+            let schedule = tool_schedule_new(4)?;
+            let results: Vec<String> = vec_new();
+            let jobs: Vec<ControllerBatchJob> = vec_new();
+            let mut end = index;
+            while end < count and controller_batch_read_eligible(state, options, calls.array_get(end)?) {
+                let item = calls.array_get(end)?;
+                let args = json_parse(cli_json_string(item, "arguments")?.as_str())?;
+                tool_schedule_add(&schedule, cli_json_string(item, "id")?.as_str(), cli_json_string(item, "name")?.as_str(), &args, false, -1)?;
+                if not results.push(string_new()) { return controller_batch_error(8); };
+                end = end + 1;
+            };
+            tool_schedule_seal(&schedule);
+            let mut batch = ControllerReadBatch { schedule: schedule, jobs: jobs, results: results, first: index, published: 0 };
+            loop {
+                let step = controller_batch_step(state, execution, options, history, calls, &mut batch, scheduler, task_id, goal, terminal, children, child_states);
+                if not step.is_ok() {
+                    controller_batch_drain(state, execution, options, &mut batch, scheduler, task_id, terminal);
+                    controller_interrupted_tools(state, execution, history, calls, index + batch.published)?;
+                    return controller_batch_error(step.error);
+                };
+                if step.value { break; };
+                time_sleep_ms(1);
+            };
+            index = end;
+        };
+        if goal.status == 2 { controller_interrupted_tools(state, execution, history, calls, index)?; return controller_batch_error(12); };
+        if goal.status != 1 { controller_interrupted_tools(state, execution, history, calls, index)?; return Result { is_ok: true, value: false, error: 0 }; };
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}

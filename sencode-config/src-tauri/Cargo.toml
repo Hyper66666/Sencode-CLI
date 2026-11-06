@@ -1,0 +1,22 @@
+[package]
+name = "sencode-config"
+version = "0.1.0"
+description = "Sencode CLI configuration switcher"
+edition = "2021"
+default-run = "sencode-config"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+specta-typescript = "=0.0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

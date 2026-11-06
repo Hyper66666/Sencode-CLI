@@ -1,0 +1,148 @@
+import consult;
+import std::args;
+
+def expect_consult(value: bool, message: &str) -> i64 {
+    if value { return 0; };
+    cli_diagnostic(message);
+    1
+}
+
+def fixture_target(base: &str, id: &str, model: &str, protocol: i64) -> ConsultTarget {
+    let key = cli_text("fixture-key-");
+    key.push_str(id);
+    ConsultTarget { connection: ProviderConnection { id: cli_text(id), base: cli_text(base), model: cli_text(model), effort: string_new(), protocol: protocol, images: false }, credential: key }
+}
+
+def await_consult(batch: &ConsultBatch, goal: &mut GoalState) -> Result<JsonDoc, i64> {
+    let started = time_unix_ms();
+    while not consult_done(batch) {
+        consult_poll(batch, goal)?;
+        if time_since_ms(started) > 15000 { consult_cancel(batch, goal)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 11 }; };
+        time_sleep_ms(1);
+    };
+    consult_result(batch)
+}
+
+def verify_consult(base: &str) -> Result<i64, i64> {
+    println("consult: create targets");
+    let mut failures = 0;
+    let targets: Vec<ConsultTarget> = vec_new();
+    targets.push(fixture_target(base, "a", "chat-one", 0));
+    targets.push(fixture_target(base, "a", "chat-two", 0));
+    targets.push(fixture_target(base, "a", "chat-three", 0));
+    targets.push(fixture_target(base, "b", "responses-one", 1));
+    targets.push(fixture_target(base, "c", "messages-one", 2));
+    let batch = consult_batch(".", "Independent assessment of fixture evidence", targets)?;
+    println("consult: initial five streams");
+    let mut goal = goal_new(50, 0);
+    let result = await_consult(&batch, &mut goal)?;
+    let reports = result.root().object_get("reports")?;
+    failures = failures + expect_consult(reports.array_len()? == 5 and goal.requests == 5 and goal.tokens == 125, "Every consultant uses the same Goal budget");
+    let mut index = 0;
+    while index < reports.array_len()? {
+        let report = reports.array_get(index)?;
+        failures = failures + expect_consult(cli_json_optional_i64(report, "error", -1) == 0 and cli_json_string(report, "content")?.as_str() == "世界😀", "Three protocol reports retain Unicode content");
+        failures = failures + expect_consult(cli_json_string(report, "connection_id")?.len() > 0 and cli_json_string(report, "model")?.len() > 0, "Reports retain captured model/connection attribution");
+        index = index + 1;
+    };
+    let serialized = result.serialize_string()?;
+    failures = failures + expect_consult(not str_contains(serialized.as_str(), "fixture-key-"), "Credentials never enter reports");
+
+    // Busy waits must append new input only. Already queued paste and Enter
+    // stay with the next composer, never a nested operation or approval.
+    let terminal = terminal_open()?;
+    let pending: Vec<TerminalEvent> = vec_new();
+    pending.push(TerminalEvent { kind: 2, code: 0, modifiers: 0, width: 80, height: 24, data: cli_text("yes\n中文😀") });
+    pending.push(TerminalEvent { kind: 1, code: 13, modifiers: 0, width: 80, height: 24, data: cli_text("\r") });
+    let typed_targets: Vec<ConsultTarget> = vec_new();
+    typed_targets.push(fixture_target(base, "a", "queued-input", 0));
+    let typed_batch = consult_batch(".", "Keep typing for the next prompt", typed_targets)?;
+    let mut typed_goal = goal_new(50, 0);
+    let typed_result = consult_await(&typed_batch, &mut typed_goal, &terminal, &pending)?;
+    failures = failures + expect_consult(typed_result.root().object_get("reports")?.array_len()? == 1 and typed_goal.requests == 1, "Pending-aware consultation completes with the shared budget");
+    failures = failures + expect_consult(pending.len() == 2 and pending.get(0).data.as_str() == "yes\n中文😀" and pending.get(1).code == 13, "Consultation preserves queued Unicode paste and Enter for the next prompt");
+
+    let partial: Vec<ConsultTarget> = vec_new();
+    println("consult: partial failure");
+    partial.push(fixture_target(base, "a", "failure", 0));
+    partial.push(fixture_target(base, "b", "responses-two", 1));
+    let partly = consult_batch(".", "A failed consultant must not discard successful peers", partial)?;
+    let mut partial_goal = goal_new(50, 0);
+    let partial_result = await_consult(&partly, &mut partial_goal)?;
+    let partial_reports = partial_result.root().object_get("reports")?;
+    let mut successes = 0;
+    let mut failures_500 = 0;
+    index = 0;
+    while index < partial_reports.array_len()? {
+        let code = cli_json_optional_i64(partial_reports.array_get(index)?, "error", -1);
+        if code == 0 { successes = successes + 1; };
+        if code == 500 { failures_500 = failures_500 + 1; };
+        index = index + 1;
+    };
+    failures = failures + expect_consult(successes == 1 and failures_500 == 1, "Failure is isolated and attributed per consultant");
+
+    let tools: Vec<ConsultTarget> = vec_new();
+    println("consult: read-only tools");
+    tools.push(fixture_target(base, "a", "tools", 0));
+    let readonly = consult_batch(".", "No tool may execute", tools)?;
+    let mut tools_goal = goal_new(50, 0);
+    let tools_result = await_consult(&readonly, &mut tools_goal)?;
+    failures = failures + expect_consult(cli_json_optional_i64(tools_result.root().object_get("reports")?.array_get(0)?, "error", 0) == 7, "A provider tool request is rejected in read-only consultation");
+
+    let slow: Vec<ConsultTarget> = vec_new();
+    println("consult: cancellation");
+    slow.push(fixture_target(base, "a", "slow-one", 0));
+    slow.push(fixture_target(base, "b", "slow-two", 1));
+    let canceled = consult_batch(".", "Cancel both real native streams", slow)?;
+    let mut cancel_goal = goal_new(50, 0);
+    consult_poll(&canceled, &mut cancel_goal)?;
+    time_sleep_ms(100);
+    consult_poll(&canceled, &mut cancel_goal)?;
+    consult_cancel(&canceled, &mut cancel_goal)?;
+    let cancel_result = consult_result(&canceled)?;
+    let canceled_reports = cancel_result.root().object_get("reports")?;
+    failures = failures + expect_consult(cancel_result.root().object_get("cancelled")?.bool_value()? and canceled_reports.array_len()? == 2, "Cancel returns one attributed result per active stream");
+    index = 0;
+    while index < canceled_reports.array_len()? {
+        failures = failures + expect_consult(cli_json_optional_i64(canceled_reports.array_get(index)?, "error", 0) == 19, "Real canceled streams report STATUS_CANCELED");
+        index = index + 1;
+    };
+
+    let limited: Vec<ConsultTarget> = vec_new();
+    println("consult: request budget");
+    limited.push(fixture_target(base, "a", "budget-one", 0));
+    limited.push(fixture_target(base, "b", "budget-two", 1));
+    limited.push(fixture_target(base, "c", "budget-three", 2));
+    let stopped = consult_batch(".", "Request budget applies before starting children", limited)?;
+    let mut limit_goal = goal_new(1, 0);
+    let stopped_result = await_consult(&stopped, &mut limit_goal)?;
+    failures = failures + expect_consult(limit_goal.status == 3 and limit_goal.requests == 1 and stopped_result.root().object_get("reports")?.array_len()? == 3, "Request budget prevents queued requests and cancels active peers");
+
+    let token_targets: Vec<ConsultTarget> = vec_new();
+    println("consult: token budget");
+    token_targets.push(fixture_target(base, "a", "token-one", 0));
+    token_targets.push(fixture_target(base, "b", "token-two", 1));
+    let token_batch = consult_batch(".", "Token reports stop active peers", token_targets)?;
+    let mut token_goal = goal_new(50, 1);
+    await_consult(&token_batch, &mut token_goal)?;
+    failures = failures + expect_consult(token_goal.status == 3 and token_goal.tokens >= 25, "Provider usage cancels remaining work at token budget");
+    let until = time_unix_ms() + 3000;
+    while sengoo_net_stream_live_workers() != 0 and time_unix_ms() < until { time_sleep_ms(2); };
+    failures = failures + expect_consult(sengoo_net_stream_live_handles() == 0 and sengoo_net_stream_live_workers() == 0, "Consultation cleans all native stream handles and workers");
+    cli_ok(failures)
+}
+
+def consult_entry() -> Result<i64, i64> {
+    let buffer = ffi_buffer_new(32768)?;
+    let length = arg_copy(0, buffer)?;
+    let base = string_from_bytes_raw(buffer.ptr(), length)?;
+    verify_consult(base.as_str())
+}
+
+def main() -> i64 {
+    println("consult: start");
+    let checked = consult_entry();
+    if not checked.is_ok() { println(checked.error); return 1; };
+    if checked.value == 0 { println("parallel consultation acceptance passed"); };
+    checked.value
+}

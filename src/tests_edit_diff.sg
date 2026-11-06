@@ -1,0 +1,25 @@
+import workspace;
+import tui;
+
+def diff_check(ok: bool) -> Result<bool, i64> { if not ok { println("edit diff regression failed"); }; Result { is_ok: ok, value: ok, error: if ok { 0 } else { 99 } } }
+def diff_tests() -> Result<i64, i64> {
+    let diff = edit_diff("src/中文.sg", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n", "one\ntwo\nthree\nfour\n你好😀\nsix\nseven\neight\n")?;
+    diff_check(str_contains(diff.as_str(), "@@ -2,7 +2,7 @@") and str_contains(diff.as_str(), "-five\n+你好😀\n") and not str_contains(diff.as_str(), " one"))?;
+    let rows: Vec<UiLine> = vec_new(); md_edit_render(&rows, diff.as_str(), 70, 10)?;
+    let mut index = 0; let mut removed = false; let mut added = false;
+    while index < rows.len() { let row: &UiLine = rows.get(index);
+        if row.style == 6 { removed = str_contains(row.text.as_str(), "5") and str_contains(row.text.as_str(), "- five"); };
+        if row.style == 5 { added = str_contains(row.text.as_str(), "5") and str_contains(row.text.as_str(), "+ 你好😀"); };
+        diff_check(row.cells <= 70 and row.message_id == 10)?; index = index + 1;
+    }; diff_check(removed and added)?;
+    diff_check(str_contains(edit_diff("new", "", "one\ntwo\n")?.as_str(), "@@ -0,0 +1,2 @@"))?;
+    diff_check(str_contains(edit_diff("delete", "one\n", "")?.as_str(), "@@ -1,1 +0,0 @@"))?;
+    let mut app = tui_new("fixture", "fixture", "fixture", "fixture");
+    tui_set_approval(&mut app, "edit", diff.as_str(), false)?;
+    let approval: Vec<UiLine> = vec_new(); tui_approval_rows(&approval, &app, 20)?;
+    index = 0; removed = false; added = false;
+    while index < approval.len() { if approval.get(index).style == 6 { removed = true; }; if approval.get(index).style == 5 { added = true; }; index = index + 1; };
+    diff_check(removed and added and not app.approval_yes)?;
+    println("edit diff: complete-file offsets, Unicode, context, additions/deletions and approval styles passed"); cli_ok(0)
+}
+def main() -> i64 { let result = diff_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

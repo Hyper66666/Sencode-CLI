@@ -1,0 +1,24 @@
+schema: spec-driven
+
+context: |
+  Product: Sencode CLI is a Sengoo-native terminal coding agent, Windows x64 first.
+  Source: src/ owns agent, provider, tools, permissions, workflows and terminal code.
+  sencode-config/ owns the React/Tauri configuration companion.
+  Generic native system capabilities belong in the adjacent Sengoo repository.
+  Native providers support Chat Completions, Responses and Anthropic Messages.
+  Optional managed official runtimes are capability-gated and independently pinned.
+  State: project .sencode history is portable; desktop sharing uses shared-state contracts,
+  OS execution locks and fencing tokens. Credentials stay in the OS credential store.
+  Preserve ABI, event compatibility, upstream notices and explicit engine limitations.
+  Acceptance distinguishes fixture tests, live provider calls and installation checks.
+
+rules:
+  proposal:
+    - Include Capabilities, Non-Goals and affected ownership boundaries.
+  design:
+    - Define lifecycle, cancellation, replay, bounds and permission behavior.
+  specs:
+    - Use Requirement and Scenario headings with WHEN/THEN assertions.
+    - Cover failure, recovery and unsupported capabilities.
+  tasks:
+    - Give each requirement one owner and record named executable verification.

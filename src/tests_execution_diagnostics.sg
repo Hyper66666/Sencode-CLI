@@ -1,0 +1,39 @@
+import execution_diagnostics;
+
+def diagnostic_tests() -> Result<i64, i64> {
+    let mut failures = 0;
+    let raw: Vec<TerminalEvent> = vec_new();
+    execution_diagnostic_stage(&raw, "tool", "run_command", "raw")?;
+    execution_diagnostic_failure(&raw, "tool_outcome_unknown", "tool", "run_command", "raw", true)?;
+    if raw.len() != 0 { failures = failures + 1; };
+    let input: Vec<TerminalEvent> = vec_new();
+    engine_control_init(&input)?;
+    engine_control_begin(&input, "request")?;
+    execution_diagnostic_stage(&input, "provider", "", "")?;
+    let provider = execution_diagnostic_document(&input, 20)?;
+    if cli_json_string(provider.root(), "reason")?.as_str() != "provider_request" or str_contains(execution_diagnostic_content(&provider)?.as_str(), "UTF-8") or provider.root().object_get("automatic_replay_forbidden")?.bool_value()? { failures = failures + 1; };
+    let cancellation = execution_diagnostic_document(&input, 19)?;
+    if cli_json_string(cancellation.root(), "reason")?.as_str() != "cancelled" { failures = failures + 1; };
+    execution_diagnostic_failure(&input, "provider_request", "provider", "", "", false)?;
+    execution_diagnostic_stage(&input, "cleanup", "run_command", "later")?;
+    let retained = execution_diagnostic_document(&input, 9)?;
+    if cli_json_string(retained.root(), "stage")?.as_str() != "provider" { failures = failures + 1; };
+    execution_diagnostic_failure(&input, "cleanup_unknown", "cleanup", "run_command", "later", true)?;
+    let unknown = execution_diagnostic_document(&input, 9)?;
+    if cli_json_string(unknown.root(), "reason")?.as_str() != "provider_request" or not unknown.root().object_get("automatic_replay_forbidden")?.bool_value()? or not str_contains(execution_diagnostic_content(&unknown)?.as_str(), "automatic replay is forbidden") { failures = failures + 1; };
+    execution_diagnostic_reset(&input);
+    execution_diagnostic_stage(&input, "tool", "run_command", "call")?;
+    let plain = execution_diagnostic_document(&input, 20)?;
+    if cli_json_string(plain.root(), "reason")?.as_str() != "tool_failed" or plain.root().object_has("outcome_unknown") or plain.root().object_get("automatic_replay_forbidden")?.bool_value()? { failures = failures + 1; };
+    engine_control_end(&input);
+    execution_diagnostic_reset(&input);
+    if input.len() != 1 { failures = failures + 1; };
+    cli_ok(failures)
+}
+
+def main() -> i64 {
+    let result = diagnostic_tests();
+    if not result.is_ok() { println(result.error); return 1; };
+    if result.value == 0 { println("execution stage diagnostics regression passed"); };
+    result.value
+}

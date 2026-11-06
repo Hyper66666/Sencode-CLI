@@ -1,0 +1,23 @@
+import engine_control;
+
+def nonce_expect(value:bool)->Result<bool,i64>{Result{is_ok:value,value:value,error:if value{0}else{99}}}
+def nonce_response(id:&str,request:&str)->Result<String,i64>{let document=json_doc_object()?;cli_put_string(&document,document.root(),"type","approval")?;cli_put_string(&document,document.root(),"id",id)?;cli_put_string(&document,document.root(),"request_id",request)?;cli_put_bool(&document,document.root(),"approved",true)?;document.serialize_string()}
+def nonce_test()->Result<bool,i64>{
+    let input:Vec<TerminalEvent> = vec_new();engine_control_init(&input)?;engine_control_begin(&input,"one")?;
+    engine_control_accept(&input,nonce_response("one-approval-1","one")?.as_str())?;nonce_expect(engine_control_slot(&input,96)<0)?;
+    let first=engine_control_interaction_start(&input,"fixture","first approval",false)?;
+    nonce_expect(str_starts_with(first.as_str(),"one-approval-1-") and first.len()>40)?;
+    engine_control_accept(&input,nonce_response("one-approval-1","one")?.as_str())?;nonce_expect(engine_control_slot(&input,96)<0)?;
+    engine_control_accept(&input,nonce_response(first.as_str(),"other")?.as_str())?;nonce_expect(engine_control_slot(&input,96)<0)?;
+    engine_control_accept(&input,nonce_response(first.as_str(),"one")?.as_str())?;
+    nonce_expect(engine_control_interaction_take(&input)?.root().object_get("approved")?.bool_value()?)?;
+    let second=engine_control_interaction_start(&input,"fixture","second approval",false)?;
+    nonce_expect(second.as_str()!=first.as_str())?;engine_control_accept(&input,nonce_response(first.as_str(),"one")?.as_str())?;
+    nonce_expect(engine_control_slot(&input,96)<0)?;engine_control_accept(&input,nonce_response(second.as_str(),"one")?.as_str())?;
+    nonce_expect(engine_control_interaction_take(&input)?.root().object_get("approved")?.bool_value()?)?;
+    engine_control_end(&input);engine_control_begin(&input,"one")?;
+    let restarted=engine_control_interaction_start(&input,"fixture","same request restarted",false)?;
+    nonce_expect(restarted.as_str()!=first.as_str())?;engine_control_accept(&input,nonce_response(first.as_str(),"one")?.as_str())?;
+    nonce_expect(engine_control_slot(&input,96)<0)
+}
+def main()->i64{let result=nonce_test();if not result.is_ok(){println(result.error);return 1;};println("opaque approval nonce/replay fixture passed");0}

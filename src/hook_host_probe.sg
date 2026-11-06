@@ -1,0 +1,36 @@
+import controller;
+import hook_management;
+import command_line;
+
+// Private deterministic host/controller admission fixture; never a public tool.
+def hook_host_probe()->Result<i64,i64>{
+    let database=cli_argument(0)?;let cwd=cli_argument(1)?;let mode=cli_argument(2)?;let call_path=cli_argument(3)?;
+    let state=cli_state_open(database.as_str())?;let session=cli_state_create_session(&state,cwd.as_str())?;
+    let mut execution=cli_state_begin(&state,session.as_str(),"fixture","fixture")?;
+    let input:Vec<TerminalEvent> = vec_new();
+    if mode.as_str()!="headless"{engine_control_init(&input)?;engine_control_begin(&input,"fixture")?; ();};
+    let terminal=terminal_open()?;
+    let options=AgentOptions{cwd:cwd.clone()?,session:session.clone()?,connection:cli_text("fixture"),model:cli_text("fixture"),format:cli_text("stream-json"),policy:AgentPolicy{plan:mode.as_str()=="plan",auto_edit:true,full_access:false,interactive:true,depth:if mode.as_str()=="child"{1}else{0},maximum_depth:1},allow_commands:true,plan_path:string_new(),goal_text:cli_text("fixture"),checks:json_parse("{\"checks\":[]}")?,input:input};
+    let call=json_parse(workspace_read(call_path.as_str(),131072)?.as_str())?;let id=cli_json_string(call.root(),"id")?;
+    if mode.as_str()=="complete" or mode.as_str()=="running"{
+        cli_state_tool_claim(&state,&execution,id.as_str(),cli_json_string(call.root(),"name")?.as_str(),cli_json_string(call.root(),"arguments")?.as_str())?;
+        if mode.as_str()=="complete"{cli_state_tool_complete(&state,&execution,id.as_str(),workspace_result("saved original outcome",false)?.serialize_string()?.as_str())?; ();};
+    };
+    if mode.as_str()=="hook-prior" or mode.as_str()=="hook-done"{
+        let store=hook_store_open(&state)?;let manifest=hook_store_manifest(&store,"guard",true)?;
+        let hook_id=hook_invocation_id(session.as_str(),id.as_str(),manifest.id.as_str(),"before_tool")?;
+        if mode.as_str()=="hook-prior"{cli_state_tool_claim(&state,&execution,hook_id.as_str(),"internal:extension_worker","{}")?; ();}
+        else{hook_store_claim(&store,&state,&execution,hook_id.as_str(),id.as_str(),&manifest,"before_tool")?;hook_store_finish(&store,&state,&execution,hook_id.as_str(),&hook_host_status("continued","old admission",false,true)?)?; ();};
+        ();
+    };
+    let ready=json_doc_object()?;cli_put_string(&ready,ready.root(),"type","fixture-ready")?;cli_put_string(&ready,ready.root(),"session",session.as_str())?;output_document(&ready)?;
+    let scheduler=scheduler_new();let task=scheduler_add(&scheduler,0,"fixture",cwd.as_str(),true)?;let children=children_new();let child_states:Vec<ControllerChild> = vec_new();
+    let mut goal=goal_new(50,0);goal.requests=7;goal.tokens=91;
+    let result=controller_tool(&state,&execution,&options,call.root(),&scheduler,task,&mut goal,&terminal,&options.input,&children,&child_states);
+    let report=json_doc_object()?;cli_put_string(&report,report.root(),"type","fixture-result")?;cli_put_string(&report,report.root(),"session",session.as_str())?;
+    cli_put_bool(&report,report.root(),"is_ok",result.is_ok())?;cli_put_i64(&report,report.root(),"error",result.error)?;
+    cli_put_i64(&report,report.root(),"goal_status",goal.status)?;cli_put_i64(&report,report.root(),"requests",goal.requests)?;cli_put_i64(&report,report.root(),"tokens",goal.tokens)?;
+    if result.is_ok(){report.root().object_set("result",report.copy(json_parse(result.value.as_str())?.root())?)?; ();};
+    cli_state_finish(&state,&mut execution,"idle")?;output_document(&report)?;cli_ok(0)
+}
+def main()->i64{let result=hook_host_probe();if result.is_ok(){result.value}else{cli_diagnostic("hook host probe error");println(result.error);1}}

@@ -1,0 +1,258 @@
+import job_store;
+
+struct JobPeer {
+    stream: IpcStream, input: Buffer, output: Buffer,
+    epoch: String, flags: Vec<i64>,
+}
+struct JobHost {
+    worker: ProcessHandle, input: Buffer, output: Buffer, errors: Buffer,
+    peers: Vec<JobPeer>, active: bool, submitted: bool, terminal: bool,
+    goal: bool, approval: String, stopping_at: i64, reason: String,
+    code: i64, control_ever: bool,
+}
+
+def job_peer_flags() -> Vec<i64> {
+    let flags: Vec<i64> = vec_new(); flags.push(0); flags.push(0); flags.push(0); flags.push(0); flags.push(time_unix_ms()); flags
+}
+
+def job_host_control(host: &JobHost) -> bool {
+    let mut index = 0;
+    while index < host.peers.len() { let peer: &JobPeer = host.peers.get(index); if (peer.flags.get(0).unwrap_or(0) != 0) and (peer.flags.get(1).unwrap_or(0) != 0) and not (peer.flags.get(3).unwrap_or(0) != 0) { return true; }; index = index + 1; };
+    false
+}
+
+def job_host_queue(host: &JobHost, kind: &str, id: &str) -> Result<bool,i64> {
+    let command = json_doc_object()?; cli_put_string(&command,command.root(),"type",kind)?;
+    if id.len() > 0 { cli_put_string(&command,command.root(),"id",id)?; (); };
+    job_frame_append(&host.input,&command)
+}
+
+def job_host_cancel(host: &mut JobHost, reason: &str, request: &str) -> Result<bool,i64> {
+    if host.stopping_at == 0 {
+        host.reason = cli_text(reason); host.stopping_at = time_unix_ms(); host.approval.clear();
+        if host.active { job_host_queue(host,"cancel",request)?; job_host_queue(host,"shutdown","")?; (); };
+    };
+    job_true()
+}
+
+def job_host_drop_peer(host: &mut JobHost, index: i64, request: &str) -> Result<bool,i64> {
+    let peer: &JobPeer = host.peers.get(index);
+    let controller = (peer.flags.get(1).unwrap_or(0) != 0) and (peer.flags.get(0).unwrap_or(0) != 0);
+    let removed = host.peers.remove(index);
+    if controller and (host.goal or host.approval.len() > 0) { job_host_cancel(host,if host.goal {"goal_controller_disconnected"}else{"interaction_controller_disconnected"},request)?; (); };
+    job_true()
+}
+
+def job_host_scope(command: &JsonDoc, job: &JsonDoc) -> Result<bool,i64> {
+    if cli_json_optional_i64(command.root(),"schema",0) != 1 or cli_json_string(command.root(),"job_id")?.as_str() != cli_json_string(job.root(),"job_id")?.as_str() or cli_json_string(command.root(),"generation")?.as_str() != cli_json_string(job.root(),"generation")?.as_str() { return state_bool_error(7); };
+    job_true()
+}
+
+def job_host_spawn(state: &CliState, job: &JsonDoc, image: &str) -> Result<ProcessHandle,i64> {
+    let command = process_command(image)?;
+    command.arg("--engine-stdio")?; command.arg("--database")?; command.arg(state.path.as_str())?;
+    command.arg("--cwd")?; command.arg(cli_json_string(job.root(),"cwd")?.as_str())?;
+    command.arg("resume")?; command.arg(cli_json_string(job.root(),"session_id")?.as_str())?;
+    command.cwd(cli_json_string(job.root(),"cwd")?.as_str())?;
+    // The engine needs its runtime credential access, but tool children keep the
+    // existing explicit environment boundary. No credential is put in argv.
+    command.spawn_piped()
+}
+
+def job_host_command(state: &CliState, store: &JobStore, job: &JsonDoc, host: &mut JobHost, index: i64, command: &JsonDoc, image: &str) -> Result<bool,i64> {
+    job_host_scope(command,job)?;
+    let kind = cli_json_string(command.root(),"type")?;
+    let id = cli_json_string(job.root(),"job_id")?; let generation = cli_json_string(job.root(),"generation")?;
+    let greeted = { let peer: &JobPeer = host.peers.get(index); peer.flags.get(0).unwrap_or(0) != 0 };
+    if not greeted {
+        job_keys(command,"|schema||type||job_id||generation||role||after|")?;
+        let role = cli_json_string(command.root(),"role")?;
+        if kind.as_str() != "hello" or (role.as_str() != "control" and role.as_str() != "observe" and role.as_str() != "start" and role.as_str() != "stop") { return state_bool_error(2); };
+        let wants_control = role.as_str() == "control" or role.as_str() == "start";
+        if wants_control and job_host_control(host) { return state_bool_error(7); };
+        if wants_control { host.control_ever = true; };
+        let peer: &JobPeer = host.peers.get(index);
+        peer.flags.set(1,if wants_control {1}else{0}); peer.flags.set(0,1);
+        peer.flags.set(2,cli_json_optional_i64(command.root(),"after",0));
+        if peer.flags.get(2).unwrap_or(0) < 0 { return state_bool_error(2); };
+        peer.epoch.clear(); if wants_control { peer.epoch.push_str(state_id("attach-")?.as_str())?; (); };
+        let ready = job_store_load(store,id.as_str())?;
+        cli_put_string(&ready,ready.root(),"type","ready")?;
+        cli_put_string(&ready,ready.root(),"control_epoch",peer.epoch.as_str())?;
+        job_frame_append(&peer.output,&ready)?;
+        return job_true();
+    };
+    if kind.as_str() == "stop" {
+        job_keys(command,"|schema||type||job_id||generation||id|")?;
+        let stop = cli_json_string(command.root(),"id")?; if stop.len() == 0 or stop.len() > 128 { return state_bool_error(2); };
+        job_host_cancel(host,"stopped",cli_json_string(job.root(),"request_id")?.as_str())?;
+        return job_true();
+    };
+    if kind.as_str() == "logs" {
+        job_keys(command,"|schema||type||job_id||generation||after|")?;
+        let after = cli_json_optional_i64(command.root(),"after",0); if after < 0 { return state_bool_error(2); }; let peer: &JobPeer = host.peers.get(index); peer.flags.set(2,after); return job_true();
+    };
+    { let peer: &JobPeer = host.peers.get(index);
+      if not (peer.flags.get(1).unwrap_or(0) != 0) or cli_json_string(command.root(),"control_epoch")?.as_str() != peer.epoch.as_str() { return state_bool_error(7); }; };
+    if kind.as_str() == "detach" {
+        job_keys(command,"|schema||type||job_id||generation||control_epoch|")?;
+        let peer: &JobPeer = host.peers.get(index); peer.flags.set(3,1); return job_true();
+    };
+    if kind.as_str() == "start" {
+        job_keys(command,"|schema||type||job_id||generation||control_epoch|")?;
+        if host.active or host.submitted or host.stopping_at != 0 { return state_bool_error(12); };
+        let submit = job_store_admit(store,id.as_str(),generation.as_str())?;
+        host.worker = job_host_spawn(state,job,image)?; host.active = true;
+        // Engine ready precedes forwarding. Admission remains durable if ready
+        // never arrives; no restarted supervisor will replay this payload.
+        host.input.clear(); job_frame_append(&host.input,&submit)?;
+        host.submitted = true;
+        return job_true();
+    };
+    if kind.as_str() == "approval" {
+        job_keys(command,"|schema||type||job_id||generation||control_epoch||id||request_id||approved||text||cancelled|")?;
+        if host.stopping_at != 0 or host.approval.len() == 0 or cli_json_string(command.root(),"id")?.as_str() != host.approval.as_str() or cli_json_string(command.root(),"request_id")?.as_str() != cli_json_string(job.root(),"request_id")?.as_str() { return state_bool_error(7); };
+        let answer = json_doc_object()?; cli_put_string(&answer,answer.root(),"type","approval")?;
+        cli_put_string(&answer,answer.root(),"id",host.approval.as_str())?; cli_put_string(&answer,answer.root(),"request_id",cli_json_string(job.root(),"request_id")?.as_str())?;
+        if command.root().object_has("approved") { cli_put_bool(&answer,answer.root(),"approved",command.root().object_get("approved")?.bool_value()?)?; (); };
+        if command.root().object_has("cancelled") { cli_put_bool(&answer,answer.root(),"cancelled",command.root().object_get("cancelled")?.bool_value()?)?; (); };
+        if command.root().object_has("text") { let text = cli_json_string(command.root(),"text")?; if text.len() > 131072 {return state_bool_error(13);}; cli_put_string(&answer,answer.root(),"text",text.as_str())?; (); };
+        job_frame_append(&host.input,&answer)?; host.approval.clear();
+        job_store_status(store,id.as_str(),generation.as_str(),"running","")?; return job_true();
+    };
+    state_bool_error(2)
+}
+
+def job_host_peers(state: &CliState, store: &JobStore, job: &JsonDoc, host: &mut JobHost, listener: &IpcListener, image: &str) -> Result<bool,i64> {
+    let stream = listener.try_accept()?;
+    if stream.is_open() {
+        if host.peers.len() < 8 {
+            let peer = JobPeer { stream:stream,input:cli_bytes(2097152),output:cli_bytes(2097152),epoch:string_new(),flags:job_peer_flags() };
+            if not host.peers.push(peer) { return state_bool_error(13); }; ();
+        }; ();
+    };
+    let mut index = 0;
+    while index < host.peers.len() {
+        let disconnected = {
+            let peer: &JobPeer = host.peers.get(index);
+            let polled = job_stream_flush(&peer.stream,&peer.output);
+            let read = if polled.is_ok() {job_stream_read(&peer.stream,&peer.input)}else{state_bool_error(polled.error)};
+            let eof = peer.stream.eof();
+            not read.is_ok() or not eof.is_ok() or eof.value or peer.flags.get(3).unwrap_or(0)!=0 or (peer.flags.get(0).unwrap_or(0)==0 and time_since_ms(peer.flags.get(4).unwrap_or(0))>5000)
+        };
+        if disconnected { job_host_drop_peer(host,index,cli_json_string(job.root(),"request_id")?.as_str())?; continue; };
+        let mut count = 0;
+        while count < 8 {
+            let message = { let peer: &JobPeer = host.peers.get(index); job_frame_take(&peer.input,262144) };
+            if not message.is_ok() { let peer: &JobPeer = host.peers.get(index); peer.flags.set(3,1); break; };
+            if not message.value.root().object_has("type") { break; };
+            let handled = job_host_command(state,store,job,host,index,&message.value,image);
+            if not handled.is_ok() {
+                let error = job_message("error",cli_json_string(job.root(),"job_id")?.as_str(),cli_json_string(job.root(),"generation")?.as_str())?;
+                cli_put_i64(&error,error.root(),"code",handled.error)?;
+                let peer: &JobPeer = host.peers.get(index);
+                if not job_frame_append(&peer.output,&error).is_ok() {peer.flags.set(3,1); (); }; ();
+            };
+            count = count + 1;
+        };
+        {
+            let peer: &JobPeer = host.peers.get(index);
+            if peer.flags.get(0).unwrap_or(0)!=0 and peer.flags.get(3).unwrap_or(0)==0 and peer.output.used_len()<1048576 {
+                let logs = job_store_logs(store,cli_json_string(job.root(),"job_id")?.as_str(),peer.flags.get(2).unwrap_or(0),16)?;
+                let expired = cli_json_string(logs.root(),"type")?.as_str()=="cursor_expired";
+                let events = logs.root().object_get("events")?;
+                if expired or events.array_len()?>0 {
+                    if expired { peer.flags.set(2,cli_json_optional_i64(logs.root().object_get("snapshot")?,"first_sequence",1)-1); (); } else {peer.flags.set(2,cli_json_optional_i64(events.array_get(events.array_len()?-1)?,"sequence",peer.flags.get(2).unwrap_or(0))); (); };
+                    if not job_frame_append(&peer.output,&logs).is_ok() {peer.flags.set(3,1); (); }; ();
+                };
+            };
+        };
+        index=index+1;
+    };
+    job_true()
+}
+
+def job_host_event(store: &JobStore, job: &JsonDoc, host: &mut JobHost, event: &JsonDoc) -> Result<bool,i64> {
+    let id=cli_json_string(job.root(),"job_id")?; let generation=cli_json_string(job.root(),"generation")?;
+    job_store_event(store,id.as_str(),generation.as_str(),event)?;
+    let kind=cli_json_optional_string(event.root(),"type");
+    if kind.as_str()=="ready" { job_store_status(store,id.as_str(),generation.as_str(),"running","")?; (); };
+    if kind.as_str()=="approval" {
+        host.approval=cli_json_string(event.root(),"id")?;
+        if not job_host_control(host) {job_host_cancel(host,"interaction_required",cli_json_string(job.root(),"request_id")?.as_str())?; (); }
+        else {job_store_status(store,id.as_str(),generation.as_str(),"waiting_interaction","")?; (); }; ();
+    };
+    if kind.as_str()=="result" {
+        if cli_json_optional_string(event.root(),"id").as_str()!=cli_json_string(job.root(),"request_id")?.as_str() {return state_bool_error(10);};
+        host.code=cli_json_optional_i64(event.root(),"code",10); host.terminal=true; host.approval.clear();
+        if host.stopping_at==0 {host.stopping_at=time_unix_ms();job_host_queue(host,"shutdown","")?; (); }; ();
+    };
+    job_true()
+}
+
+def job_host_run(state: &CliState, id: &str, image: &str) -> Result<i64,i64> {
+    let store=job_store_open(state)?; let job=job_store_load(&store,id)?;
+    let generation=cli_json_string(job.root(),"generation")?;
+    if cli_json_string(job.root(),"state")?.as_str()!="created" or job.root().object_get("admitted")?.bool_value()? {return cli_fail(12);};
+    let lock_path=state_lock_path(state.path.as_str(),"job-host",id)?; let lease=file_lock(lock_path.as_str())?;
+    let listener=ipc_listen(cli_json_string(job.root(),"endpoint")?.as_str())?;
+    let peers: Vec<JobPeer> = vec_new();
+    let mut host=JobHost{worker:ProcessHandle{handle:0},input:cli_bytes(524288),output:cli_bytes(2097152),errors:cli_bytes(65536),peers:peers,active:false,submitted:false,terminal:false,goal:job.root().object_get("goal")?.bool_value()?,approval:string_new(),stopping_at:0,reason:string_new(),code:10,control_ever:false};
+    let started=time_unix_ms(); let lifetime=cli_json_optional_i64(job.root(),"lifetime_ms",3600000);
+    loop {
+        let polled=job_host_peers(state,&store,&job,&mut host,&listener,image);
+        if not polled.is_ok() {job_host_cancel(&mut host,"registry_or_transport_failed",cli_json_string(job.root(),"request_id")?.as_str())?; (); };
+        if not host.active {
+            if time_since_ms(started)>10000 or host.stopping_at>0 {break;};
+        } else {
+            let controlling = job_host_control(&host);
+            if host.goal and host.control_ever and not controlling {job_host_cancel(&mut host,"goal_controller_disconnected",cli_json_string(job.root(),"request_id")?.as_str())?; (); };
+            if time_since_ms(started)>lifetime {job_host_cancel(&mut host,"lifetime_exceeded",cli_json_string(job.root(),"request_id")?.as_str())?; (); };
+            if host.input.used_len()>0 {let part=cli_bytes(65536); let n=if host.input.used_len()>65536{65536}else{host.input.used_len()};cli_bytes_append(&part,&host.input,0,n)?;let sent=host.worker.try_write_stdin(&part,n);if sent.is_ok(){host.input.consume(sent.value)?; (); }else{job_host_cancel(&mut host,"worker_input_failed",cli_json_string(job.root(),"request_id")?.as_str())?; (); };};
+            let mut bytes=cli_bytes(65536);
+            let read=host.worker.read_stdout(&mut bytes);
+            if read.is_ok() and read.value>0 {if host.output.used_len()+read.value>2097152{job_host_cancel(&mut host,"worker_output_overflow",cli_json_string(job.root(),"request_id")?.as_str())?; (); }else{cli_bytes_append(&host.output,&bytes,0,read.value)?; (); };};
+            let errors=host.worker.read_stderr(&mut bytes); // Always drain stderr.
+            if errors.is_ok() and errors.value>0 and host.errors.used_len()<4096 {
+                let keep=if errors.value>4096-host.errors.used_len(){4096-host.errors.used_len()}else{errors.value};
+                cli_bytes_append(&host.errors,&bytes,0,keep)?; ();
+            };
+            let mut frames=0;
+            while frames<32 {
+                let frame=job_frame_take(&host.output,1048576);
+                if not frame.is_ok(){job_host_cancel(&mut host,"worker_protocol_failed",cli_json_string(job.root(),"request_id")?.as_str())?;break;};
+                if not frame.value.root().object_has("type"){break;};
+                let saved=job_host_event(&store,&job,&mut host,&frame.value);
+                if not saved.is_ok(){job_host_cancel(&mut host,"event_persistence_failed",cli_json_string(job.root(),"request_id")?.as_str())?; (); };
+                frames=frames+1;
+            };
+            if host.worker.try_wait()? {
+                if cli_bytes_index(&host.output,"\n")?>=0 or not host.worker.stdout_eof()? {continue;};
+                if host.output.used_len()>0 {host.reason=cli_text("worker_partial_frame");};
+                if not host.terminal {
+                    let ended=json_doc_object()?;cli_put_string(&ended,ended.root(),"type","worker_exit")?;cli_put_i64(&ended,ended.root(),"code",host.worker.exit_code()?)?;
+                    // Provider/runtime stderr may contain secrets; retain only
+                    // the process exit code, never its text.
+                    job_store_event(&store,id,generation.as_str(),&ended)?; ();
+                };
+                break;
+            };
+            if host.stopping_at>0 and time_since_ms(host.stopping_at)>5000 {host.worker.terminate_tree()?;host.worker.reap(5000)?;break;};
+        };
+        time_sleep_ms(2);
+    };
+    let mut cleanup=true;
+    if host.active {
+        let killed=host.worker.terminate_tree();let reaped=host.worker.reap(5000);
+        if not killed.is_ok() or not reaped.is_ok(){cleanup=false;};
+        let started_cleanup=time_unix_ms();
+        loop{let quiet=host.worker.tree_quiescent();if not quiet.is_ok(){cleanup=false;break;};if quiet.value{break;};if time_since_ms(started_cleanup)>5000{cleanup=false;break;};time_sleep_ms(1);};
+        if sengoo_process_handle_close(host.worker.handle)<0 {cleanup=false;};host.worker.handle=0;
+    };
+    let status=if not cleanup{"cleanup_unknown"}else{if not host.submitted{"interrupted"}else{if host.reason.len()>0{if host.terminal{"paused"}else{"cleanup_unknown"}}else{if host.terminal and host.code==0{"completed"}else{if host.terminal{"failed"}else{"interrupted"}}}}};
+    job_store_status(&store,id,generation.as_str(),status,if host.reason.len()>0{host.reason.as_str()}else{if not host.submitted{"bootstrap_expired"}else{""}})?;
+    // Briefly serve final cursor/status to live peers; host lifetime stays bounded.
+    let drain=time_unix_ms();
+    while time_since_ms(drain)<250 and host.peers.len()>0 {job_host_peers(state,&store,&job,&mut host,&listener,image)?;time_sleep_ms(2);};
+    cli_ok(0)
+}

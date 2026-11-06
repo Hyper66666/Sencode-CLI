@@ -1,0 +1,70 @@
+import terminal;
+
+def queued_event(kind: i64, code: i64, text: &str) -> TerminalEvent {
+    TerminalEvent { kind: kind, code: code, modifiers: 0, width: 80, height: 24, data: cli_text(text) }
+}
+def terminal_assert(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+def terminal_tests() -> Result<i64, i64> {
+    let terminal = terminal_open()?;
+    let history: Vec<InputHistory> = vec_new(); let pending: Vec<TerminalEvent> = vec_new();
+    pending.push(queued_event(2, 0, "中文😀\nsecond")); pending.push(queued_event(1, 1004, "")); pending.push(queued_event(1, 8, "")); pending.push(queued_event(1, 13, ""));
+    let line = ui_read_line_pending(&terminal, &history, &pending)?;
+    terminal_assert(line.as_str() == "中文😀\nsecod" and pending.len() == 0, "Unicode editor")?;
+    terminal_assert(ui_previous_boundary("中😀", 7) == 3 and ui_next_boundary("中😀", 3) == 7, "UTF-8 boundaries")?;
+    terminal_assert(ui_cells("中文😀é")? == 7, "terminal cell widths")?;
+    terminal_assert(ui_cells("👨‍👩‍👧‍👦🇨🇳1️⃣é")? == 7, "Unicode 17 grapheme display widths")?;
+    terminal_assert(ui_previous_boundary("x👨‍👩‍👧‍👦", 26) == 1 and ui_next_boundary("x👨‍👩‍👧‍👦y", 1) == 26, "ZWJ family is one cursor step")?;
+    terminal_assert(ui_previous_boundary("🇨🇳🇺🇸", 16) == 8 and ui_next_boundary("🇨🇳🇺🇸", 0) == 8, "regional pairs stay intact")?;
+    terminal_assert(ui_previous_boundary("é", 3) == 0 and ui_next_boundary("क्ष", 0) == 9, "combining and Indic cluster boundaries")?;
+    terminal_assert(ui_cursor_boundary("éx", 1)? == 3 and ui_cursor_boundary("👨‍👩‍👧‍👦x", 4)? == 25, "post-edit joined clusters clamp forward")?;
+    terminal_assert(ui_fit("a👨‍👩‍👧‍👦z", 2)?.as_str() == "a" and ui_fit("a👨‍👩‍👧‍👦z", 3)?.as_str() == "a👨‍👩‍👧‍👦", "fitting never clips a grapheme")?;
+    let grapheme_wrap = ui_layout("a👨‍👩‍👧‍👦🇨🇳z", 26, 3)?;
+    terminal_assert(grapheme_wrap.lines.len() == 2 and grapheme_wrap.lines.get(0).text.as_str() == "a👨‍👩‍👧‍👦" and grapheme_wrap.cursor_row == 1 and grapheme_wrap.cursor_column == 0, "wrapping preserves emoji clusters")?;
+    terminal_assert(ui_vertical_cursor("👨‍👩‍👧‍👦\n🇨🇳x", 34, 8, -1)? == 25, "vertical movement lands on grapheme boundaries")?;
+    let wrapped = ui_layout("ab中文😀cd", 14, 6)?;
+    terminal_assert(wrapped.lines.len() == 2 and wrapped.cursor_row == 1 and wrapped.cursor_column == 4, "wide wrap end cursor")?;
+    let middle = ui_layout("ab中文😀cd", 8, 6)?;
+    terminal_assert(middle.cursor_row == 1 and middle.cursor_column == 0, "wide wrap middle cursor")?;
+    let multiline = ui_layout("a\n中文\n😀", 5, 8)?;
+    terminal_assert(multiline.lines.len() == 3 and multiline.cursor_row == 1 and multiline.cursor_column == 2, "multiline cursor")?;
+    let small = ui_layout("中文😀abcdef", 10, 2)?;
+    terminal_assert(small.lines.len() == 6 and small.cursor_row == 3 and small.cursor_column == 0, "narrow layout")?;
+    let resized = ui_layout("ab中文😀cd", 14, 4)?;
+    terminal_assert(resized.lines.len() == 3 and resized.cursor_row == 2 and resized.cursor_column == 2, "resize layout")?;
+    let plain = ui_frame(&wrapped, 40, 8, "NORMAL · demo", false)?;
+    terminal_assert(not str_contains(plain.as_str(), "\x1b") and str_contains(plain.as_str(), "╭─ Message"), "monochrome frame")?;
+    let lines = plain.split("\r\n");
+    loop { let row = lines.next(); if not row.is_some { break; }; terminal_assert(ui_cells(row.value.as_str())? <= 40, "frame row exceeds width")?; };
+    let injected = ui_layout("hi\x1b[2J\x07", 8, 10)?;
+    let protected = ui_frame(&injected, 20, 2, "\x1b]0;bad\x07", false)?;
+    terminal_assert(not str_contains(protected.as_str(), "\x1b") and not str_contains(protected.as_str(), "\x07"), "untrusted ANSI is text")?;
+    let long = ui_layout("1\n2\n3\n4\n5", 9, 10)?;
+    let viewport = ui_frame(&long, 20, 2, "", false)?;
+    terminal_assert(not str_contains(viewport.as_str(), "│ > 1") and str_contains(viewport.as_str(), "│   5"), "bounded cursor viewport")?;
+    history.push(InputHistory { text: cli_text("old message") });
+    pending.push(queued_event(2, 0, "draft 中文")); pending.push(queued_event(1, 1001, "")); pending.push(queued_event(1, 1002, "")); pending.push(queued_event(1, 13, ""));
+    terminal_assert(ui_read_prompt_mode(&terminal, &history, &pending, "", false)?.as_str() == "draft 中文", "history restores draft")?;
+    pending.push(queued_event(2, 0, "keep")); pending.push(queued_event(1, 1002, "")); pending.push(queued_event(1, 13, ""));
+    terminal_assert(ui_read_prompt_mode(&terminal, &history, &pending, "", false)?.as_str() == "keep", "down on draft is no-op")?;
+    pending.push(queued_event(2, 0, "hello 中文  ")); pending.push(queued_event(1, 23, "")); pending.push(queued_event(1, 13, ""));
+    terminal_assert(ui_read_prompt_mode(&terminal, &history, &pending, "", false)?.as_str() == "hello ", "delete Unicode word")?;
+    pending.push(queued_event(2, 0, "clear me")); pending.push(queued_event(1, 21, "")); pending.push(queued_event(1, 13, ""));
+    terminal_assert(ui_read_prompt_mode(&terminal, &history, &pending, "", false)?.len() == 0, "clear input prefix")?;
+    terminal_assert(ui_complete("/mod")?.as_str() == "/model" and ui_complete("/co")?.as_str() == "/co", "command completion")?;
+    terminal_assert(str_contains(ui_command_hint("/mod", "")?.as_str(), "/model"), "command hint")?;
+    terminal_assert(ui_vertical_cursor("ab\n中文\nxyz", 12, 10, -1)? == 6, "visual up respects wide characters")?;
+    terminal_assert(ui_vertical_cursor("ab\n中文\nxyz", 6, 10, 1)? == 12, "visual down respects wide characters")?;
+    pending.push(queued_event(1, 4, ""));
+    let quit = ui_read_prompt_mode(&terminal, &history, &pending, "", false);
+    terminal_assert(not quit.is_ok and quit.error == 5, "Ctrl+D empty exits")?;
+    pending.push(queued_event(2, 0, "abc")); pending.push(queued_event(1, 1005, "")); pending.push(queued_event(1, 4, "")); pending.push(queued_event(1, 13, ""));
+    terminal_assert(ui_read_prompt_mode(&terminal, &history, &pending, "", false)?.as_str() == "bc", "Ctrl+D deletes next")?;
+    println("TUI layout, resize, Unicode, safe frames, viewport, history and editor acceptance passed");
+    cli_ok(0)
+}
+def main() -> i64 {
+    let result = terminal_tests(); if not result.is_ok() { println(result.error); return 1; }; result.value
+}

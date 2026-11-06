@@ -1,0 +1,278 @@
+import terminal;
+import std::file;
+import std::path;
+
+// Composer-only key configuration. It cannot synthesize submission, approval,
+// commands, provider calls, process actions or an exit/cancel event.
+struct UiKeyBinding { key: String, code: i64, modifiers: i64, action: i64 }
+struct UiKeymap { mode: String, source: String, warning: String, bindings: Vec<UiKeyBinding> }
+struct UiChord { code: i64, modifiers: i64 }
+struct UiUndo { text: String, cursor: i64 }
+struct UiVim { insert: bool, pending: i64, undo: Vec<UiUndo>, undo_bytes: i64, record_insert: bool }
+struct UiEdit { handled: bool, text: String, cursor: i64 }
+
+def keys_new() -> UiKeymap { let bindings: Vec<UiKeyBinding> = vec_new(); UiKeymap { mode: cli_text("default"), source: cli_text("built-in defaults"), warning: string_new(), bindings: bindings } }
+def keys_vim_new() -> UiVim { let undo: Vec<UiUndo> = vec_new(); UiVim { insert: true, pending: 0, undo: undo, undo_bytes: 0, record_insert: true } }
+def keys_error(code: i64) -> Result<UiKeymap, i64> { Result { is_ok: false, value: keys_new(), error: code } }
+def keys_bool(value: bool) -> Result<bool, i64> { Result { is_ok: true, value: value, error: 0 } }
+def keys_literal(value: &String) -> bool {
+    let bytes = value.bytes();
+    loop { let next = bytes.next(); if not next.is_some { break; }; if next.value < 32 or next.value > 126 { bytes.free(); return false; }; };
+    bytes.free(); true
+}
+
+def keys_action(name: &str) -> i64 {
+    if name == "left" { return 1; }; if name == "right" { return 2; };
+    if name == "word_left" { return 3; }; if name == "word_right" { return 4; };
+    if name == "line_start" { return 5; }; if name == "line_end" { return 6; };
+    if name == "delete_backward" { return 7; }; if name == "delete_forward" { return 8; };
+    if name == "delete_word_backward" { return 9; }; if name == "delete_word_forward" { return 10; };
+    if name == "delete_to_line_end" { return 11; }; if name == "delete_to_line_start" { return 12; };
+    0
+}
+def keys_action_name(action: i64) -> &str {
+    if action == 1 { return "left"; }; if action == 2 { return "right"; };
+    if action == 3 { return "word_left"; }; if action == 4 { return "word_right"; };
+    if action == 5 { return "line_start"; }; if action == 6 { return "line_end"; };
+    if action == 7 { return "delete_backward"; }; if action == 8 { return "delete_forward"; };
+    if action == 9 { return "delete_word_backward"; }; if action == 10 { return "delete_word_forward"; };
+    if action == 11 { return "delete_to_line_end"; }; if action == 12 { return "delete_to_line_start"; };
+    "unsupported"
+}
+
+def keys_chord(text: &str) -> Result<UiChord, i64> {
+    let invalid = UiChord { code: 0, modifiers: 0 };
+    let key = str_to_ascii_lower(text)?;
+    if key.as_str() == "left" { return Result { is_ok: true, value: UiChord { code: 1004, modifiers: 0 }, error: 0 }; };
+    if key.as_str() == "right" { return Result { is_ok: true, value: UiChord { code: 1003, modifiers: 0 }, error: 0 }; };
+    if key.as_str() == "home" { return Result { is_ok: true, value: UiChord { code: 1005, modifiers: 0 }, error: 0 }; };
+    if key.as_str() == "end" { return Result { is_ok: true, value: UiChord { code: 1006, modifiers: 0 }, error: 0 }; };
+    if key.as_str() == "ctrl+left" { return Result { is_ok: true, value: UiChord { code: 1004, modifiers: 4 }, error: 0 }; };
+    if key.as_str() == "ctrl+right" { return Result { is_ok: true, value: UiChord { code: 1003, modifiers: 4 }, error: 0 }; };
+    let control = str_starts_with(key.as_str(), "ctrl+") and key.len() == 6;
+    let alt = str_starts_with(key.as_str(), "alt+") and key.len() == 5;
+    if not control and not alt { return Result { is_ok: false, value: invalid, error: 2 }; };
+    let suffix = cli_byte_slice(key.as_str(), if control { 5 } else { 4 }, key.len())?;
+    let chars = suffix.chars(); let next = chars.next(); chars.free();
+    if not next.is_some { return Result { is_ok: false, value: invalid, error: 2 }; };
+    let cp = char_codepoint(next.value)?;
+    if cp < 97 or cp > 122 { return Result { is_ok: false, value: invalid, error: 2 }; };
+    // Enter, Tab, cancellation, EOF, redraw, queue, paste and terminal control
+    // remain reserved. Modal/approval handlers run before every custom map.
+    if control and (cp == 99 or cp == 100 or cp == 104 or cp == 105 or cp == 106 or cp == 108 or cp == 109 or cp == 113 or cp == 114 or cp == 118) { return Result { is_ok: false, value: invalid, error: 7 }; };
+    Result { is_ok: true, value: UiChord { code: if control { cp - 96 } else { cp }, modifiers: if control { 4 } else { 2 } }, error: 0 }
+}
+
+def keys_fields(object: JsonValue, allowed: &str) -> Result<bool, i64> {
+    let mut index = 0;
+    while index < object.object_len()? {
+        let key = object.object_key(index)?; if not keys_literal(&key) { return keys_bool(false); };
+        let root_key = allowed == "|version||mode||bindings|" and (key.as_str() == "version" or key.as_str() == "mode" or key.as_str() == "bindings");
+        let binding_key = allowed == "|key||action|" and (key.as_str() == "key" or key.as_str() == "action");
+        if not root_key and not binding_key { return keys_bool(false); }; index = index + 1;
+    };
+    keys_bool(true)
+}
+
+// The general JSON DOM intentionally uses last-member-wins semantics. This
+// schema rejects ambiguous duplicates before inspecting that normalized DOM.
+// json_parse already validates syntax; only quoted property tokens and object
+// scopes are tracked here. Decoding each key also catches escaped aliases.
+def keys_unique_fields(text: &str) -> Result<bool, i64> {
+    let source = cli_text(text); let chars = source.chars(); let mut offset = 0;
+    let mut quoted = false; let mut escaped = false; let mut candidate = false;
+    let mut start = 0; let mut end = 0; let mut depth = 0;
+    let mut version = false; let mut mode = false; let mut bindings = false;
+    let mut binding_key = false; let mut binding_action = false;
+    loop {
+        let item = chars.next(); if not item.is_some { break; };
+        let cp = char_codepoint(item.value)?; let position = offset; offset = offset + ui_scalar_bytes(cp);
+        if quoted {
+            if escaped { escaped = false; } else {
+                if cp == 92 { escaped = true; } else { if cp == 34 { quoted = false; candidate = true; end = offset; }; };
+            };
+        } else {
+            if cp == 34 { quoted = true; escaped = false; candidate = false; start = position; } else {
+                if not (cp == 32 or cp == 9 or cp == 10 or cp == 13) {
+                    if cp == 58 and candidate {
+                        let token = cli_byte_slice(text, start, end)?; let document = json_parse(token.as_str())?; let key = document.root().string_value()?;
+                        if not keys_literal(&key) { chars.free(); return keys_bool(false); };
+                        if depth == 1 {
+                            if key.as_str() == "version" and not version { version = true; } else {
+                                if key.as_str() == "mode" and not mode { mode = true; } else {
+                                    if key.as_str() == "bindings" and not bindings { bindings = true; } else { chars.free(); return keys_bool(false); };
+                                };
+                            };
+                        } else {
+                            if depth != 2 { chars.free(); return keys_bool(false); };
+                            if key.as_str() == "key" and not binding_key { binding_key = true; } else {
+                                if key.as_str() == "action" and not binding_action { binding_action = true; } else { chars.free(); return keys_bool(false); };
+                            };
+                        };
+                    };
+                    candidate = false;
+                    if cp == 123 { depth = depth + 1; if depth > 2 { chars.free(); return keys_bool(false); }; if depth == 2 { binding_key = false; binding_action = false; }; };
+                    if cp == 125 { depth = depth - 1; };
+                };
+            };
+        };
+    };
+    chars.free(); keys_bool(true)
+}
+
+def keys_parse(text: &str, source: &str) -> Result<UiKeymap, i64> {
+    if text.len() > 65536 { return keys_error(13); };
+    let document = json_parse(text)?; let root = document.root();
+    if not keys_unique_fields(text)? { return keys_error(2); };
+    if not keys_fields(root, "|version||mode||bindings|")? { return keys_error(2); };
+    if root.object_get("version")?.number_i64()? != 1 { return keys_error(2); };
+    let mode = if root.object_has("mode") { root.object_get("mode")?.string_value()? } else { cli_text("default") };
+    if not keys_literal(&mode) { return keys_error(2); };
+    if mode.as_str() != "default" and mode.as_str() != "vim" { return keys_error(2); };
+    let mut map = keys_new(); map.mode = mode; map.source = cli_text(source);
+    if root.object_has("bindings") {
+        let bindings = root.object_get("bindings")?; let count = bindings.array_len()?;
+        if count > 64 { return keys_error(13); }; let mut index = 0;
+        while index < count {
+            let item = bindings.array_get(index)?;
+            if not keys_fields(item, "|key||action|")? { return keys_error(2); };
+            let key = item.object_get("key")?.string_value()?; let action = item.object_get("action")?.string_value()?;
+            if not keys_literal(&key) or not keys_literal(&action) { return keys_error(2); };
+            let chord = keys_chord(key.as_str())?; let operation = keys_action(action.as_str());
+            if operation == 0 { return keys_error(7); };
+            let mut previous = 0;
+            while previous < map.bindings.len() { let old: &UiKeyBinding = map.bindings.get(previous); if old.code == chord.code and old.modifiers == chord.modifiers { return keys_error(2); }; previous = previous + 1; };
+            map.bindings.push(UiKeyBinding { key: str_to_ascii_lower(key.as_str())?, code: chord.code, modifiers: chord.modifiers, action: operation }); index = index + 1;
+        };
+    };
+    Result { is_ok: true, value: map, error: 0 }
+}
+
+def keys_read(path: &str) -> Result<UiKeymap, i64> {
+    let length = file_len(path)?; if length < 0 or length > 65536 { return keys_error(13); };
+    // Fixed capacity prevents a concurrent file growth from increasing bounds.
+    let buffer = ffi_buffer_new(65537)?; let read = file_read_into(path, buffer)?;
+    if read > 65536 { return keys_error(13); };
+    if not buffer.is_utf8() { return keys_error(20); };
+    let text = cli_bytes_text(&buffer, 0, read)?;
+    if text.len() != read { return keys_error(20); };
+    let bytes = text.bytes(); loop { let byte = bytes.next(); if not byte.is_some { break; }; if byte.value == 0 { bytes.free(); return keys_error(20); }; }; bytes.free();
+    keys_parse(text.as_str(), path)
+}
+
+def keys_load() -> UiKeymap {
+    let mut map = keys_new(); let explicit = env_has_var("SENCODE_KEYMAP"); let selection = ui_env("SENCODE_KEYMAP");
+    if explicit and (not selection.is_ok or selection.value.len() == 0) { map.warning = cli_text("Explicit keymap path is invalid; using built-in defaults. /keys show explains the safe schema."); return map; };
+    let configured = selection.unwrap_or(string_new());
+    let mut path = configured.clone().unwrap_or(string_new());
+    if path.len() == 0 {
+        let appdata = ui_env("APPDATA").unwrap_or(string_new());
+        if appdata.len() == 0 { return map; };
+        path = path_join_string(appdata.as_str(), "Sencode/cli-keybindings.json").unwrap_or(string_new());
+    };
+    if path.len() == 0 { return map; };
+    if configured.len() == 0 and not file_exists(path.as_str()) { return map; };
+    let loaded = keys_read(path.as_str());
+    if loaded.is_ok { return loaded.value; };
+    map.warning = cli_text("Keymap rejected; using defaults (code "); map.warning.push_i64(loaded.error); map.warning.push_str("). /keys show explains the safe schema.");
+    map
+}
+
+def keys_lookup(map: &UiKeymap, event: &TerminalEvent) -> i64 {
+    if event.kind != 1 { return 0; }; let mut index = 0;
+    while index < map.bindings.len() { let binding: &UiKeyBinding = map.bindings.get(index); if event.code == binding.code and event.modifiers == binding.modifiers { return binding.action; }; index = index + 1; };
+    0
+}
+
+def keys_describe(map: &UiKeymap) -> Result<String, i64> {
+    let out = cli_text("Editor mode: "); out.push_str(map.mode.as_str())?; out.push_str("\nSource: ")?; out.push_str(map.source.as_str())?;
+    out.push_str("\n\n/keys default | vim | show | reset\nVim is a composer subset: Esc INSERT→NORMAL; i/a/I/A insert; h/j/k/l, w/b, 0/$, gg/G; x/D/dd/dw/cw; u undo. Ctrl+C cancels a running request. Enter remains explicit send/save.\n\nOptional user JSON: %APPDATA%/Sencode/cli-keybindings.json. SENCODE_KEYMAP explicitly selects another path. Files are read only; 64 KiB / 64 bindings maximum.\nExample: {\"version\":1,\"mode\":\"vim\",\"bindings\":[{\"key\":\"alt+b\",\"action\":\"word_left\"}]}\nAllowed actions: left/right, word_left/word_right, line_start/line_end, delete_backward/delete_forward, delete_word_backward/delete_word_forward, delete_to_line_start/delete_to_line_end. Reserved approval, send, cancel and exit keys cannot be remapped.\n")?;
+    if map.warning.len() > 0 { out.push_str("\n")?; out.push_str(map.warning.as_str())?; (); };
+    let mut index = 0; while index < map.bindings.len() { let binding: &UiKeyBinding = map.bindings.get(index); out.push_str("\n")?; out.push_str(binding.key.as_str())?; out.push_str(" → ")?; out.push_str(keys_action_name(binding.action))?; index = index + 1; };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def keys_line_start(text: &str, cursor: i64) -> Result<i64, i64> {
+    let prefix = cli_byte_slice(text, 0, cursor)?; let chars = prefix.chars(); let mut offset = 0; let mut start = 0;
+    loop { let next = chars.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?; offset = offset + ui_scalar_bytes(cp); if cp == 10 { start = offset; }; }; chars.free(); cli_ok(start)
+}
+def keys_line_end(text: &str, cursor: i64) -> Result<i64, i64> {
+    let suffix = cli_byte_slice(text, cursor, text.len())?; let found = str_index_of(suffix.as_str(), "\n"); cli_ok(if found < 0 { text.len() } else { cursor + found })
+}
+def keys_space(text: &str) -> bool { text == " " or text == "\t" or text == "\n" or text == "\r\n" }
+def keys_word_right(text: &str, cursor: i64) -> Result<i64, i64> {
+    let clusters = ui_clusters(text)?; let mut index = 0; let mut word = false; let mut offset = cursor;
+    while index < clusters.len() { let cluster: &UiCluster = clusters.get(index);
+        if cluster.offset >= cursor { let blank = cluster.newline or keys_space(cluster.text.as_str()); if word and blank { word = false; } else { if not blank { if offset > cursor and not word { return cli_ok(cluster.offset); }; word = true; }; }; offset = cluster.end; };
+        index = index + 1;
+    }; cli_ok(text.len())
+}
+def keys_word_left(text: &str, cursor: i64) -> Result<i64, i64> {
+    let clusters = ui_clusters(text)?; let mut index = clusters.len(); let mut word = false; let mut offset = cursor;
+    while index > 0 { index = index - 1; let cluster: &UiCluster = clusters.get(index);
+        if cluster.offset < cursor { let blank = cluster.newline or keys_space(cluster.text.as_str()); if blank and word { return cli_ok(offset); }; if not blank { word = true; }; offset = cluster.offset; };
+    }; cli_ok(0)
+}
+
+def keys_snapshot(vim: &mut UiVim, text: &str, cursor: i64) -> Result<bool, i64> {
+    if vim.undo.len() > 0 and vim.undo.get(vim.undo.len() - 1).text.as_str() == text { return keys_bool(true); };
+    vim.undo.push(UiUndo { text: cli_text(text), cursor: cursor }); vim.undo_bytes = vim.undo_bytes + text.len();
+    while vim.undo.len() > 32 or vim.undo_bytes > 1048576 { let removed = vim.undo.remove(0); if not removed.is_some { break; }; vim.undo_bytes = vim.undo_bytes - removed.value.text.len(); };
+    keys_bool(true)
+}
+def keys_before_insert(vim: &mut UiVim, text: &str, cursor: i64) -> Result<bool, i64> {
+    if vim.record_insert { keys_snapshot(vim, text, cursor)?; vim.record_insert = false; }; keys_bool(true)
+}
+def keys_edit(text: &str, cursor: i64, handled: bool) -> Result<UiEdit, i64> { Result { is_ok: true, value: UiEdit { handled: handled, text: cli_text(text), cursor: cursor }, error: 0 } }
+def keys_apply(vim: &mut UiVim, text: &str, cursor: i64, action: i64, width: i64) -> Result<UiEdit, i64> {
+    let mut next = cursor; let mut start = cursor; let mut end = cursor;
+    if action == 1 { next = ui_previous_boundary(text, cursor); }; if action == 2 { next = ui_next_boundary(text, cursor); };
+    if action == 3 { next = keys_word_left(text, cursor)?; }; if action == 4 { next = keys_word_right(text, cursor)?; };
+    if action == 5 { next = keys_line_start(text, cursor)?; }; if action == 6 { next = keys_line_end(text, cursor)?; };
+    if action == 7 { start = ui_previous_boundary(text, cursor); }; if action == 8 { end = ui_next_boundary(text, cursor); };
+    if action == 9 { start = keys_word_left(text, cursor)?; }; if action == 10 { end = keys_word_right(text, cursor)?; };
+    if action == 11 { end = keys_line_end(text, cursor)?; }; if action == 12 { start = keys_line_start(text, cursor)?; };
+    if action == 13 { next = ui_vertical_cursor(text, cursor, width, -1)?; }; if action == 14 { next = ui_vertical_cursor(text, cursor, width, 1)?; };
+    if action == 15 { next = 0; }; if action == 16 { next = text.len(); };
+    if action == 17 { start = keys_line_start(text, cursor)?; end = keys_line_end(text, cursor)?; if end < text.len() { end = end + 1; } else { if start > 0 { start = start - 1; }; }; };
+    if action >= 7 and action <= 12 or action == 17 {
+        if start == end { return keys_edit(text, cursor, true); }; keys_snapshot(vim, text, cursor)?;
+        let out = ui_replace_range(text, start, end, "")?; return Result { is_ok: true, value: UiEdit { handled: true, text: out, cursor: start }, error: 0 };
+    };
+    keys_edit(text, next, action > 0)
+}
+
+def keys_vim_event(vim: &mut UiVim, text: &str, cursor: i64, width: i64, event: &TerminalEvent) -> Result<UiEdit, i64> {
+    if event.kind == 2 { vim.insert = true; vim.pending = 0; vim.record_insert = true; return keys_edit(text, cursor, false); };
+    if event.kind != 1 { return keys_edit(text, cursor, false); };
+    if event.code == 27 { vim.insert = false; vim.pending = 0; vim.record_insert = true; return keys_edit(text, cursor, true); };
+    if vim.insert { return keys_edit(text, cursor, false); };
+    if event.modifiers > 1 or event.code < 32 or event.code >= 1000 and event.code <= 1010 { vim.pending = 0; return keys_edit(text, cursor, false); };
+    if event.code > 126 { vim.pending = 0; return keys_edit(text, cursor, true); };
+    let key = event.code; let pending = vim.pending; vim.pending = 0;
+    if pending == 100 or pending == 99 {
+        let operation = if key == 100 and pending == 100 { 17 } else { if key == 119 { 10 } else { if key == 36 { 11 } else { 0 } } };
+        if operation > 0 { let result = keys_apply(vim, text, cursor, operation, width)?; if pending == 99 { vim.insert = true; vim.record_insert = true; }; return Result { is_ok: true, value: result, error: 0 }; };
+        return keys_edit(text, cursor, true);
+    };
+    if pending == 103 { if key == 103 { return keys_apply(vim, text, cursor, 15, width); }; return keys_edit(text, cursor, true); };
+    if key == 100 or key == 99 or key == 103 { vim.pending = key; return keys_edit(text, cursor, true); };
+    if key == 105 or key == 97 or key == 73 or key == 65 {
+        vim.insert = true; vim.record_insert = true;
+        let next = if key == 97 { ui_next_boundary(text, cursor) } else { if key == 73 { keys_line_start(text, cursor)? } else { if key == 65 { keys_line_end(text, cursor)? } else { cursor } } };
+        return keys_edit(text, next, true);
+    };
+    if key == 117 {
+        let removed = vim.undo.pop(); if not removed.is_some { return keys_edit(text, cursor, true); };
+        vim.undo_bytes = vim.undo_bytes - removed.value.text.len();
+        return Result { is_ok: true, value: UiEdit { handled: true, text: removed.value.text.clone()?, cursor: removed.value.cursor }, error: 0 };
+    };
+    let mut action = 0;
+    if key == 104 { action = 1; }; if key == 108 { action = 2; }; if key == 98 { action = 3; }; if key == 119 { action = 4; };
+    if key == 48 { action = 5; }; if key == 36 { action = 6; }; if key == 120 { action = 8; }; if key == 68 { action = 11; };
+    if key == 107 { action = 13; }; if key == 106 { action = 14; }; if key == 71 { action = 16; };
+    if action > 0 { return keys_apply(vim, text, cursor, action, width); };
+    // Unsupported normal-mode characters are inert, including ':' and '/' in
+    // this deliberately small subset. Use i before composing a slash command.
+    keys_edit(text, cursor, true)
+}

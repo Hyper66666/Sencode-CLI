@@ -1,0 +1,28 @@
+import transport;
+import command_line;
+import std::time;
+
+def probe() -> Result<bool, i64> {
+    let args = cli_arguments()?;
+    let port = args.root().object_get("positionals")?.array_get(0)?.string_value()?;
+    let base = cli_join("http://127.0.0.1:", port.as_str())?;
+    let history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"offline\"}]}")?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    let mut job = provider_job_start(base.as_str(), 0, "fixture", "fixture-only", &history, &tools)?;
+    let started = time_unix_ms();
+    loop {
+        let result = job.poll();
+        if not result.is_ok() {
+            println("ProviderJob.poll failed"); println(result.error); println(job.error); println(job.http.status);
+            if job.stream.request_started()? { println("request emitted"); } else { println("no request emitted"); };
+            let buffer = ffi_buffer_new(4096)?; let read = job.stream.read_into(buffer);
+            println(read.error); if read.eof { println("direct EOF"); } else { println("direct not EOF"); };
+            break;
+        };
+        if time_since_ms(started) > 35000 { return Result { is_ok: false, value: false, error: 11 }; };
+        time_sleep_ms(1);
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 { let result = probe(); if not result.is_ok() { println(result.error); return 1; }; 0 }

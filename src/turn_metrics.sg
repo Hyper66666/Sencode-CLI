@@ -1,0 +1,28 @@
+import state;
+import std::time;
+
+// Presentation metadata only. The existing message content and execution fence
+// remain authoritative; this never creates a model message or resumes work.
+def turn_metrics_save(state: &CliState, execution: &CliExecution, started: i64, outcome: &str) -> Result<bool, i64> {
+    let ended = time_monotonic_ms();
+    if started < 0 or ended < started { return Result { is_ok: true, value: false, error: 0 }; };
+    turn_metrics_save_elapsed(state, execution, ended - started, outcome)
+}
+
+def turn_metrics_save_elapsed(state: &CliState, execution: &CliExecution, elapsed_ms: i64, outcome: &str) -> Result<bool, i64> {
+    if elapsed_ms < 0 { return Result { is_ok: true, value: false, error: 0 }; };
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx, state, execution)?;
+    let mut query = tx.prepare("SELECT h.message_id,h.message_json FROM shared_history h JOIN messages m ON m.id=h.message_id AND m.session_id=h.session_id WHERE h.session_id=? AND h.execution_id=? AND h.fence=? ORDER BY m.revision DESC,m.created_at DESC,m.id DESC LIMIT 1")?;
+    query.bind_text(1, execution.session.as_str())?; query.bind_text(2, execution.id.as_str())?; query.bind_i64(3, execution.fence)?;
+    if not query.step()? { tx.commit()?; return Result { is_ok: true, value: false, error: 0 }; };
+    let id = query.text(0)?; let raw = query.text(1)?;
+    let message = json_parse(raw.as_str())?;
+    cli_put_i64(&message, message.root(), "cli_turn_elapsed_ms", elapsed_ms)?;
+    cli_put_string(&message, message.root(), "cli_turn_outcome", outcome)?;
+    let mut save = tx.prepare("UPDATE shared_history SET message_json=? WHERE message_id=? AND session_id=? AND execution_id=? AND fence=?")?;
+    save.bind_text(1, message.serialize_string()?.as_str())?; save.bind_text(2, id.as_str())?;
+    save.bind_text(3, execution.session.as_str())?; save.bind_text(4, execution.id.as_str())?; save.bind_i64(5, execution.fence)?; save.step()?;
+    tx.commit()?;
+    Result { is_ok: true, value: true, error: 0 }
+}

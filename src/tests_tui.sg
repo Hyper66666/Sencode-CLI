@@ -1,0 +1,298 @@
+import tui;
+import slash;
+import tui_interaction_tests;
+import tui_images_tests;
+
+def tui_test_event(kind: i64, code: i64, modifiers: i64, text: &str) -> TerminalEvent { TerminalEvent { kind: kind, code: code, modifiers: modifiers, width: 100, height: 30, data: cli_text(text) } }
+def tui_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; tui_true() }
+
+def tui_test_frame(app: &UiApp) -> Result<bool, i64> {
+    let frame = tui_frame(app)?; let iter = frame.split("\n"); let mut count = 0;
+    loop { let line = iter.next(); if not line.is_some { break; }; count = count + 1; tui_assert(ui_cells(line.value.as_str())? <= app.width, "frame overflows viewport")?; tui_assert(not str_contains(line.value.as_str(), "\x1b") and not str_contains(line.value.as_str(), "\x07"), "frame contains terminal controls")?; };
+    tui_assert(count == app.height, "frame does not own exact terminal height")
+}
+
+def tui_cursor_paint_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "cursor");
+    let first = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(first.as_str(), "\x1b[?25h") and not str_contains(first.as_str(), "\x1b[?25l"), "first composer paint makes native cursor visible once")?;
+    let mut tick = 0;
+    while tick < 100 { app.animation_tick = tick; tui_assert(tui_paint_update(&mut app, true)?.len() == 0, "unchanged frame produces zero writes and does not reset cursor blink")?; tick = tick + 1; };
+    tui_set_draft(&mut app, "draft")?; let changed = tui_paint_update(&mut app, true)?;
+    tui_assert(changed.len() > 0 and not str_contains(changed.as_str(), "\x1b[?25l") and not str_contains(changed.as_str(), "\x1b[?25h"), "editing never toggles cursor visibility")?;
+    let left = tui_test_event(1, 1004, 0, ""); tui_event(&mut app, &left)?;
+    let moved = tui_paint_update(&mut app, true)?;
+    tui_assert(moved.len() > 0 and not str_contains(moved.as_str(), "\x1b[?25"), "cursor-only movement repaints without blink reset")?;
+    let choices: Vec<UiCandidate> = vec_new(); choices.push(UiCandidate { id: cli_text("one"), label: cli_text("one"), detail: string_new(), value: cli_text("one") });
+    tui_set_candidates(&mut app, "fixture", "Choose", choices)?; let hidden = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(hidden.as_str(), "\x1b[?25l") and not str_contains(hidden.as_str(), "\x1b[?25h"), "picker hides cursor once")?;
+    tui_assert(tui_paint_update(&mut app, true)?.len() == 0, "open unchanged picker performs no cursor writes")?;
+    tui_close_picker(&mut app)?; let restored = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(restored.as_str(), "\x1b[?25h") and not str_contains(restored.as_str(), "\x1b[?25l"), "closing picker restores cursor once")?;
+    tui_true()
+}
+
+def tui_stream_paint_tests() -> Result<bool, i64> {
+    tui_assert(tui_append_column("中", "中文", 120)? == 3, "CJK append advances by cells rather than UTF-8 bytes")?;
+    tui_assert(tui_append_column("e", "é", 120)? == 0, "combining extension redraws its preceding cluster")?;
+    tui_assert(tui_append_column("👨", "👨‍👩", 120)? == 0, "ZWJ extension redraws its preceding emoji")?;
+    tui_assert(tui_append_column("🇨", "🇨🇳", 120)? == 0, "regional-indicator extension redraws the flag cluster")?;
+    tui_assert(tui_append_column("old", "new", 120)? == 0 and tui_append_column("old ", "old", 120)? == 0, "replacement and shrink never use append")?;
+    tui_assert(tui_append_column("ab", "abc", 2)? == 0, "append cannot overflow terminal width")?;
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "stream"); tui_resize(&mut app, 120, 30)?;
+    tui_begin(&mut app)?; tui_delta(&mut app, "# Stable heading\n```sg\nprintln(1);\n```\nLong prefix 中文")?;
+    let stable = app.stream_lines.get(0).text.clone()?; let completed_rows = app.stream_lines.len();
+    tui_paint_update(&mut app, true)?;
+    tui_delta(&mut app, "继续")?; let extended = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(extended.as_str(), "继续") and not str_contains(extended.as_str(), "\x1b[2K") and not str_contains(extended.as_str(), "Long prefix"), "streamed Chinese writes only its appended cells")?;
+    tui_assert(not str_contains(extended.as_str(), "╭") and not str_contains(extended.as_str(), "╯") and not str_contains(extended.as_str(), "\x1b[?25"), "stream append leaves composer borders and cursor visibility untouched")?;
+    tui_assert(app.stream_lines.len() == completed_rows and app.stream_lines.get(0).text.as_str() == stable.as_str(), "completed Markdown rows remain immutable while the tail grows")?;
+    tui_delta(&mut app, "e")?; tui_paint_update(&mut app, true)?;
+    tui_delta(&mut app, "́")?; let joined = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(joined.as_str(), "\x1b[2K") and str_contains(joined.as_str(), "é"), "joining grapheme uses a complete row repaint")?;
+    tui_set_draft(&mut app, "kept draft")?; tui_delta(&mut app, "\n#")?; tui_paint_update(&mut app, true)?;
+    tui_delta(&mut app, " Heading")?; let restyled = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(restyled.as_str(), "\x1b[2K") and str_contains(restyled.as_str(), "\x1b[1;38;5;183m"), "Markdown classification changes redraw the whole row in its new style")?;
+    tui_resize(&mut app, 80, 24)?; let resized = tui_paint_update(&mut app, true)?;
+    tui_assert(str_contains(resized.as_str(), "\x1b[2K") and str_contains(resized.as_str(), "╭"), "resize invalidates append mode and redraws borders")?;
+    let unchanged = tui_paint_update(&mut app, true)?;
+    tui_assert(app.draft.as_str() == "kept draft" and unchanged.len() == 0, "stream repaint preserves draft and unchanged frames stay silent")?;
+    let mut immediate = tui_new("D:/fixture", "fixture", "fixture", "batch");
+    let mut coalesced = tui_new("D:/fixture", "fixture", "fixture", "batch");
+    tui_begin(&mut immediate)?; tui_begin(&mut coalesced)?;
+    let chunks: Vec<InputHistory> = vec_new();
+    chunks.push(InputHistory { text: cli_text("# Title\n\nUnicode 中") }); chunks.push(InputHistory { text: cli_text("文 e") }); chunks.push(InputHistory { text: cli_text("́ 👨") }); chunks.push(InputHistory { text: cli_text("‍👩\n```diff\n@@ -1,1 +1,1 @@\n-old\n") }); chunks.push(InputHistory { text: cli_text("+new\n```\nTail") });
+    let batch = string_new(); let mut index = 0;
+    while index < chunks.len() { let chunk: &InputHistory = chunks.get(index); tui_delta(&mut immediate, chunk.text.as_str())?; batch.push_str(chunk.text.as_str())?; index = index + 1; };
+    tui_delta(&mut coalesced, batch.as_str())?;
+    tui_assert(immediate.streaming.as_str() == coalesced.streaming.as_str() and tui_frame(&immediate)?.as_str() == tui_frame(&coalesced)?.as_str(), "coalescing adjacent deltas preserves Unicode and Markdown output exactly")?;
+    tui_finish(&mut immediate, false)?;
+    tui_assert(not immediate.busy and str_contains(immediate.messages.get(0).text.as_str(), "Tail"), "cancel preserves the complete visible partial answer")?;
+    let mut measured = tui_new("D:/fixture", "fixture", "fixture", "measure"); let mut batched = tui_new("D:/fixture", "fixture", "fixture", "measure");
+    tui_begin(&mut measured)?; tui_begin(&mut batched)?;
+    let chunk = "A long immutable prefix with 中文 and plain streamed text. "; let all = string_new(); index = 0; let started = time_unix_ms();
+    while index < 96 { tui_delta(&mut measured, chunk)?; all.push_str(chunk)?; index = index + 1; };
+    let unbatched_ms = time_unix_ms() - started; let batched_started = time_unix_ms();
+    tui_delta(&mut batched, all.as_str())?;
+    let batched_ms = time_unix_ms() - batched_started;
+    tui_assert(tui_frame(&measured)?.as_str() == tui_frame(&batched)?.as_str(), "long paragraph batching preserves the visible projection")?;
+    let report = cli_text("stream workload: 96 deltas reuse wrapped rows; individual_ms="); report.push_i64(unbatched_ms)?; report.push_str(", coalesced_ms=")?; report.push_i64(batched_ms)?; report.push_str(", append_update_bytes=")?; report.push_i64(extended.len())?; println(report.as_str());
+    let sample = "A long paragraph 中文 that wraps across rows and keeps é 👨‍👩‍👧‍👦 🇨🇳 stable while it grows. Another wrapped sentence then **bold** and `code`.\n# Heading\n| a | b |\n|---|---|\n| 中文 | é |\n```diff\n@@ -1,1 +1,1 @@\n-old\n+new\n```\n> quote\n---\nTail _name_ with a · separator\n";
+    let mut partition = 1;
+    while partition <= 3 {
+        let mut cached = tui_new("D:/fixture", "fixture", "fixture", "partition"); let mut reference = tui_new("D:/fixture", "fixture", "fixture", "partition"); tui_resize(&mut cached, 48, 20)?; tui_resize(&mut reference, 48, 20)?; tui_begin(&mut cached)?; tui_begin(&mut reference)?;
+        let source = cli_text(sample); let chars = source.chars(); let mut fragment = string_new(); let mut scalars = 0; let mut seed = 19;
+        loop { let next = chars.next(); if not next.is_some { break; }; fragment.push_char(next.value)?; scalars = scalars + 1;
+            let limit = if partition == 1 { 1 } else { if partition == 2 { 3 } else { seed % 11 + 1 } };
+            if scalars >= limit { reference.tail_plain = false; tui_delta(&mut cached, fragment.as_str())?; tui_delta(&mut reference, fragment.as_str())?;
+                tui_assert(tui_frame(&cached)?.as_str() == tui_frame(&reference)?.as_str(), "cached streaming equals full Markdown parsing at every scalar/random partition")?;
+                fragment.clear(); scalars = 0; seed = (seed * 17 + 3) % 1009;
+            };
+        }; chars.free();
+        if fragment.len() > 0 { reference.tail_plain = false; tui_delta(&mut cached, fragment.as_str())?; tui_delta(&mut reference, fragment.as_str())?; (); };
+        tui_assert(tui_frame(&cached)?.as_str() == tui_frame(&reference)?.as_str(), "partition final frame matches the uncached reference")?; partition = partition + 1;
+    };
+    tui_true()
+}
+
+def tui_resize_anchor_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "resize"); tui_resize(&mut app, 80, 30)?;
+    let mut index = 0; let mut selected = 0;
+    while index < 30 {
+        let text = cli_text("A paragraph whose words wrap into different line counts as the terminal width changes. 中文 Each entry has its own stable identity and an explicit end marker. END-"); text.push_i64(index)?;
+        tui_message(&mut app, "assistant", text.as_str())?;
+        if index == 12 { selected = app.messages.get(index).id; };
+        index = index + 1;
+    };
+    index = 0; let mut bottom = 0;
+    while index < app.transcript.len() { if app.transcript.get(index).message_id == selected { bottom = index + 1; }; index = index + 1; };
+    app.scroll = app.transcript.len() - bottom; tui_set_draft(&mut app, "preserved 中文 draft")?; tui_read(&mut app)?;
+    tui_assert(str_contains(tui_frame(&app)?.as_str(), "END-12"), "reader begins at the selected entry end")?;
+    tui_resize(&mut app, 120, 35)?;
+    tui_assert(str_contains(tui_frame(&app)?.as_str(), "END-12") and not str_contains(tui_frame(&app)?.as_str(), "END-13"), "80 to 120 columns preserves the selected message end")?;
+    tui_resize(&mut app, 160, 28)?;
+    tui_assert(str_contains(tui_frame(&app)?.as_str(), "END-12") and not str_contains(tui_frame(&app)?.as_str(), "END-13"), "120 to 160 columns preserves the selected message end")?;
+    tui_resize(&mut app, 80, 30)?;
+    tui_assert(str_contains(tui_frame(&app)?.as_str(), "END-12") and not str_contains(tui_frame(&app)?.as_str(), "END-13"), "return to 80 columns does not shift the reading entry")?;
+    tui_assert(app.reading.active and app.draft.as_str() == "preserved 中文 draft", "resize keeps reading focus and the original draft")?;
+    tui_begin(&mut app)?; tui_delta(&mut app, "Streaming begins and adds a newer message.\n")?;
+    tui_assert(tui_read_anchor(&app).message_id == selected and tui_read_anchor(&app).last_row, "starting a stream keeps the lower visible entry anchor")?;
+    tui_resize(&mut app, 120, 35)?;
+    tui_assert(tui_read_anchor(&app).message_id == selected and str_contains(tui_frame(&app)?.as_str(), "END-12") and not str_contains(tui_frame(&app)?.as_str(), "Streaming begins"), "completed entry anchor survives a live tail and resize")?;
+    app.scroll = 0; tui_resize(&mut app, 80, 30)?;
+    tui_assert(app.scroll == 0 and str_contains(tui_frame(&app)?.as_str(), "Streaming begins"), "following output remains at the live tail across resize")?;
+    tui_test_frame(&app)
+}
+
+def tui_conversation_origin_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "origin");
+    tui_message(&mut app, "user", "ORIGIN_USER 中文")?; tui_begin(&mut app)?;
+    tui_delta(&mut app, "ORIGIN_ANSWER")?;
+    let mut width = 80;
+    while width <= 160 {
+        tui_resize(&mut app, width, 35)?; let rows = tui_frame_rows(&app)?;
+        tui_assert(str_contains(rows.get(3).text.as_str(), "YOU") and str_contains(rows.get(4).text.as_str(), "ORIGIN_USER"), "short streaming conversation starts directly below header at every width")?;
+        tui_assert(str_contains(rows.get(7).text.as_str(), "ORIGIN_ANSWER") and str_trim(rows.get(app.height - 7).text.as_str())?.len() == 0, "unused conversation space follows the answer and retains composer spacer")?;
+        tui_test_frame(&app)?; width = width + 40;
+    };
+    tui_finish(&mut app, false)?;
+    let completed = tui_frame_rows(&app)?;
+    tui_assert(str_contains(completed.get(4).text.as_str(), "ORIGIN_USER"), "completion does not move a short conversation to the bottom")?;
+    tui_true()
+}
+
+def tui_provider_list_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "providers");
+    let models: Vec<UiCandidate> = vec_new(); let mut group = 0;
+    while group < 4 {
+        let id = cli_text("provider-"); id.push_i64(group)?;
+        let label = cli_text("供应商 "); label.push_i64(group)?;
+        let mut index = 0; let count = if group == 0 { 37 } else { 2 };
+        while index < count {
+            let model = cli_text("model-"); model.push_i64(index)?;
+            let value = cli_join(id.as_str(), "/")?; value.push_str(model.as_str())?;
+            models.push(UiCandidate { id: id.clone()?, label: model, detail: label.clone()?, value: value }); index = index + 1;
+        }; group = group + 1;
+    };
+    tui_set_draft(&mut app, "kept draft")?;
+    tui_set_candidates(&mut app, "models", "Models", models)?;
+    let down = tui_test_event(1, 1002, 0, ""); let up = tui_test_event(1, 1001, 0, "");
+    let mut index = 0;
+    while index < 43 {
+        let mut width = 80;
+        while width <= 160 {
+            tui_resize(&mut app, width, 22)?; tui_test_frame(&app)?;
+            let rows = tui_frame_rows(&app)?; let mut row = 0; let mut visible = false;
+            while row < rows.len() { if rows.get(row).style == 12 and str_contains(rows.get(row).text.as_str(), "› model-") { visible = true; }; row = row + 1; };
+            tui_assert(visible, "selected model remains visible while scrolling long provider groups")?;
+            width = width + 40;
+        };
+        tui_event(&mut app, &down)?; index = index + 1;
+    };
+    tui_assert(app.picker_selected == 0, "down crosses every provider and wraps only at the end of the complete catalog")?;
+    tui_event(&mut app, &up)?; tui_assert(app.picker_selected == 42, "up traverses across provider boundaries")?;
+    tui_set_draft(&mut app, "kept draft")?;
+    let escape = tui_test_event(1, 27, 0, ""); tui_event(&mut app, &escape)?;
+    tui_assert(app.draft.as_str() == "kept draft" and app.picker.len() == 0 and app.queue.len() == 0, "canceling a grouped model picker preserves draft and never submits")?;
+    tui_true()
+}
+
+def tui_tests() -> Result<i64, i64> {
+    tui_conversation_origin_tests()?;
+    tui_provider_list_tests()?;
+    image_ui_tests()?;
+    interaction_tests()?;
+    tui_resize_anchor_tests()?;
+    tui_cursor_paint_tests()?;
+    tui_stream_paint_tests()?;
+    let mut app = tui_new("D:/项目/中文😀", "test-api", "test-model", "fixture-session");
+    tui_assert(app.home and not app.busy, "initial state")?;
+    let home = tui_frame(&app)?;
+    tui_assert(str_contains(home.as_str(), "█████  █████") and str_contains(home.as_str(), "░") and str_contains(home.as_str(), "S E N C O D E") and str_contains(home.as_str(), "中文😀"), "centered dimensional monochrome wordmark")?;
+    app.busy = true; app.animation_tick = 0;
+    app.phase = cli_text("compacting"); tui_assert(not str_contains(tui_frame(&app)?.as_str(), "/  streaming"), "compaction has no streaming label")?;
+    let busy_rows = tui_frame_rows(&app)?;
+    tui_assert(not str_contains(busy_rows.get(app.height - 2).text.as_str(), "Thinking") and not str_contains(busy_rows.get(app.height - 2).text.as_str(), "Compacting") and not str_contains(busy_rows.get(app.height - 2).text.as_str(), "working"), "composer status omits the activity animation and label")?;
+    app.busy = false; app.phase.clear();
+    tui_test_frame(&app)?;
+    let paste = tui_test_event(2, 0, 0, "/mod"); tui_event(&mut app, &paste)?;
+    tui_assert(app.menu_open and app.matches.len() > 0, "slash opens matching menu")?;
+    let enter = tui_test_event(1, 13, 0, ""); let accepted = tui_event(&mut app, &enter)?;
+    tui_assert(accepted.kind == 0 and app.draft.as_str() == "/model " and not app.menu_open, "first Enter only completes")?;
+    let submitted = tui_event(&mut app, &enter)?;
+    tui_assert(submitted.kind == 1 and submitted.text.as_str() == "/model" and app.draft.len() == 0, "second Enter submits once")?;
+    tui_assert(tui_event(&mut app, &enter)?.kind == 0, "empty third Enter does not resubmit")?;
+    tui_set_draft(&mut app, "/ex")?; tui_event(&mut app, &enter)?;
+    tui_assert(app.draft.as_str() == "/quit ", "alias completion returns canonical command")?;
+    let parsed = slash_command("/exit"); tui_assert(parsed.is_ok and cli_json_string(parsed.value.root(), "command")?.as_str() == "/quit", "dispatch and menu use registry aliases")?;
+    tui_set_draft(&mut app, "/hooks")?; let gated = tui_event(&mut app, &enter)?;
+    tui_assert(gated.kind == 0 and app.menu_open and app.draft.as_str() == "/hooks" and app.status.len() > 0, "unavailable command cannot execute")?;
+    tui_enable_command(&mut app, "/new", true, "")?; tui_set_draft(&mut app, "/new")?; tui_event(&mut app, &enter)?;
+    tui_assert(app.draft.as_str() == "/new ", "host enables implemented capability")?;
+    let esc = tui_test_event(1, 27, 0, ""); tui_set_draft(&mut app, "/")?; tui_event(&mut app, &esc)?;
+    tui_assert(not app.menu_open, "Escape closes menu")?;
+    let move_left = tui_test_event(1, 1004, 0, ""); tui_event(&mut app, &move_left)?;
+    tui_assert(not app.menu_open, "cursor does not reopen dismissed menu")?;
+    tui_set_draft(&mut app, "")?; tui_message(&mut app, "user", "explain the code")?; tui_begin(&mut app)?;
+    tui_delta(&mut app, "Hello 中文")?;
+    tui_set_draft(&mut app, "/model test-next")?; let immediate = tui_event(&mut app, &enter)?;
+    tui_assert(immediate.kind == 1 and app.queue.len() == 0 and app.busy, "busy model selection is immediate and does not enter queue")?;
+    tui_set_draft(&mut app, "/goal pause")?; tui_assert(tui_event(&mut app, &enter)?.kind == 0 and app.draft.as_str() == "/goal pause ", "goal argument first Enter only completes")?;
+    tui_assert(tui_event(&mut app, &enter)?.kind == 1 and app.queue.len() == 0, "goal pause is immediately available while busy")?;
+    let typing = tui_test_event(2, 0, 0, "next 😀\nsecond line"); tui_event(&mut app, &typing)?;
+    tui_delta(&mut app, "😀\n```sg\nprintln(1);\n```")?;
+    tui_assert(app.draft.as_str() == "next 😀\nsecond line" and app.streaming.as_str() == "Hello 中文😀\n```sg\nprintln(1);\n```", "streaming preserves editable draft")?;
+    let queued = tui_event(&mut app, &enter)?;
+    tui_assert(queued.kind == 0 and app.queue.len() == 1 and app.draft.len() == 0, "busy Enter owns exactly one queue")?;
+    tui_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 1, "busy cannot drain queued work")?;
+    tui_set_draft(&mut app, "unsubmitted draft")?;
+    tui_finish(&mut app, false)?;
+    tui_assert(not app.busy and app.streaming.len() == 0 and app.messages.len() == 3 and app.messages.get(1).role.as_str() == "assistant" and app.messages.get(2).role.as_str() == "elapsed" and app.draft.as_str() == "unsubmitted draft", "finish retains partial stream, elapsed record and draft")?;
+    let queued_picker: Vec<UiCandidate> = vec_new(); queued_picker.push(UiCandidate { id: cli_text("one"), label: cli_text("model"), detail: string_new(), value: cli_text("one") });
+    tui_set_candidates(&mut app, "model", "Choose next target", queued_picker)?;
+    tui_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 1, "queued work waits while a picker owns focus")?; tui_close_picker(&mut app)?;
+    tui_set_approval(&mut app, "queued-focus", "Confirm?", false)?;
+    tui_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 1, "queued work waits while an approval owns focus")?; tui_event(&mut app, &esc)?;
+    app.queue_paused = false; let next = tui_take_submission(&mut app)?;
+    tui_assert(next.kind == 1 and next.text.as_str() == "next 😀\nsecond line" and app.queue.len() == 0 and tui_take_submission(&mut app)?.kind == 0, "queue drains once after finish")?;
+    tui_test_frame(&app)?;
+    let mut index = 0;
+    while index < 35 { let text = cli_text("history row "); text.push_i64(index)?; tui_message(&mut app, "assistant", text.as_str())?; index = index + 1; };
+    let tail = tui_frame(&app)?;
+    tui_assert(str_contains(tail.as_str(), "history row 34") and not str_contains(tail.as_str(), "history row 0\n"), "viewport shows tail")?;
+    tui_scroll(&mut app, 30)?; let before = app.scroll; tui_message(&mut app, "assistant", "new while reading")?;
+    tui_assert(app.scroll > before, "incoming message preserves history anchor")?;
+    let reading = tui_frame(&app)?; tui_assert(not str_contains(reading.as_str(), "new while reading"), "history reading does not jump to new output")?;
+    tui_scroll(&mut app, -100000)?; tui_assert(app.scroll == 0, "scroll clamps to bottom")?;
+    tui_resize(&mut app, 48, 15)?; tui_test_frame(&app)?;
+    tui_resize(&mut app, 16, 8)?; tui_test_frame(&app)?;
+    tui_resize(&mut app, 120, 40)?; tui_test_frame(&app)?;
+    tui_message(&mut app, "assistant", "safe\x1b[2J\x07\u202e text")?; tui_status(&mut app, "bad\x1b]0;title\x07")?; tui_test_frame(&app)?;
+    let candidates: Vec<UiCandidate> = vec_new();
+    candidates.push(UiCandidate { id: cli_text("one"), label: cli_text("模型 alpha"), detail: cli_text("connection A"), value: cli_text("model-a") });
+    candidates.push(UiCandidate { id: cli_text("two"), label: cli_text("模型 beta"), detail: cli_text("connection B"), value: cli_text("model-b") });
+    tui_set_candidates(&mut app, "model", "Choose a model", candidates)?;
+    let filter = tui_test_event(2, 0, 0, "beta"); tui_event(&mut app, &filter)?; tui_test_frame(&app)?;
+    let selection = tui_event(&mut app, &enter)?;
+    tui_assert(selection.kind == 4 and selection.context.as_str() == "model" and selection.text.as_str() == "model-b" and app.picker.len() == 0, "picker filtering and explicit selection")?;
+    tui_assert(app.draft.as_str() == "unsubmitted draft", "picker preserves composer")?;
+    let models: Vec<UiCandidate> = vec_new();
+    models.push(UiCandidate { id: cli_text("channel-a"), label: cli_text("model-one"), detail: cli_text("渠道 A"), value: cli_text("one") });
+    models.push(UiCandidate { id: cli_text("channel-a"), label: cli_text("model-two"), detail: cli_text("渠道 A"), value: cli_text("two") });
+    models.push(UiCandidate { id: cli_text("channel-b"), label: cli_text("model-three"), detail: cli_text("渠道 B"), value: cli_text("three") });
+    tui_set_candidates(&mut app, "models", "Models", models)?; tui_resize(&mut app, 120, 30)?;
+    let model_frame = tui_frame(&app)?;
+    tui_assert(str_contains(model_frame.as_str(), "渠道 A") and str_contains(model_frame.as_str(), "渠道 B") and str_contains(model_frame.as_str(), "model-one") and str_contains(model_frame.as_str(), "model-two") and str_contains(model_frame.as_str(), "model-three"), "grouped providers display every enabled model")?;
+    let right = tui_test_event(1, 1003, 0, ""); tui_event(&mut app, &right)?;
+    tui_assert(app.picker_selected == 2, "right moves to the adjacent channel without submitting")?;
+    tui_resize(&mut app, 32, 15)?; tui_test_frame(&app)?; tui_close_picker(&mut app)?;
+    tui_set_approval(&mut app, "nonce-1", "Write a new file?", false)?;
+    let premature = tui_test_event(2, 0, 0, "yes"); tui_event(&mut app, &premature)?;
+    let denied = tui_event(&mut app, &enter)?;
+    tui_assert(denied.kind == 5 and denied.context.as_str() == "nonce-1" and denied.text.as_str() == "no" and app.approval.len() == 0, "pasted yes cannot approve default-deny modal")?;
+    tui_set_approval(&mut app, "nonce-2", "Run tests?", false)?;
+    let up = tui_test_event(1, 1001, 0, ""); tui_event(&mut app, &up)?; tui_test_frame(&app)?;
+    let approved = tui_event(&mut app, &enter)?;
+    tui_assert(approved.kind == 5 and approved.context.as_str() == "nonce-2" and approved.text.as_str() == "yes", "explicit approval consumes current nonce")?;
+    tui_set_approval(&mut app, "nonce-3", "Which implementation?", true)?;
+    let answer = tui_test_event(2, 0, 0, "中文 answer"); tui_event(&mut app, &answer)?;
+    let response = tui_event(&mut app, &enter)?;
+    tui_assert(response.kind == 5 and response.text.as_str() == "中文 answer" and app.draft.as_str() == "unsubmitted draft", "question response has separate draft")?;
+    let wheel = TerminalMouseEvent { column: 1, row: 4, button: 0, action: 4, scroll_x: 0, scroll_y: 120, clicks: 0, modifiers: 0 };
+    tui_mouse(&mut app, &wheel)?; tui_assert(app.scroll > 0, "mouse wheel scrolls history")?;
+    let copied = tui_copy_text(&app)?; tui_assert(str_contains(copied.as_str(), "safe") and not str_contains(copied.as_str(), "\x1b"), "copy uses sanitized assistant output")?;
+    tui_set_draft(&mut app, "中😀xy")?; tui_event(&mut app, &move_left)?;
+    let erase = tui_test_event(1, 8, 0, ""); tui_event(&mut app, &erase)?;
+    tui_assert(app.draft.as_str() == "中😀y", "Unicode editing retains boundaries")?;
+    tui_set_draft(&mut app, "x👨‍👩‍👧‍👦🇨🇳")?; tui_event(&mut app, &erase)?;
+    tui_assert(app.draft.as_str() == "x👨‍👩‍👧‍👦", "Backspace deletes one complete flag")?; tui_event(&mut app, &erase)?;
+    tui_assert(app.draft.as_str() == "x", "Backspace deletes one complete ZWJ family")?;
+    tui_set_draft(&mut app, "́")?; let home_key = tui_test_event(1, 1005, 0, ""); tui_event(&mut app, &home_key)?;
+    let base = tui_test_event(2, 0, 0, "e"); tui_event(&mut app, &base)?;
+    tui_assert(app.draft.as_str() == "é" and app.cursor == 3, "insertion before a combining tail leaves a valid cursor")?; tui_event(&mut app, &erase)?;
+    tui_assert(app.draft.len() == 0 and app.cursor == 0, "joined cluster deletes as one unit")?;
+    tui_clear(&mut app)?; tui_assert(app.home and app.messages.len() == 0 and app.transcript.len() == 0, "new session clears transcript")?;
+    println("fullscreen UI: command registry, two-step Enter, streaming draft, queue, viewport, Unicode, gates and pickers passed"); cli_ok(0)
+}
+
+def main() -> i64 { let result = tui_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

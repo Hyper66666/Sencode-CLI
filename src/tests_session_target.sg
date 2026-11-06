@@ -1,0 +1,78 @@
+import session_target;
+import project_history;
+import command_line;
+
+def target_expect(ok: bool, label: &str) -> Result<bool, i64> {
+    if not ok { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def target_store(state: &CliState, id: &str) -> Result<bool, i64> {
+    let mut insert = state.db.prepare("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES(?,'customApi','managed',?,'{\"baseUrl\":\"https://fixture.invalid/v1\",\"protocol\":\"responses\",\"enabledModels\":[{\"id\":\"one\"},{\"id\":\"two\"}]}','one',1,1)")?;
+    insert.bind_text(1, id)?; insert.bind_text(2, id)?; insert.step()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def target_matches(value: &JsonDoc, connection: &str, model: &str, effort: &str) -> bool {
+    cli_json_optional_string(value.root(), "connection").as_str() == connection and cli_json_optional_string(value.root(), "model").as_str() == model and cli_json_optional_string(value.root(), "effort").as_str() == effort
+}
+
+def target_changes(state: &CliState) -> Result<i64, i64> {
+    let mut count = state.db.prepare("SELECT COUNT(*) FROM shared_changes")?; count.step()?;
+    Result { is_ok: true, value: count.integer(0)?, error: 0 }
+}
+
+def target_tests(database: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    target_store(&state, "target-a")?; target_store(&state, "target-b")?;
+    cli_state_set_default_connection(&state, "target-a")?;
+    let session = cli_state_create_session(&state, cli_current_directory()?.as_str())?;
+    target_expect(not session_target_restore(&state, session.as_str(), "", "", "")?.root().object_get("restored")?.bool_value()?, "new session keeps the default selection")?;
+    session_target_save(&state, session.as_str(), "target-b", "two", "xhigh")?;
+    target_expect(target_matches(&session_target_load(&state, session.as_str())?, "target-b", "two", "xhigh"), "selection without a model request is durable")?;
+    cli_state_set_default_connection(&state, "target-a")?;
+    target_expect(target_matches(&session_target_restore(&state, session.as_str(), "", "", "")?, "target-b", "two", "xhigh"), "global default does not override a saved target")?;
+    target_expect(target_matches(&session_target_restore(&state, session.as_str(), "target-a", "", "")?, "target-a", "", ""), "explicit supplier replaces the complete saved tuple")?;
+    target_expect(target_matches(&session_target_restore(&state, session.as_str(), "", "one", "")?, "target-b", "one", ""), "explicit model retains supplier and resets saved effort")?;
+    target_expect(target_matches(&session_target_restore(&state, session.as_str(), "", "", "low")?, "target-b", "two", "low"), "explicit effort overrides saved effort")?;
+    let mut running = cli_state_begin(&state, session.as_str(), "target-b", "two")?;
+    let user = json_parse("{\"role\":\"user\",\"content\":\"目标记忆 😀\"}")?; cli_state_append(&state, &running, &user)?;
+    let goal = json_parse("{\"requests\":17,\"tokens\":240,\"status\":2}")?;
+    cli_state_mode_save(&state, &running, "goal", &goal)?;
+    target_expect(not session_target_save(&state, session.as_str(), "target-a", "one", "low").is_ok(), "active execution forbids rewriting the remembered target")?;
+    target_expect(target_matches(&session_target_load(&state, session.as_str())?, "target-b", "two", "xhigh"), "active request target remains unchanged")?;
+    cli_state_finish(&state, &mut running, "idle")?;
+    session_target_save(&state, session.as_str(), "target-b", "two", "xhigh")?;
+    let before = target_changes(&state)?;
+    session_target_save(&state, session.as_str(), "target-b", "two", "xhigh")?;
+    target_expect(before == target_changes(&state)?, "unchanged target does not write changelog or session timestamps")?;
+    session_target_save(&state, session.as_str(), "target-a", "one", "")?;
+    target_expect(target_matches(&session_target_load(&state, session.as_str())?, "target-a", "one", "medium"), "default effort is normalized before persistence")?;
+    let modes = cli_state_modes(&state, session.as_str())?;
+    target_expect(modes.root().object_get("goal")?.object_get("requests")?.number_i64()? == 17 and modes.root().object_has("session_origin"), "single-member save preserves Goal budget and session origin")?;
+    let imported = project_history_import_modes(modes.serialize_string()?.as_str())?;
+    target_expect(cli_json_string(imported.root().object_get("cli_target")?, "effort")?.as_str() == "medium", "portable project history retains sanitized target metadata")?;
+    let branch = session_branch(&state, session.as_str(), "branch")?;
+    target_expect(target_matches(&session_target_load(&state, branch.as_str())?, "target-a", "one", "medium"), "branch inherits target")?;
+    let legacy = cli_state_create_session(&state, cli_current_directory()?.as_str())?;
+    let mut old = cli_state_begin(&state, legacy.as_str(), "target-b", "two")?; cli_state_finish(&state, &mut old, "idle")?;
+    target_expect(target_matches(&session_target_load(&state, legacy.as_str())?, "target-b", "two", ""), "legacy session falls back to existing selected columns")?;
+    state.db.exec("DELETE FROM connection_configs WHERE id='target-b'")?;
+    target_expect(target_matches(&session_target_restore(&state, legacy.as_str(), "", "", "")?, "target-b", "two", ""), "removed supplier stays explicit and does not borrow the default")?;
+    session_target_save(&state, legacy.as_str(), "target-b", "two", "xhigh")?;
+    target_expect(target_matches(&session_target_load(&state, legacy.as_str())?, "target-b", "two", "xhigh"), "unavailable target can still retain its previous effort")?;
+    let untrusted = json_parse("{\"schema\":1,\"connection\":\"target-a\",\"model\":\"one\",\"effort\":\"medium\",\"policy\":\"full\",\"secret\":\"not-portable\"}")?;
+    let safe = session_target_sanitize(untrusted.root())?;
+    target_expect(not safe.root().object_has("policy") and not safe.root().object_has("secret"), "selection metadata never imports permissions or secrets")?;
+    let invalid = json_parse("{\"cli_target\":{\"schema\":1,\"connection\":\"target-a\",\"model\":\"bad\\u001b[2J\",\"effort\":\"medium\"}}")?;
+    target_expect(not project_history_import_modes(invalid.serialize_string()?.as_str()).is_ok(), "portable target rejects terminal control injection")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", "").unwrap_or(string_new()); if database.len() == 0 { return 2; };
+    let tested = target_tests(database.as_str());
+    if not tested.is_ok() { println(tested.error); let error = sqlite_error_message(); if error.is_ok() { cli_diagnostic(error.value.as_str()); }; return 1; };
+    println("session target: idle selection, overrides, live isolation, budgets, branch, legacy and portable history passed"); 0
+}

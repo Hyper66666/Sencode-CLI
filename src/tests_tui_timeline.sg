@@ -1,0 +1,113 @@
+import tui;
+import tui_history;
+
+def timeline_assert(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; tui_true()
+}
+
+def timeline_order_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture/中文", "fixture", "fixture", "timeline"); tui_resize(&mut app, 120, 35)?;
+    tui_scroll(&mut app, 100)?; timeline_assert(app.scroll == 0, "empty history has no phantom live rows to scroll")?;
+    tui_begin(&mut app)?; tui_delta(&mut app, "BEFORE 中文 é 👨‍👩")?; let first = app.stream_id;
+    tui_tool(&mut app, "req/one", "read_file", "running", "AGENTS.md", "")?;
+    timeline_assert(app.messages.len() == 2 and app.messages.get(0).id == first and app.messages.get(0).role.as_str() == "assistant" and app.messages.get(1).tool_key.as_str() == "req/one", "tool start seals the earlier answer in place")?;
+    tui_delta(&mut app, "AFTER remains streaming")?; let second = app.stream_id;
+    tui_tool(&mut app, "req/one", "read_file", "completed", "", "")?;
+    timeline_assert(app.messages.len() == 2 and app.streaming.as_str() == "AFTER remains streaming" and app.stream_id == second and second != first, "tool completion updates in place without splitting later answer")?;
+    timeline_assert(app.messages.get(1).tool_detail.as_str() == "AGENTS.md", "terminal update retains original path")?;
+    tui_tool(&mut app, "req/one", "read_file", "running", "wrong", "")?;
+    timeline_assert(app.messages.len() == 2 and app.messages.get(1).tool_status.as_str() == "completed", "late running event cannot restart a terminal card")?;
+    tui_finish(&mut app, true)?;
+    timeline_assert(app.messages.len() == 4 and app.messages.get(2).id == second and app.messages.get(3).role.as_str() == "elapsed", "completed timeline has exactly one entry per segment and tool")?;
+    let frame = tui_frame(&app)?;
+    timeline_assert(str_index_of(frame.as_str(), "BEFORE") < str_index_of(frame.as_str(), "Explored") and str_index_of(frame.as_str(), "Explored") < str_index_of(frame.as_str(), "AFTER"), "screen order matches event order")?;
+    tui_begin(&mut app)?;
+    tui_tool(&mut app, "req2/one", "read_file", "running", "one.txt", "")?;
+    tui_tool(&mut app, "req2/two", "read_file", "running", "two.txt", "")?;
+    timeline_assert(app.messages.len() == 6, "same-name and cross-request calls have independent identities")?;
+    tui_tool(&mut app, "req2/one", "read_file", "failed", "", "missing file")?;
+    tui_finish(&mut app, false)?;
+    timeline_assert(app.messages.get(4).tool_status.as_str() == "failed" and app.messages.get(5).tool_status.as_str() == "interrupted", "cancellation preserves known failure and marks only unresolved calls interrupted")?;
+    tui_resize(&mut app, 80, 24)?; let narrow = tui_frame(&app)?;
+    timeline_assert(str_index_of(narrow.as_str(), "one.txt") < str_index_of(narrow.as_str(), "two.txt"), "resize retains chronological tool identity")?;
+    tui_begin(&mut app)?; tui_tool(&mut app, "req3/above", "read_file", "running", "above.txt", "")?;
+    let mut index = 0; while index < 30 { tui_message(&mut app, "assistant", "History being read, 中文 é 👨‍👩")?; index = index + 1; };
+    tui_scroll(&mut app, 24)?; let anchor = tui_read_anchor(&app);
+    tui_tool(&mut app, "req3/above", "read_file", "failed", "", "A growing error preview\nwith several rows\nabove the visible history")?;
+    let restored = tui_read_anchor(&app);
+    timeline_assert(anchor.message_id == restored.message_id and anchor.row == restored.row and app.scroll > 0, "updating an earlier tool preserves the reader's message and row anchor")?;
+    tui_true()
+}
+
+def timeline_animation_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "animation"); tui_resize(&mut app, 120, 35)?;
+    tui_begin(&mut app)?; tui_set_draft(&mut app, "my unchanged draft")?;
+    tui_tool(&mut app, "req/animated", "run_command", "running", "bash: build", "")?;
+    app.animation_tick = time_monotonic_ms() / 120;
+    // Start at a changing phase; the two middle star frames intentionally match.
+    app.animation_tick = app.animation_tick - app.animation_tick % 6; app.animate_tools = true;
+    tui_paint_update(&mut app, true)?;
+    app.animation_tick = app.animation_tick + 1;
+    let tick = tui_paint_update(&mut app, true)?;
+    timeline_assert(tick.len() > 0 and str_contains(tick.as_str(), "Working") and not str_contains(tick.as_str(), "run_command") and not str_contains(tick.as_str(), "╭") and not str_contains(tick.as_str(), "\x1b[?25"), "animation only repaints the conversation tail without borders or cursor visibility writes")?;
+    timeline_assert(app.draft.as_str() == "my unchanged draft" and app.cursor == app.draft.len() and app.scroll == 0, "motion preserves draft cursor and following position")?;
+    timeline_assert(not str_contains(tui_frame(&app)?.as_str(), "Thinking"), "no extra thinking row is introduced")?;
+    timeline_assert(tui_animation_due(&app, app.animation_tick + 1), "visible conversation activity schedules its next tick")?;
+    app.animate_tools = false; tui_paint_update(&mut app, true)?; app.animation_tick = app.animation_tick + 1;
+    let reduced = tui_paint_update(&mut app, true)?;
+    timeline_assert(not tui_animation_due(&app, app.animation_tick + 1) and reduced.len() == 0, "reduced motion stays static")?;
+    // An out-of-range scroll value alone does not put a short conversation
+    // offscreen. Fill a real viewport, then scroll away from its active tail.
+    let mut history = tui_new("D:/fixture", "fixture", "fixture", "offscreen"); tui_resize(&mut history, 120, 35)?;
+    let mut row = 0; while row < 40 { tui_message(&mut history, "assistant", "Earlier conversation content")?; row = row + 1; };
+    tui_begin(&mut history)?; history.animate_tools = true; tui_tool(&mut history, "req/hidden", "run_command", "running", "bash: build", "")?;
+    tui_scroll(&mut history, 10000)?; tui_paint_update(&mut history, true)?;
+    timeline_assert(history.scroll > 0 and not tui_animation_due(&history, history.animation_tick + 1), "offscreen activity performs no periodic repaint")?;
+    history.animation_tick = history.animation_tick + 1;
+    timeline_assert(tui_paint_update(&mut history, true)?.len() == 0, "hidden activity writes no terminal bytes")?;
+    app.animate_tools = true;
+    app.scroll = 0; tui_set_approval(&mut app, "permission", "Allow?", false)?;
+    timeline_assert(not tui_animation_due(&app, app.animation_tick + 1), "approval pauses decorative activity")?;
+    app.approval.clear(); app.animation_tick = (app.messages.get(0).tool_started + 2400) / 120;
+    timeline_assert(str_contains(tui_frame(&app)?.as_str(), "running  2s"), "slow tool retains an elapsed-time label")?;
+    tui_tool(&mut app, "req/animated", "run_command", "completed", "", "")?;
+    tui_finish(&mut app, true)?;
+    tui_paint_update(&mut app, true)?; app.animation_tick = app.animation_tick + 1;
+    let frozen = tui_paint_update(&mut app, true)?;
+    timeline_assert(not tui_animation_due(&app, app.animation_tick + 1) and frozen.len() == 0, "completed card freezes completely")?;
+    tui_finish(&mut app, true)?; tui_true()
+}
+
+def timeline_history_tests() -> Result<bool, i64> {
+    let history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"Inspect\"},{\"role\":\"assistant\",\"content\":\"HISTORY_BEFORE\",\"tool_calls\":[{\"id\":\"call1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"AGENTS.md\\\"}\"}]},{\"role\":\"tool\",\"tool_call_id\":\"call1\",\"content\":\"{\\\"is_error\\\":false,\\\"content\\\":\\\"ok\\\"}\"},{\"role\":\"assistant\",\"content\":\"HISTORY_AFTER\",\"tool_calls\":[{\"id\":\"call2\",\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"unknown\\\"}\"}]}]}")?;
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "resume"); tui_resize(&mut app, 120, 40)?;
+    tui_history_messages(&mut app, &history)?;
+    timeline_assert(app.messages.len() == 5 and app.messages.get(2).tool_status.as_str() == "completed" and app.messages.get(4).tool_status.as_str() == "interrupted", "resume reconstructs single cards and does not pretend incomplete calls are running")?;
+    let frame = tui_frame(&app)?;
+    timeline_assert(str_index_of(frame.as_str(), "HISTORY_BEFORE") < str_index_of(frame.as_str(), "Explored") and str_index_of(frame.as_str(), "Explored") < str_index_of(frame.as_str(), "HISTORY_AFTER"), "restored order agrees with live text/tool order")?;
+    timeline_assert(not app.busy and not tui_animation_due(&app, 1), "history restoration cannot start execution or animation")?;
+    let old = tui_read_anchor(&app); tui_resize(&mut app, 80, 24)?;
+    timeline_assert(app.scroll == 0 and old.message_id == 0, "resume and reflow remain at explicit follow position")?;
+    let malformed = json_parse("{\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"bad\",\"name\":\"run_command\",\"arguments\":\"{}\"}]},{\"role\":\"tool\",\"tool_call_id\":\"bad\",\"content\":\"unparseable outcome\"}]}")?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &malformed)?;
+    timeline_assert(app.messages.len() == 1 and app.messages.get(0).tool_status.as_str() == "interrupted", "missing structured terminal outcome can never become a successful card")?;
+    let wrong_bool = json_parse("{\"is_error\":\"false\"}")?; let wrong_unknown = json_parse("{\"is_error\":false,\"outcome_unknown\":null}")?;
+    timeline_assert(tui_tool_outcome(wrong_bool.root()) == 0 and tui_tool_outcome(wrong_unknown.root()) == 0, "malformed boolean metadata remains unknown without aborting history")?;
+    let recent = json_parse("{\"total_messages\":1008,\"offset\":1006,\"messages\":[{\"role\":\"user\",\"content\":\"Recent question\"},{\"role\":\"assistant\",\"content\":\"Latest 中文 sentinel\"}]}")?;
+    tui_clear(&mut app)?; tui_history_messages(&mut app, &recent)?;
+    tui_status(&mut app, "ready")?;
+    let window = tui_frame(&app)?;
+    timeline_assert(app.messages.len() == 2 and str_contains(window.as_str(), "Latest 中文 sentinel") and str_contains(window.as_str(), "Latest history / 1008 saved"), "recent history keeps its latest messages and a persistent window label")?;
+    tui_begin(&mut app)?;
+    timeline_assert(str_contains(tui_frame(&app)?.as_str(), "Latest history / 1008 saved"), "request status does not erase the history window label")?;
+    tui_finish(&mut app, false)?; tui_clear(&mut app)?;
+    timeline_assert(app.history_window.len() == 0, "a new session clears the previous history window label")?;
+    tui_true()
+}
+
+def main() -> i64 {
+    let order = timeline_order_tests(); if not order.is_ok { return 1; };
+    let motion = timeline_animation_tests(); if not motion.is_ok { return 1; };
+    let history = timeline_history_tests(); if not history.is_ok { return 1; };
+    println("tool timeline: ordered stream segments, stable calls, bounded motion, focus, terminal states and restored history passed"); 0
+}

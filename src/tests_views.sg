@@ -1,0 +1,24 @@
+import views;
+
+def main() -> i64 {
+    let connections = json_parse("{\"current\":\"custom-one\",\"connections\":[{\"id\":\"custom-one\",\"name\":\"本地 API\",\"model\":\"fixture\",\"protocol\":\"responses\",\"api_key\":\"never-show\"}]}");
+    if not connections.is_ok() { return 1; };
+    let shown = view_connections(&connections.value);
+    if not shown.is_ok() or not str_contains(shown.value.as_str(), "本地 API") or str_contains(shown.value.as_str(), "never-show") { return 1; };
+    let sessions = json_parse("{\"sessions\":[{\"id\":\"cli-1\",\"title\":\"修复 😀\",\"status\":\"idle\"}]}").unwrap_or(JsonDoc { handle: 0 });
+    let session_text = view_sessions(&sessions, "cli-1").unwrap_or(string_new());
+    if not str_contains(session_text.as_str(), "● cli-1") or not str_contains(session_text.as_str(), "修复 😀") { return 2; };
+    let messages = json_parse("{\"messages\":[{\"role\":\"assistant\",\"content\":\"Hello 世界😀\"}]}").unwrap_or(JsonDoc { handle: 0 });
+    let context = view_context(&messages).unwrap_or(string_new());
+    if not str_contains(context.as_str(), "[assistant] Hello 世界😀") { return 3; };
+    let recent = json_parse("{\"total_messages\":1008,\"offset\":1007,\"messages\":[{\"role\":\"assistant\",\"content\":\"Latest 中文\"}]}").unwrap_or(JsonDoc { handle: 0 });
+    let recent_text = view_context(&recent).unwrap_or(string_new());
+    if not str_contains(recent_text.as_str(), "1008 saved messages") or not str_contains(recent_text.as_str(), "[assistant] Latest 中文") { return 6; };
+    let plan = view_status(true, true, true, true, "model").unwrap_or(string_new());
+    if not str_contains(plan.as_str(), "PLAN · read only") or str_contains(plan.as_str(), "auto edit") or str_contains(plan.as_str(), "commands allowed") { return 4; };
+    let usage = json_parse("{\"usage\":[{\"connection\":\"one\",\"model\":\"fixture\",\"requests\":2,\"input_tokens\":40,\"output_tokens\":10}]}").unwrap_or(JsonDoc { handle: 0 });
+    let usage_text = view_usage(&usage).unwrap_or(string_new());
+    if not str_contains(usage_text.as_str(), "not remaining quota") or not str_contains(usage_text.as_str(), "2 requests · 40 input · 10 output tokens") { return 5; };
+    println("readable session/model/mode views and allowlisted metadata passed");
+    0
+}

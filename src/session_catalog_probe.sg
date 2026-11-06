@@ -1,0 +1,39 @@
+import sessions;
+import local_prompts;
+import project_history;
+import command_line;
+
+// Isolated fixture entry points only; never linked into the product command.
+def session_catalog_probe() -> Result<i64,i64> {
+    let database=cli_argument(0)?;let cwd=cli_argument(1)?;let action=cli_argument(2)?;
+    if action.as_str()=="title" {let text=cli_argument(3)?;println(session_title(text.as_str())?.as_str());return cli_ok(0);};
+    if action.as_str()=="sanitize" {let raw=cli_argument(3)?;println(project_history_import_modes(raw.as_str())?.serialize_string()?.as_str());return cli_ok(0);};
+    if action.as_str()=="sql-source" {println(session_children_sql());return cli_ok(0);};
+    let state=cli_state_open(database.as_str())?;
+    if action.as_str()=="init" {return cli_ok(0);};
+    if action.as_str()=="create" {println(cli_state_create_session(&state,cwd.as_str())?.as_str());return cli_ok(0);};
+    if action.as_str()=="child" {let parent=cli_argument(3)?;println(cli_state_create_child_session(&state,cwd.as_str(),parent.as_str())?.as_str());return cli_ok(0);};
+    if action.as_str()=="append" {
+        let id=cli_argument(3)?;let text=cli_argument(4)?;let mut execution=cli_state_begin(&state,id.as_str(),"fixture","fixture")?;
+        let message=json_doc_object()?;cli_put_string(&message,message.root(),"role","user")?;cli_put_string(&message,message.root(),"content",text.as_str())?;
+        cli_state_append(&state,&execution,&message)?;cli_state_finish(&state,&mut execution,"idle")?;return cli_ok(0);
+    };
+    if action.as_str()=="stream" {
+        let id=cli_argument(3)?;let raw=cli_argument(4)?;let message=json_parse(raw.as_str())?;
+        let mut execution=cli_state_begin(&state,id.as_str(),"fixture","fixture")?;
+        let streaming=cli_state_stream_start(&state,&execution)?;
+        cli_state_stream_finish(&state,&execution,streaming.as_str(),&message)?;cli_state_finish(&state,&mut execution,"idle")?;return cli_ok(0);
+    };
+    if action.as_str()=="history" {let id=cli_argument(3)?;println(cli_state_history(&state,id.as_str())?.serialize_string()?.as_str());return cli_ok(0);};
+    if action.as_str()=="rename" {let id=cli_argument(3)?;let text=cli_argument(4)?;session_rename(&state,id.as_str(),text.as_str())?;return cli_ok(0);};
+    if action.as_str()=="branch" {let id=cli_argument(3)?;let text=cli_argument(4)?;println(session_branch(&state,id.as_str(),text.as_str())?.as_str());return cli_ok(0);};
+    if action.as_str()=="eligible" {let id=cli_argument(3)?;println(if cli_state_session_resumable(&state,cwd.as_str(),id.as_str())? {"true"}else{"false"});return cli_ok(0);};
+    if action.as_str()=="member" {let id=cli_argument(3)?;println(if cli_state_session_in_project(&state,cwd.as_str(),id.as_str())? {"true"}else{"false"});return cli_ok(0);};
+    if action.as_str()=="prompts" {println(local_prompt_history(&state,cwd.as_str(),"")?.serialize_string()?.as_str());return cli_ok(0);};
+    let result=if action.as_str()=="agents" {cli_state_agent_sessions(&state,cwd.as_str())?}else{cli_state_resumable_sessions(&state,cwd.as_str())?};
+    println(result.serialize_string()?.as_str());cli_ok(0)
+}
+
+def main() -> i64 {
+    let result=session_catalog_probe();if not result.is_ok {println(result.error);let detail=sqlite_error_message();if detail.is_ok(){cli_diagnostic(detail.value.as_str());};return 1;};result.value
+}

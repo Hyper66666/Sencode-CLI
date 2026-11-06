@@ -1,0 +1,161 @@
+import common;
+import std::terminal;
+import std::system;
+import std::process;
+import std::env;
+import std::time;
+import std::file;
+
+// Public protocol fixture only. It never logs in, opens account files or makes
+// a model request. Copies run under the two fixed executable basenames.
+struct ManagedFixture { codex: bool, active: bool, approval: bool, slow: bool, started: i64 }
+
+def fixture_emit(document: &JsonDoc) -> Result<bool, i64> {
+    let text = document.serialize_string()?; io_stdout_write(text.as_str())?; io_stdout_write("\n")?; io_stdout_flush()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def fixture_reply(id: JsonValue, result: &JsonDoc) -> Result<bool, i64> {
+    let response = json_doc_object()?; cli_put_string(&response, response.root(), "jsonrpc", "2.0")?;
+    response.root().object_set("id", response.copy(id)?)?; response.root().object_set("result", response.copy(result.root())?)?;
+    fixture_emit(&response)
+}
+
+def fixture_notify(method: &str, params: &JsonDoc) -> Result<bool, i64> {
+    let response = json_doc_object()?; cli_put_string(&response, response.root(), "jsonrpc", "2.0")?;
+    cli_put_string(&response, response.root(), "method", method)?; response.root().object_set("params", response.copy(params.root())?)?;
+    fixture_emit(&response)
+}
+
+def fixture_delta(codex: bool, text: &str) -> Result<bool, i64> {
+    if codex {
+        let params = json_parse("{\"threadId\":\"fixture-thread\",\"turnId\":\"fixture-turn\",\"itemId\":\"answer\"}")?;
+        cli_put_string(&params, params.root(), "delta", text)?;
+        return fixture_notify("item/agentMessage/delta", &params);
+    };
+    let params = json_parse("{\"sessionId\":\"fixture-session\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\"}}}")?;
+    cli_put_string(&params, params.root().object_get("update")?.object_get("content")?, "text", text)?;
+    fixture_notify("session/update", &params)
+}
+
+def fixture_tool(codex: bool, completed: bool) -> Result<bool, i64> {
+    if codex {
+        let params = json_parse("{\"threadId\":\"fixture-thread\",\"turnId\":\"fixture-turn\",\"item\":{\"id\":\"tool-one\",\"type\":\"fileChange\",\"changes\":[],\"status\":\"inProgress\"}}")?;
+        if completed { cli_put_string(&params, params.root().object_get("item")?, "status", "completed")?; (); };
+        return fixture_notify(if completed { "item/completed" } else { "item/started" }, &params);
+    };
+    let params = json_parse("{\"sessionId\":\"fixture-session\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"tool-one\",\"title\":\"Write approved fixture\",\"kind\":\"edit\",\"status\":\"in_progress\"}}")?;
+    if completed { cli_put_string(&params, params.root().object_get("update")?, "sessionUpdate", "tool_call_update")?; cli_put_string(&params, params.root().object_get("update")?, "status", "completed")?; (); };
+    fixture_notify("session/update", &params)
+}
+
+def fixture_approval(codex: bool) -> Result<bool, i64> {
+    let request = if codex {
+        json_parse("{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"item/fileChange/requestApproval\",\"params\":{\"threadId\":\"fixture-thread\",\"turnId\":\"fixture-turn\",\"itemId\":\"tool-one\",\"startedAtMs\":1,\"reason\":\"Write managed-approved.txt\",\"grantRoot\":null}}")?
+    } else {
+        json_parse("{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"fixture-session\",\"toolCall\":{\"toolCallId\":\"tool-one\",\"title\":\"Write managed-approved.txt\",\"kind\":\"edit\",\"status\":\"pending\"},\"options\":[{\"optionId\":\"opaque-always\",\"name\":\"Always\",\"kind\":\"allow_always\"},{\"optionId\":\"opaque-once\",\"name\":\"Once\",\"kind\":\"allow_once\"},{\"optionId\":\"opaque-reject\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}")?
+    };
+    fixture_emit(&request)
+}
+
+def fixture_complete(state: &mut ManagedFixture) -> Result<bool, i64> {
+    fixture_delta(state.codex, "中文😀")?;
+    if state.codex {
+        let item = json_parse("{\"threadId\":\"fixture-thread\",\"turnId\":\"fixture-turn\",\"item\":{\"id\":\"answer\",\"type\":\"agentMessage\",\"text\":\"managed 中文😀\",\"phase\":\"final_answer\"}}")?;
+        fixture_notify("item/completed", &item)?;
+        let done = json_parse("{\"threadId\":\"fixture-thread\",\"turn\":{\"id\":\"fixture-turn\",\"status\":\"completed\",\"items\":[],\"error\":null}}")?;
+        fixture_notify("turn/completed", &done)?;
+        ();
+    } else {
+        let response = json_parse("{\"jsonrpc\":\"2.0\",\"id\":\"prompt\",\"result\":{\"stopReason\":\"end_turn\"}}")?;
+        fixture_emit(&response)?;
+        ();
+    };
+    state.active = false;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def fixture_accept(state: &mut ManagedFixture, line: &str) -> Result<bool, i64> {
+    let request = json_parse(line)?;
+    let method = cli_json_optional_string(request.root(), "method");
+    if method.len() == 0 {
+        if request.root().object_has("id") and request.root().object_get("id")?.number_i64().unwrap_or(0) == 71 and state.approval {
+            let result = request.root().object_get("result")?;
+            let allowed = if state.codex { cli_json_optional_string(result, "decision").as_str() == "accept" } else { cli_json_optional_string(result.object_get("outcome")?, "optionId").as_str() == "opaque-once" };
+            if allowed { file_write_str("managed-approved.txt", "managed approved 中文😀")?; (); };
+            fixture_tool(state.codex, true)?;
+            state.approval = false;
+        };
+        return Result { is_ok: true, value: true, error: 0 };
+    };
+    if method.as_str() == "initialize" {
+        if env_has_var("SENCODE_FIXTURE_PROVIDER_SECRET") or env_has_var("OPENAI_API_KEY") or env_has_var("ANTHROPIC_API_KEY") or env_has_var("CODEX_API_KEY") { return Result { is_ok: true, value: false, error: 0 }; };
+        file_write_str("managed-env.txt", "OS environment allowlist; provider secrets absent")?;
+        let profile_buffer = ffi_buffer_new(32768)?;
+        let profile_count = env_var_copy(if state.codex { "CODEX_HOME" } else { "GROK_HOME" }, profile_buffer)?;
+        let profile = string_from_buffer(profile_buffer, profile_count)?;
+        let result = if state.codex {
+            let value = json_parse("{\"platformFamily\":\"windows\",\"platformOs\":\"windows\",\"userAgent\":\"codex/0.144.4 (public fixture)\"}")?;
+            cli_put_string(&value, value.root(), "codexHome", if file_exists("fixture-wrong-home") { "C:/unexpected-profile" } else { profile.as_str() })?;
+            if file_exists("fixture-bad-version") { cli_put_string(&value, value.root(), "userAgent", "codex/0.144.5 (public fixture)")?; (); };
+            value
+        } else {
+            let value = json_parse("{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false},\"agentInfo\":{\"name\":\"Sencode public fixture\",\"version\":\"0.2.102\"},\"authMethods\":[]}")?;
+            if file_exists("fixture-bad-version") { cli_put_i64(&value, value.root(), "protocolVersion", 2)?; (); };
+            value
+        };
+        let pid = cli_text(""); pid.push_i64(process_id())?; file_write_str("managed.pid", pid.as_str())?;
+        return fixture_reply(request.root().object_get("id")?, &result);
+    };
+    if method.as_str() == "initialized" { return Result { is_ok: true, value: true, error: 0 }; };
+    if method.as_str() == "thread/start" or method.as_str() == "session/new" {
+        let result = if state.codex { json_parse("{\"thread\":{\"id\":\"fixture-thread\",\"turns\":[]}}")? } else { json_parse("{\"sessionId\":\"fixture-session\"}")? };
+        return fixture_reply(request.root().object_get("id")?, &result);
+    };
+    if method.as_str() == "turn/start" or method.as_str() == "session/prompt" {
+        let params = request.root().object_get("params")?;
+        let text = cli_json_string(params.object_get(if state.codex { "input" } else { "prompt" })?.array_get(0)?, "text")?;
+        file_write_str("managed-context.txt", text.as_str())?;
+        if state.codex { let result = json_parse("{\"turn\":{\"id\":\"fixture-turn\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}")?; fixture_reply(request.root().object_get("id")?, &result)?; (); };
+        if file_exists("fixture-crash") { return Result { is_ok: true, value: false, error: 0 }; };
+        state.active = true; state.started = time_unix_ms(); state.slow = str_ends_with(text.as_str(), "slow managed");
+        state.approval = str_ends_with(text.as_str(), "approve managed") or str_ends_with(text.as_str(), "deny managed");
+        fixture_delta(state.codex, "managed ")?;
+        if state.approval { fixture_tool(state.codex, false)?; fixture_approval(state.codex)?; (); };
+        if file_exists("fixture-wrong-session") {
+            let wrong = if state.codex { json_parse("{\"threadId\":\"wrong-thread\",\"turnId\":\"fixture-turn\",\"itemId\":\"wrong\",\"delta\":\"must not appear\"}")? } else { json_parse("{\"sessionId\":\"wrong-session\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"must not appear\"}}}")? };
+            fixture_notify(if state.codex { "item/agentMessage/delta" } else { "session/update" }, &wrong)?;
+            ();
+        };
+        if file_exists("fixture-malformed") { io_stdout_write("[]\n")?; io_stdout_flush()?; (); };
+        return Result { is_ok: true, value: true, error: 0 };
+    };
+    if method.as_str() == "turn/interrupt" or method.as_str() == "session/cancel" { file_write_str("managed-cancelled.txt", "cancelled")?; return Result { is_ok: true, value: false, error: 0 }; };
+    if request.root().object_has("id") { let result = json_doc_object()?; fixture_reply(request.root().object_get("id")?, &result)?; (); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def managed_fixture_main() -> Result<bool, i64> {
+    let executable = current_executable_string()?;
+    let mut state = ManagedFixture { codex: str_contains(executable.as_str(), "codex-app-server"), active: false, approval: false, slow: false, started: 0 };
+    let terminal = terminal_open()?;
+    let partial = string_new();
+    loop {
+        let event = terminal.read_event(1)?;
+        if event.kind == 5 or event.kind == 4 { break; };
+        if event.kind == 1 {
+            if event.code == 10 {
+                let line = partial.clone()?; partial.clear();
+                if line.len() > 0 and not fixture_accept(&mut state, line.as_str())? { break; };
+            } else { if event.code != 13 { partial.push_str(event.data.as_str())?; (); }; };
+        };
+        if state.active and not state.approval and not state.slow and time_since_ms(state.started) >= 150 { fixture_complete(&mut state)?; (); };
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let result = managed_fixture_main();
+    if not result.is_ok() { cli_diagnostic("Public protocol fixture failed"); return 1; };
+    0
+}

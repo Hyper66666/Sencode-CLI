@@ -1,0 +1,28 @@
+import tui;
+
+// A console-only UI driver: no application storage, credentials or providers.
+def editor_console_fixture() -> Result<i64, i64> {
+    let terminal = terminal_open()?; terminal.enter_fullscreen()?;
+    let mut app = tui_new("D:/editor-fixture/中文", "fixture-only", "test-model", "test-session");
+    let mut ticks = 0; let mut counter = 0;
+    loop {
+        tui_paint(&terminal, &mut app)?;
+        let action = tui_poll(&terminal, &mut app, 10)?;
+        if action.kind == 3 { break; };
+        if action.kind == 2 { tui_finish(&mut app, false)?; (); };
+        if action.kind == 5 { tui_status(&mut app, if action.text.as_str() == "no" { "FIXTURE PERMISSION DENIED" } else { "FIXTURE PERMISSION ALLOWED" })?; (); };
+        if action.kind == 1 {
+            if action.text.as_str() == "/quit" or action.text.as_str() == "/exit" { break; };
+            if action.text.as_str() == "stream" { tui_message(&mut app, "user", "stream")?; tui_begin(&mut app)?; ticks = 0; } else {
+                if action.text.as_str() == "approval" { tui_set_approval(&mut app, "editor-console-approval", "Synthetic edit needs fresh confirmation", false)?; (); } else { tui_message(&mut app, "user", action.text.as_str())?; (); };
+            }; ();
+        };
+        if app.busy {
+            ticks = ticks + 1;
+            if ticks % 4 == 0 { let line = cli_text("editor stream line "); line.push_i64(counter)?; line.push_str("  中文\n")?; counter = counter + 1; tui_delta(&mut app, line.as_str())?; (); };
+        };
+    };
+    terminal.leave_fullscreen()?; cli_ok(0)
+}
+
+def main() -> i64 { let result = editor_console_fixture(); if not result.is_ok { return result.error; }; result.value }

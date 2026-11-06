@@ -1,0 +1,82 @@
+import engine_control;
+
+// Actor-local host metadata, never a key event. Raw-TTY callers are no-ops so
+// this private record cannot be replayed by the line editor as user input.
+// Numeric error codes retain their published meaning; stage/reason add context.
+def execution_diagnostic_reset(input: &Vec<TerminalEvent>) {
+    if engine_control_enabled(input) { engine_control_remove(input, 98); };
+}
+
+def execution_diagnostic_saved(input: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+    let index = engine_control_slot(input, 98);
+    if not engine_control_enabled(input) or index < 0 { return json_doc_object(); };
+    let record: &TerminalEvent = input.get(index);
+    json_parse(record.data.as_str())
+}
+
+def execution_diagnostic_store(input: &Vec<TerminalEvent>, document: &JsonDoc) -> Result<bool, i64> {
+    if not engine_control_enabled(input) { return Result { is_ok: true, value: false, error: 0 }; };
+    let encoded = document.serialize_string()?;
+    engine_control_remove(input, 98);
+    if not input.push(engine_control_record(98, 0, encoded.as_str())) { return Result { is_ok: false, value: false, error: 8 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def execution_diagnostic_stage(input: &Vec<TerminalEvent>, stage: &str, tool: &str, call_id: &str) -> Result<bool, i64> {
+    if not engine_control_enabled(input) { return Result { is_ok: true, value: false, error: 0 }; };
+    let document = execution_diagnostic_saved(input)?;
+    // Cleanup must not replace the original terminal failure's attribution.
+    if document.root().object_has("reason") { return Result { is_ok: true, value: false, error: 0 }; };
+    cli_put_string(&document, document.root(), "stage", stage)?;
+    cli_put_string(&document, document.root(), "tool", tool)?;
+    cli_put_string(&document, document.root(), "call_id", call_id)?;
+    execution_diagnostic_store(input, &document)
+}
+
+def execution_diagnostic_failure(input: &Vec<TerminalEvent>, reason: &str, stage: &str, tool: &str, call_id: &str, outcome_unknown: bool) -> Result<bool, i64> {
+    if not engine_control_enabled(input) { return Result { is_ok: true, value: false, error: 0 }; };
+    let document = execution_diagnostic_saved(input)?;
+    if document.root().object_has("reason") {
+        // Retain the first cause; later cleanup uncertainty may strengthen,
+        // never weaken, the no-replay requirement.
+        if outcome_unknown { cli_put_bool(&document, document.root(), "outcome_unknown", true)?; return execution_diagnostic_store(input, &document); };
+        return Result { is_ok: true, value: false, error: 0 };
+    };
+    cli_put_string(&document, document.root(), "reason", reason)?;
+    cli_put_string(&document, document.root(), "stage", stage)?;
+    cli_put_string(&document, document.root(), "tool", tool)?;
+    cli_put_string(&document, document.root(), "call_id", call_id)?;
+    cli_put_bool(&document, document.root(), "outcome_unknown", outcome_unknown)?;
+    execution_diagnostic_store(input, &document)
+}
+
+def execution_diagnostic_document(input: &Vec<TerminalEvent>, code: i64) -> Result<JsonDoc, i64> {
+    let document = execution_diagnostic_saved(input)?;
+    let stage = cli_json_optional_string(document.root(), "stage");
+    if not document.root().object_has("reason") {
+        let reason = if code == 19 { "cancelled" } else { if stage.as_str() == "provider" { "provider_request" } else { if stage.as_str() == "budget" { "budget" } else { if stage.as_str() == "context" { "context" } else { if stage.as_str() == "tool" or stage.as_str() == "tool_commit" { "tool_failed" } else { "execution_failed" } } } } };
+        cli_put_string(&document, document.root(), "reason", reason)?;
+        ();
+    };
+    cli_put_i64(&document, document.root(), "schema", 1)?;
+    cli_put_i64(&document, document.root(), "code", code)?;
+    let unknown = document.root().object_has("outcome_unknown") and document.root().object_get("outcome_unknown")?.bool_value()?;
+    cli_put_bool(&document, document.root(), "automatic_replay_forbidden", unknown)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def execution_diagnostic_content(document: &JsonDoc) -> Result<String, i64> {
+    let reason = cli_json_optional_string(document.root(), "reason");
+    let unknown = document.root().object_has("outcome_unknown") and document.root().object_get("outcome_unknown")?.bool_value()?;
+    let text = cli_text(if unknown { "Execution paused: a tool outcome or process cleanup is unverified. Inspect the recorded outcome before retrying; automatic replay is forbidden." } else {
+        if reason.as_str() == "provider_request" { "Model request failed. Completed tool results were retained; check the request details before continuing." } else {
+        if reason.as_str() == "budget" { "Execution paused because its request or token budget could not continue." } else {
+        if reason.as_str() == "context" { "Execution paused because complete model context could not be prepared; history was retained." } else {
+        if reason.as_str() == "permission_required" { "Execution paused awaiting permission." } else {
+        if reason.as_str() == "cancelled" { "Execution paused / cancelled." } else {
+        if reason.as_str() == "ownership_lost" { "Execution paused because session ownership changed; inspect the current executor before resuming." } else {
+        if reason.as_str() == "tool_failed" { "Tool execution failed; inspect the recorded tool details." } else { "Execution failed; inspect its recorded stage and error code." } } } } } } }
+    });
+    text.push_str(" (code ")?; text.push_i64(cli_json_optional_i64(document.root(), "code", 1))?; text.push_str(")")?;
+    Result { is_ok: true, value: text, error: 0 }
+}

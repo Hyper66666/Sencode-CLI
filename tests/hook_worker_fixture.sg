@@ -1,0 +1,32 @@
+import hook_sdk;
+import std::process;
+import std::time;
+
+def hook_fixture()->Result<i64,i64>{
+    let initialize=hook_sdk_read()?;hook_sdk_ready(&initialize)?;let event=hook_sdk_read()?;
+    let input=event.root().object_get("input")?;let mut mode=cli_json_optional_string(input,"hook_fixture_mode");
+    if cli_json_string(event.root(),"event")?.as_str()=="after_tool" and input.object_has("hook_fixture_after_mode"){mode=cli_json_string(input,"hook_fixture_after_mode")?;};
+    let sentinel=cli_json_optional_string(input,"hook_fixture_sentinel");
+    if sentinel.len()>0{file_append_str(sentinel.as_str(),"worker started\n")?; ();};
+    if mode.as_str()=="crash"{return cli_ok(5);};
+    if mode.as_str()=="sleep"{time_sleep_ms(30000); ();};
+    if mode.as_str()=="tree"{
+        let command=process_command("powershell.exe")?;command.arg("-NoProfile")?;command.arg("-NonInteractive")?;command.arg("-Command")?;
+        let script=cli_text("Start-Sleep -Milliseconds 1800; Set-Content -LiteralPath '");script.push_str(sentinel.as_str())?;script.push_str(".grandchild' -Value escaped; Start-Sleep -Seconds 30")?;command.arg(script.as_str())?;let descendant=command.spawn_piped()?;
+        time_sleep_ms(30000);return cli_ok(0);
+    };
+    if mode.as_str()=="stderr"{let mut count=0;while count<2000{io_stderr_write("stderr is private diagnostic data not forwarded to provider context\n")?;count=count+1;};};
+    let id=cli_json_string(event.root(),"id")?;let worker=cli_json_string(event.root(),"worker_id")?;let digest=cli_json_string(event.root(),"manifest_sha256")?;
+    if mode.as_str()=="host_call"{let call=hook_frame("host_call",id.as_str(),worker.as_str(),digest.as_str())?;hook_sdk_write(&call)?;let reply=hook_sdk_read()?;if cli_json_string(reply.root(),"type")?.as_str()!="unsupported"{return cli_ok(6);};};
+    if mode.as_str()=="malformed"{io_stdout_write("not-json\n")?;return cli_ok(0);};
+    if mode.as_str()=="oversized"{let mut count=0;while count<5000{io_stdout_write("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")?;count=count+1;};io_stdout_write("\n")?;return cli_ok(0);};
+    let result=hook_sdk_result(&event,if mode.as_str()=="block"{"block"}else{"continue"},if mode.as_str()=="block"{"fixture veto"}else{""},"中文😀 worker notice")?;
+    if mode.as_str()=="wrong_id"{cli_put_string(&result,result.root(),"id","stale-id")?; ();};
+    if mode.as_str()=="unknown"{cli_put_string(&result,result.root(),"grant","allow-shell")?; ();};
+    if mode.as_str()=="fragment"{
+        let text=result.serialize_string()?;let mut index=0;while index<text.len(){io_stdout_write_raw(sengoo_stdlib_str_ptr(text.as_str())+index,1)?;io_stdout_flush()?;index=index+1;};io_stdout_write("\n")?; ();
+    }else{hook_sdk_write(&result)?; ();};
+    if mode.as_str()=="duplicate"{hook_sdk_write(&result)?; ();};
+    if mode.as_str()=="exit_after_result"{return cli_ok(5);};cli_ok(0)
+}
+def main()->i64{let result=hook_fixture();if result.is_ok(){result.value}else{1}}

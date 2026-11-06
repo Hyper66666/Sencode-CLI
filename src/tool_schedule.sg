@@ -1,0 +1,173 @@
+import tool_spec;
+
+// Single-owner, bounded dispatch state. This module never executes a tool and
+// never replaces the durable per-session ledger. Arguments are complete and
+// validated here; permission and durable claims remain the host's obligation.
+// Entry states: 0 queued, 1 running, 2 canceling, 3 completed, 4 canceled,
+// 5 skipped because its explicit predecessor did not succeed.
+struct ToolScheduledCall {
+    id: String,
+    name: String,
+    safe_read: bool,
+    predecessor: i64,
+    // phase, successful result
+    state: Vec<i64>,
+}
+
+struct ToolSchedule {
+    calls: Vec<ToolScheduledCall>,
+    // parallel limit, sealed, canceled, active jobs, next result ordinal
+    control: Vec<i64>,
+}
+
+def tool_schedule_bool(value: bool, error: i64) -> Result<bool, i64> {
+    Result { is_ok: error == 0, value: value, error: error }
+}
+
+def tool_schedule_new(parallel_limit: i64) -> Result<ToolSchedule, i64> {
+    let valid = parallel_limit >= 1 and parallel_limit <= 8;
+    let calls: Vec<ToolScheduledCall> = vec_new();
+    let control: Vec<i64> = vec_new();
+    control.push(if valid { parallel_limit } else { 1 });
+    control.push(0); control.push(0); control.push(0); control.push(0);
+    Result { is_ok: valid, value: ToolSchedule { calls: calls, control: control }, error: if valid { 0 } else { 2 } }
+}
+
+def tool_schedule_find(schedule: &ToolSchedule, id: &str) -> i64 {
+    let mut ordinal = 0;
+    while ordinal < schedule.calls.len() {
+        let call: &ToolScheduledCall = schedule.calls.get(ordinal);
+        if call.id.as_str() == id { return ordinal; };
+        ordinal = ordinal + 1;
+    };
+    -1
+}
+
+def tool_schedule_state(schedule: &ToolSchedule, ordinal: i64) -> i64 {
+    if ordinal < 0 or ordinal >= schedule.calls.len() { return -1; };
+    let call: &ToolScheduledCall = schedule.calls.get(ordinal);
+    call.state.get(0).unwrap_or(-1)
+}
+
+def tool_schedule_active(schedule: &ToolSchedule) -> i64 { schedule.control.get(3).unwrap_or(0) }
+
+// Executable hooks can change workspace state even around a read-only tool.
+// Coordinator tools, MCP, commands and unknown tools never become safe reads.
+def tool_schedule_safe_read(name: &str, arguments: &JsonDoc, has_executable_hooks: bool) -> bool {
+    if has_executable_hooks or not tool_spec_valid(name, arguments) { return false; };
+    let spec = tool_spec(name);
+    spec.read_only and not spec.coordinator and not spec.exclusive
+}
+
+def tool_schedule_add(schedule: &ToolSchedule, id: &str, name: &str, arguments: &JsonDoc, has_executable_hooks: bool, predecessor: i64) -> Result<i64, i64> {
+    if schedule.control.get(1).unwrap_or(0) != 0 or schedule.control.get(2).unwrap_or(0) != 0 { return cli_fail(6); };
+    if id.len() == 0 or id.len() > 256 or predecessor < -1 or predecessor >= schedule.calls.len() or not tool_spec_valid(name, arguments) { return cli_fail(2); };
+    if tool_schedule_find(schedule, id) >= 0 { return cli_fail(6); };
+    if schedule.calls.len() >= 128 { return cli_fail(13); };
+    let captured_id = string_from_str(id)?;
+    let captured_name = string_from_str(name)?;
+    let state: Vec<i64> = vec_new();
+    if not state.push(0) or not state.push(0) { return cli_fail(8); };
+    let ordinal = schedule.calls.len();
+    let call = ToolScheduledCall { id: captured_id, name: captured_name, safe_read: tool_schedule_safe_read(name, arguments, has_executable_hooks), predecessor: predecessor, state: state };
+    if not schedule.calls.push(call) { return cli_fail(8); };
+    cli_ok(ordinal)
+}
+
+def tool_schedule_seal(schedule: &ToolSchedule) -> bool {
+    if schedule.control.get(2).unwrap_or(0) != 0 { return false; };
+    schedule.control.set(1, 1);
+    true
+}
+
+// An exclusive call is a source-order barrier. It starts only after all prior
+// reads settle, and nothing after it starts before it settles. Within a read
+// block a stalled predecessor need not block an unrelated safe read.
+// Returns -1 when the owner should poll its existing jobs or await approval.
+def tool_schedule_next(schedule: &ToolSchedule) -> Result<i64, i64> {
+    if schedule.control.get(1).unwrap_or(0) == 0 { return cli_fail(6); };
+    if schedule.control.get(2).unwrap_or(0) != 0 { return cli_ok(-1); };
+    if tool_schedule_active(schedule) >= schedule.control.get(0).unwrap_or(1) { return cli_ok(-1); };
+    let mut earlier_pending = false;
+    let mut ordinal = 0;
+    while ordinal < schedule.calls.len() {
+        let call: &ToolScheduledCall = schedule.calls.get(ordinal);
+        let phase = call.state.get(0).unwrap_or(0);
+        if phase < 3 {
+            if not call.safe_read and (phase != 0 or earlier_pending or tool_schedule_active(schedule) != 0) { return cli_ok(-1); };
+            if phase == 0 {
+                let mut dependency_ready = true;
+                let mut dependency_failed = false;
+                if call.predecessor >= 0 {
+                    let prior: &ToolScheduledCall = schedule.calls.get(call.predecessor);
+                    dependency_ready = prior.state.get(0).unwrap_or(0) >= 3;
+                    dependency_failed = dependency_ready and prior.state.get(1).unwrap_or(0) == 0;
+                };
+                if dependency_failed {
+                    call.state.set(0, 5);
+                    ();
+                } else {
+                    if dependency_ready {
+                        call.state.set(0, 1);
+                        schedule.control.set(3, tool_schedule_active(schedule) + 1);
+                        return cli_ok(ordinal);
+                    };
+                    if not call.safe_read { return cli_ok(-1); };
+                    earlier_pending = true;
+                };
+                ();
+            } else { earlier_pending = true; };
+        };
+        ordinal = ordinal + 1;
+    };
+    cli_ok(-1)
+}
+
+// A timeout/cancel request does not finish a job. The owner must keep polling,
+// draining pipes and retaining its workspace lease until quiescent is true.
+def tool_schedule_complete(schedule: &ToolSchedule, ordinal: i64, success: bool, quiescent: bool) -> Result<bool, i64> {
+    if ordinal < 0 or ordinal >= schedule.calls.len() { return tool_schedule_bool(false, 3); };
+    let call: &ToolScheduledCall = schedule.calls.get(ordinal);
+    let phase = call.state.get(0).unwrap_or(0);
+    if phase >= 3 { return tool_schedule_bool(false, 0); };
+    if phase == 0 { return tool_schedule_bool(false, 6); };
+    if not quiescent { return tool_schedule_bool(false, 6); };
+    let canceled = phase == 2 or schedule.control.get(2).unwrap_or(0) != 0;
+    call.state.set(0, if canceled { 4 } else { 3 });
+    call.state.set(1, if success and not canceled { 1 } else { 0 });
+    schedule.control.set(3, tool_schedule_active(schedule) - 1);
+    tool_schedule_bool(true, 0)
+}
+
+def tool_schedule_cancel(schedule: &ToolSchedule) {
+    schedule.control.set(2, 1);
+    let mut ordinal = 0;
+    while ordinal < schedule.calls.len() {
+        let call: &ToolScheduledCall = schedule.calls.get(ordinal);
+        let phase = call.state.get(0).unwrap_or(0);
+        if phase == 0 { call.state.set(0, 4); (); };
+        if phase == 1 { call.state.set(0, 2); (); };
+        ordinal = ordinal + 1;
+    };
+    ();
+}
+
+// Results stay in host-owned ordinal slots. Progress may be displayed as it
+// arrives; model history consumes final results in declaration order exactly
+// once. A later fast read cannot reorder the model's tool/result pairings.
+def tool_schedule_publish_next(schedule: &ToolSchedule) -> i64 {
+    let ordinal = schedule.control.get(4).unwrap_or(0);
+    if ordinal >= schedule.calls.len() or tool_schedule_state(schedule, ordinal) < 3 { return -1; };
+    schedule.control.set(4, ordinal + 1);
+    ordinal
+}
+
+def tool_schedule_quiescent(schedule: &ToolSchedule) -> bool {
+    if tool_schedule_active(schedule) != 0 { return false; };
+    let mut ordinal = 0;
+    while ordinal < schedule.calls.len() {
+        if tool_schedule_state(schedule, ordinal) < 3 { return false; };
+        ordinal = ordinal + 1;
+    };
+    true
+}

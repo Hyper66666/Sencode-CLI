@@ -1,0 +1,39 @@
+import transport;
+import workspace;
+import command_line;
+import std::time;
+
+def media_transport_tests() -> Result<i64,i64> {
+    let base = cli_argument(0)?;
+    let path = cli_argument(1)?;
+    let history = json_parse_bounded(workspace_read(path.as_str(), 16777216)?.as_str(), 16777216)?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    let mut protocol = 0;
+    while protocol < 3 {
+        let denied = provider_job_start_with_media(base.as_str(), protocol, "fixture", "fixture-key", &history, &tools, false, 16777216, 16777216);
+        if denied.is_ok or denied.error != 7 { return cli_fail(99); };
+        let body_denied = provider_job_start_with_media(base.as_str(), protocol, "fixture", "fixture-key", &history, &tools, true, 1024, 16777216);
+        if body_denied.is_ok or body_denied.error != 13 { return cli_fail(99); };
+        let wire_denied = provider_job_start_with_media(base.as_str(), protocol, "fixture", "fixture-key", &history, &tools, true, 16777216, 1024);
+        if wire_denied.is_ok or wire_denied.error != 13 { return cli_fail(99); };
+        let mut job = provider_job_start_with_media(base.as_str(), protocol, "fixture", "fixture-key", &history, &tools, true, 16777216, 16777216)?;
+        let started = time_unix_ms();
+        loop {
+            job.poll()?;
+            if job.finished { break; };
+            if time_since_ms(started) > 15000 { job.cancel(); return cli_fail(11); };
+            time_sleep_ms(1);
+        };
+        let result = job.result()?;
+        if cli_json_string(result.root(), "content")?.as_str() != "已接收😀" { return cli_fail(99); };
+        protocol = protocol + 1;
+    };
+    cli_ok(0)
+}
+
+def main() -> i64 {
+    let result = media_transport_tests();
+    if not result.is_ok { println(result.error); return 1; };
+    println("bounded three-protocol media transport passed");
+    result.value
+}

@@ -1,0 +1,92 @@
+import tool_spec;
+import permissions;
+
+// Capabilities describe guarantees, not features inferred from a backend name.
+struct RuntimeCapabilities {
+    native_api: bool,
+    chat: bool,
+    streaming: bool,
+    strict_plan: bool,
+    tool_permissions: bool,
+    request_accounting: bool,
+    token_accounting: bool,
+    controlled_children: bool,
+    cancel_tree: bool,
+    host_tools: bool,
+}
+
+struct EffectivePolicy {
+    enforced: bool,
+    plan: bool,
+    shell: bool,
+    mcp: bool,
+    writes: bool,
+    children: bool,
+    requires_approval: bool,
+}
+
+def runtime_native_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities { native_api: true, chat: true, streaming: true, strict_plan: true, tool_permissions: true, request_accounting: true, token_accounting: false, controlled_children: true, cancel_tree: true, host_tools: true }
+}
+
+// A managed backend starts unknown. Successful chat or a read-only filesystem
+// sandbox does not prove strict Plan, per-tool approval or request accounting.
+def runtime_unknown_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities { native_api: false, chat: false, streaming: false, strict_plan: false, tool_permissions: false, request_accounting: false, token_accounting: false, controlled_children: false, cancel_tree: false, host_tools: false }
+}
+
+def runtime_managed_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities { native_api: false, chat: true, streaming: true, strict_plan: false, tool_permissions: false, request_accounting: false, token_accounting: false, controlled_children: false, cancel_tree: true, host_tools: false }
+}
+
+def runtime_managed_policy_document(engine: &str) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    cli_put_string(&document, document.root(), "engine", engine)?;
+    cli_put_i64(&document, document.root(), "contract", 1)?;
+    cli_put_string(&document, document.root(), "permission_scope", "managed-backend")?;
+    cli_put_bool(&document, document.root(), "enforced", false)?;
+    cli_put_bool(&document, document.root(), "plan", false)?;
+    cli_put_bool(&document, document.root(), "strict_plan", false)?;
+    cli_put_bool(&document, document.root(), "shell", true)?;
+    cli_put_bool(&document, document.root(), "mcp", true)?;
+    cli_put_bool(&document, document.root(), "writes", true)?;
+    cli_put_bool(&document, document.root(), "children", false)?;
+    cli_put_bool(&document, document.root(), "requires_approval", true)?;
+    cli_put_bool(&document, document.root(), "request_accounting", false)?;
+    cli_put_bool(&document, document.root(), "token_accounting", false)?;
+    cli_put_string(&document, document.root(), "notice", "The selected account runtime owns its tool policy. Sencode strict Plan, per-tool permissions, controlled children and exact request/token budgets are unavailable for this backend.")?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def runtime_effective_policy(capabilities: &RuntimeCapabilities, requested: &AgentPolicy) -> EffectivePolicy {
+    let enforced = capabilities.tool_permissions and (not requested.plan or capabilities.strict_plan);
+    EffectivePolicy { enforced: enforced, plan: requested.plan, shell: enforced and not requested.plan, mcp: enforced and not requested.plan, writes: enforced and not requested.plan, children: enforced and capabilities.controlled_children and requested.depth < requested.maximum_depth, requires_approval: enforced and not requested.plan and not requested.full_access }
+}
+
+def runtime_validate_policy(capabilities: &RuntimeCapabilities, requested: &AgentPolicy, goal: bool, token_budget: i64) -> Result<bool, i64> {
+    let effective = runtime_effective_policy(capabilities, requested);
+    if not capabilities.chat or not effective.enforced { return Result { is_ok: false, value: false, error: 7 }; };
+    if goal and not capabilities.request_accounting { return Result { is_ok: false, value: false, error: 7 }; };
+    if token_budget > 0 and not capabilities.token_accounting { return Result { is_ok: false, value: false, error: 7 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def runtime_policy_document(capabilities: &RuntimeCapabilities, policy: &AgentPolicy) -> Result<JsonDoc, i64> {
+    let effective = runtime_effective_policy(capabilities, policy);
+    let document = json_doc_object()?;
+    cli_put_string(&document, document.root(), "engine", if capabilities.native_api { "sengoo-native-api" } else { "managed-unknown" })?;
+    cli_put_i64(&document, document.root(), "contract", 1)?;
+    cli_put_bool(&document, document.root(), "enforced", effective.enforced)?;
+    cli_put_bool(&document, document.root(), "plan", effective.plan)?;
+    cli_put_bool(&document, document.root(), "shell", effective.shell)?;
+    cli_put_bool(&document, document.root(), "mcp", effective.mcp)?;
+    cli_put_bool(&document, document.root(), "writes", effective.writes)?;
+    cli_put_bool(&document, document.root(), "children", effective.children)?;
+    cli_put_bool(&document, document.root(), "requires_approval", effective.requires_approval)?;
+    cli_put_bool(&document, document.root(), "auto_edit", policy.auto_edit)?;
+    cli_put_bool(&document, document.root(), "full_access", policy.full_access and not policy.plan)?;
+    cli_put_string(&document, document.root(), "permission_mode", if policy.plan { "plan" } else { permission_mode(policy) })?;
+    cli_put_bool(&document, document.root(), "request_accounting", capabilities.request_accounting)?;
+    cli_put_bool(&document, document.root(), "token_accounting", capabilities.token_accounting)?;
+    Result { is_ok: true, value: document, error: 0 }
+}

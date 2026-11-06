@@ -1,0 +1,23 @@
+import tui_reading;
+
+def read_key(kind: i64, code: i64, modifiers: i64) -> TerminalEvent { TerminalEvent { kind: kind, code: code, modifiers: modifiers, width: 80, height: 24, data: string_new() } }
+def read_assert(value: bool, text: &str) -> bool { if not value { println(text); }; value }
+
+def main() -> i64 {
+    let mut state = reading_new(); let down = read_key(1, 106, 0); let up = read_key(1, 107, 0);
+    if not read_assert(reading_event(&mut state, &up, 24, 200, 0).kind == 0, "inactive reading does not intercept composer") { return 1; };
+    reading_enter(&mut state);
+    let older = reading_event(&mut state, &up, 24, 200, 0);
+    if not read_assert(older.kind == 1 and older.scroll == 1 and reading_event(&mut state, &down, 24, 200, 1).scroll == 0, "single-row reading navigation") { return 1; };
+    let page = read_key(1, 1008, 0); if not read_assert(reading_event(&mut state, &page, 24, 200, 0).scroll == 12, "bounded half-page navigation") { return 1; };
+    let g = read_key(1, 103, 0); reading_event(&mut state, &g, 24, 200, 12);
+    if not read_assert(reading_event(&mut state, &g, 24, 200, 12).scroll == 176, "gg goes to a full oldest viewport") { return 1; };
+    let tail = read_key(1, 71, 1); if not read_assert(reading_event(&mut state, &tail, 24, 200, 199).scroll == 0, "shifted G follows the newest output") { return 1; };
+    let paste = read_key(2, 0, 0); if not read_assert(reading_event(&mut state, &paste, 24, 200, 40).kind == 1 and state.active, "paste cannot submit or execute reading keys") { return 1; };
+    let enter = read_key(1, 13, 0); if not read_assert(reading_event(&mut state, &enter, 24, 200, 40).scroll == 40 and state.active, "Enter is inert while reading owns focus") { return 1; };
+    let cancel = read_key(4, 3, 4); if not read_assert(reading_event(&mut state, &cancel, 24, 200, 40).kind == 0, "explicit cancellation is left to the host") { return 1; };
+    let esc = read_key(1, 27, 0); if not read_assert(reading_event(&mut state, &esc, 24, 200, 40).kind == 2 and not state.active, "Escape releases reading focus") { return 1; };
+    reading_enter(&mut state); let q = read_key(1, 113, 0);
+    if not read_assert(reading_event(&mut state, &q, 24, 0, 0).kind == 2 and not state.active, "q safely returns from an empty transcript") { return 1; };
+    println("reading: transcript-only navigation, focus, bounds, paste isolation and explicit return passed"); 0
+}

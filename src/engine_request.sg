@@ -1,0 +1,42 @@
+import transport;
+import connection;
+import image_request;
+
+// Pollable native transport owns its provider snapshot for the whole request.
+// Scheduling, persistence, permissions and all agent state stay in Sengoo.
+struct EngineRequest {
+    id: String,
+    connection_id: String,
+    model: String,
+    effort: String,
+    job: ProviderJob,
+}
+
+def engine_request_start(id: &str, connection: &ProviderConnection, credential: &str, history: &JsonDoc, tools: &JsonDoc) -> Result<EngineRequest, i64> {
+    let grants = json_doc_object()?;
+    engine_request_start_with_grants(id, connection, credential, history, tools, &grants)
+}
+
+def engine_request_start_with_grants(id: &str, connection: &ProviderConnection, credential: &str, history: &JsonDoc, tools: &JsonDoc, grants: &JsonDoc) -> Result<EngineRequest, i64> {
+    let media = image_request_has_media(history)?;
+    let job = if media {
+        let hydrated = image_request_history(history, connection.images_allowed(), grants)?;
+        provider_job_start_with_media_effort_scoped(connection.base_url(), connection.protocol_id(), connection.model_id(), connection.effort_id(), connection.connection_id(), credential, &hydrated, tools, connection.images_allowed(), 16777216, 16777216)?
+    } else { provider_job_start_with_effort_scoped(connection.base_url(), connection.protocol_id(), connection.model_id(), connection.effort_id(), connection.connection_id(), credential, history, tools)? };
+    Result { is_ok: true, value: EngineRequest { id: cli_text(id), connection_id: cli_text(connection.connection_id()), model: cli_text(connection.model_id()), effort: cli_text(connection.effort_id()), job: job }, error: 0 }
+}
+
+impl EngineRequest {
+    def poll(&mut self) -> Result<String, i64> { self.job.poll() }
+    def finished(&self) -> bool { self.job.finished }
+    def activity(&self) -> i64 { self.job.turn.activity }
+    def input_tokens(&self) -> i64 { self.job.turn.input_tokens }
+    def output_tokens(&self) -> i64 { self.job.turn.output_tokens }
+    def usage_reported(&self) -> bool { self.job.turn.usage_reported }
+    def status(&self) -> i64 { self.job.http.status }
+    def retry_after(&self) -> &str { self.job.http.retry_after.as_str() }
+    def stream_observed(&self) -> bool { self.job.stream_observed }
+    def request_started(&self) -> bool { self.job.stream.request_started().unwrap_or(true) }
+    def cancel(&mut self) { self.job.cancel(); }
+    def result(&self) -> Result<JsonDoc, i64> { self.job.result() }
+}

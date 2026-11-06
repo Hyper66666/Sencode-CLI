@@ -1,0 +1,12 @@
+Sencode CLI and sencode-config
+
+This repository contains the Sengoo-native CLI and configuration companion
+developed in the Sencode project. The existing upstream Apache-2.0 license and
+SpaceXAI copyright notice are preserved in LICENSE.
+
+Grok Build / Sencode runtime notices and licenses must accompany any bundled
+managed runtime. Official Codex runtime distributions retain their own license
+and third-party notices. Those runtime binaries are not included here.
+
+Reference source trees used during design review are not distributed here.
+Sengoo and its vendored dependencies are maintained and licensed separately.

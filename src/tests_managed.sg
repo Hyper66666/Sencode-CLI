@@ -1,0 +1,24 @@
+import managed_client;
+
+def main() -> i64 {
+    let options = json_parse("{\"options\":[{\"optionId\":\"opaque-reject\",\"kind\":\"reject_once\"},{\"optionId\":\"opaque-always\",\"kind\":\"allow_always\"},{\"optionId\":\"opaque-once\",\"kind\":\"allow_once\"}]}");
+    if not options.is_ok() { return 1; };
+    let approved = managed_approval_result("sencode-acp", "session/request_permission", options.value.root(), true);
+    let denied = managed_approval_result("sencode-acp", "session/request_permission", options.value.root(), false);
+    if not approved.is_ok() or not denied.is_ok() { return 1; };
+    if cli_json_optional_string(approved.value.root().object_get("outcome").value, "optionId").as_str() != "opaque-once" { return 1; };
+    if cli_json_optional_string(denied.value.root().object_get("outcome").value, "optionId").as_str() != "opaque-reject" { return 1; };
+    let missing_once = json_parse("{\"options\":[{\"optionId\":\"opaque-always\",\"kind\":\"allow_always\"}]}");
+    if not missing_once.is_ok() { return 1; };
+    let refused = managed_approval_result("sencode-acp", "session/request_permission", missing_once.value.root(), true);
+    if not refused.is_ok() or cli_json_optional_string(refused.value.root().object_get("outcome").value, "outcome").as_str() != "cancelled" { return 1; };
+    let codex = json_parse("{\"permissions\":{\"network\":{\"enabled\":true}}}");
+    if not codex.is_ok() { return 1; };
+    let scoped = managed_approval_result("codex-app-server", "item/permissions/requestApproval", codex.value.root(), true);
+    let ungranted = managed_approval_result("codex-app-server", "item/permissions/requestApproval", codex.value.root(), false);
+    if not scoped.is_ok() or not ungranted.is_ok() { return 1; };
+    if cli_json_optional_string(scoped.value.root(), "scope").as_str() != "turn" { return 1; };
+    if ungranted.value.root().object_get("permissions").value.object_len().value != 0 { return 1; };
+    println("managed public protocol approval mapping passed");
+    0
+}

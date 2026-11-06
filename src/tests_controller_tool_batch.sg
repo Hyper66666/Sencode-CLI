@@ -1,0 +1,102 @@
+import controller;
+import command_line;
+
+def batch_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if value { return Result { is_ok: true, value: true, error: 0 }; };
+    cli_diagnostic(label); controller_batch_error(99)
+}
+
+def batch_call(calls: &JsonDoc, id: &str, name: &str, arguments: &str) -> Result<bool, i64> {
+    let call = calls.new_object()?;
+    cli_put_string(calls, call, "id", id)?; cli_put_string(calls, call, "name", name)?;
+    cli_put_string(calls, call, "arguments", arguments)?;
+    calls.root().array_push(call)
+}
+
+def batch_integration(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let session = cli_state_create_session(&state, cwd)?;
+    let mut execution = cli_state_begin(&state, session.as_str(), "fixture", "fixture-model")?;
+    let mut policy = policy_default(); policy.interactive = false; policy.auto_edit = true;
+    let input: Vec<TerminalEvent> = vec_new();
+    let options = AgentOptions { cwd: cli_text(cwd), session: session, connection: cli_text("fixture"), model: cli_text("fixture-model"), effort: string_new(), format: cli_text("json"), policy: policy, allow_commands: false, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let terminal = terminal_open()?;
+    let scheduler = scheduler_new();
+    let task = scheduler_add(&scheduler, 0, "fixture", cwd, true)?;
+    let children = children_new();
+    let child_states: Vec<ControllerChild> = vec_new();
+    let mut goal = goal_new(50, 0);
+    let git = executor_git_executable(cwd)?;
+    let setup = process_command(git.as_str())?; setup.arg("-C")?; setup.arg(cwd)?; setup.arg("init")?; setup.arg("--quiet")?;
+    let initialized = executor_capture(&setup, 10000, &terminal, &options.input)?;
+    batch_expect(initialized.exit_code == 0, "isolated Git fixture initializes")?;
+    let history = agent_history("Isolated controller scheduling fixture; no provider requests")?;
+
+    println("controller batch: process-backed read concurrency");
+    let reads = json_parse("[]")?;
+    batch_call(&reads, "parallel-status", "git_status", "{}")?;
+    batch_call(&reads, "parallel-diff", "git_diff", "{}")?;
+    let schedule = tool_schedule_new(4)?;
+    let empty = json_parse("{}")?;
+    tool_schedule_add(&schedule, "parallel-status", "git_status", &empty, false, -1)?;
+    tool_schedule_add(&schedule, "parallel-diff", "git_diff", &empty, false, -1)?;
+    tool_schedule_seal(&schedule);
+    let jobs: Vec<ControllerBatchJob> = vec_new();
+    let results: Vec<String> = vec_new(); results.push(string_new()); results.push(string_new());
+    let mut batch = ControllerReadBatch { schedule: schedule, jobs: jobs, results: results, first: 0, published: 0 };
+    let first_step = controller_batch_step(&state, &execution, &options, &history, reads.root(), &mut batch, &scheduler, task, &mut goal, &terminal, &children, &child_states);
+    if not first_step.is_ok() { controller_batch_drain(&state, &execution, &options, &mut batch, &scheduler, task, &terminal); return first_step; };
+    batch_expect(batch.jobs.len() == 2 and tool_schedule_active(&batch.schedule) == 2, "both hardened Git jobs start before either is awaited")?;
+    loop {
+        let stepped = controller_batch_step(&state, &execution, &options, &history, reads.root(), &mut batch, &scheduler, task, &mut goal, &terminal, &children, &child_states);
+        if not stepped.is_ok() { controller_batch_drain(&state, &execution, &options, &mut batch, &scheduler, task, &terminal); return stepped; };
+        if stepped.value { break; };
+        time_sleep_ms(1);
+    };
+    batch_expect(controller_tool_prior(&state, &execution, "parallel-status")? == 1 and controller_tool_prior(&state, &execution, "parallel-diff")? == 1, "concurrent reads retain durable completed outcomes")?;
+    let messages = history.root().object_get("messages")?;
+    batch_expect(cli_json_optional_string(messages.array_get(1)?, "tool_call_id").as_str() == "parallel-status" and cli_json_optional_string(messages.array_get(2)?, "tool_call_id").as_str() == "parallel-diff", "model history retains declared result order")?;
+
+    println("controller batch: write barrier and dependent read");
+    let calls = json_parse("[]")?;
+    batch_call(&calls, "before-write", "git_status", "{}")?;
+    batch_call(&calls, "create-note", "write_file", "{\"path\":\"batch-note.txt\",\"content\":\"new value 世界\"}")?;
+    batch_call(&calls, "after-write", "read_file", "{\"path\":\"batch-note.txt\"}")?;
+    batch_expect(controller_execute_batch(&state, &execution, &options, &history, calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "real mixed read write read batch completes")?;
+    let note = workspace_path(cwd, "batch-note.txt")?;
+    batch_expect(workspace_read(note.as_str(), 1000)?.as_str() == "new value 世界", "approved write remains functional and Unicode is intact")?;
+    let saved_read = cli_state_tool_result(&state, options.session.as_str(), "after-write")?;
+    batch_expect(str_contains(saved_read.as_str(), "new value 世界"), "later read observes completed write barrier")?;
+
+    println("controller batch: durable replay and duplicate batch rejection");
+    file_write_str(note.as_str(), "external current value")?;
+    let replay = json_parse("[]")?;
+    batch_call(&replay, "create-note", "write_file", "{\"path\":\"batch-note.txt\",\"content\":\"must not replay\"}")?;
+    batch_expect(controller_execute_batch(&state, &execution, &options, &history, replay.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "completed admission reuses its result")?;
+    batch_expect(workspace_read(note.as_str(), 1000)?.as_str() == "external current value", "durable replay cannot overwrite newer external content")?;
+    let duplicate = json_parse("[]")?;
+    batch_call(&duplicate, "duplicate-write", "write_file", "{\"path\":\"duplicate.txt\",\"content\":\"first\"}")?;
+    batch_call(&duplicate, "duplicate-write", "write_file", "{\"path\":\"duplicate.txt\",\"content\":\"second\"}")?;
+    let rejected = controller_execute_batch(&state, &execution, &options, &history, duplicate.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states);
+    batch_expect(not rejected.is_ok() and rejected.error == 2 and not file_exists(workspace_path(cwd, "duplicate.txt")?.as_str()), "duplicate IDs reject whole batch before its first write")?;
+    batch_expect(controller_tool_prior(&state, &execution, "duplicate-write")? == 0, "duplicate batch cannot create durable execution claims")?;
+
+    println("controller batch: configured hooks retain serial admission");
+    let hook_path = hook_store_path(&state)?;
+    file_write_str(hook_path.as_str(), "invalid sidecar fixture")?;
+    batch_expect(not controller_batch_read_eligible(&state, &options, reads.root().array_get(0)?), "present or malformed hook configuration disables parallel specialization")?;
+    batch_expect(file_remove(hook_path.as_str()), "remove only the inventoried fixture sidecar")?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", "").unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let cwd = path_parent_string(database.as_str()).unwrap_or(string_new());
+    let result = batch_integration(database.as_str(), cwd.as_str());
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_process_live_resource_count() != 0 or sengoo_process_live_handle_count() != 0 { cli_diagnostic("Controller batch leaked a process resource"); return 1; };
+    println("controller batch acceptance passed"); 0
+}

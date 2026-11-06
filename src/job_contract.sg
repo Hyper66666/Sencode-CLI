@@ -1,0 +1,66 @@
+import common;
+import std::ipc;
+import std::process;
+import std::time;
+
+// Private local supervisor protocol. It is independent of provider/engine ABI.
+def job_object_error(code: i64) -> Result<JsonDoc, i64> { Result { is_ok: false, value: JsonDoc { handle: 0 }, error: code } }
+def job_true() -> Result<bool, i64> { Result { is_ok: true, value: true, error: 0 } }
+
+def job_terminal(status: &str) -> bool {
+    status == "completed" or status == "paused" or status == "failed" or status == "interrupted" or status == "cleanup_unknown"
+}
+
+def job_keys(document: &JsonDoc, allowed: &str) -> Result<bool, i64> {
+    if document.root().kind()? != JSON_KIND_OBJECT() { return Result { is_ok: false, value: false, error: 2 }; };
+    let keys = document.root().object_keys()?;
+    let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        let marker = cli_join("|", key.as_str())?; marker.push_str("|")?;
+        if str_index_of(allowed, marker.as_str()) < 0 { return Result { is_ok: false, value: false, error: 2 }; };
+        index = index + 1;
+    };
+    job_true()
+}
+
+def job_message(kind: &str, id: &str, generation: &str) -> Result<JsonDoc, i64> {
+    let document = json_doc_object()?;
+    cli_put_i64(&document, document.root(), "schema", 1)?;
+    cli_put_string(&document, document.root(), "type", kind)?;
+    cli_put_string(&document, document.root(), "job_id", id)?;
+    cli_put_string(&document, document.root(), "generation", generation)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def job_frame_append(queue: &Buffer, document: &JsonDoc) -> Result<bool, i64> {
+    let text = document.serialize_string()?;
+    if text.len() > 2097151 or text.len() + queue.used_len() + 1 > 2097152 { return Result { is_ok: false, value: false, error: 13 }; };
+    queue.append_str(text.as_str())?; queue.append_str("\n")?; job_true()
+}
+
+def job_frame_take(queue: &Buffer, maximum: i64) -> Result<JsonDoc, i64> {
+    let newline = cli_bytes_index(queue, "\n")?;
+    if newline < 0 { if queue.used_len() > maximum { return job_object_error(13); }; return json_doc_object(); };
+    if newline > maximum { return job_object_error(13); };
+    let text = cli_bytes_text(queue, 0, newline)?;
+    queue.consume(newline + 1)?;
+    let document = json_parse(text.as_str())?;
+    if document.root().kind()? != JSON_KIND_OBJECT() { return job_object_error(2); };
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def job_stream_flush(stream: &IpcStream, queue: &Buffer) -> Result<bool, i64> {
+    if queue.used_len() > 0 {
+        let count = if queue.used_len() > 65536 { 65536 } else { queue.used_len() };
+        let written = stream.write(queue, count)?; queue.consume(written)?; ();
+    };
+    job_true()
+}
+
+def job_stream_read(stream: &IpcStream, queue: &Buffer) -> Result<bool, i64> {
+    let mut piece = cli_bytes(65536);
+    let count = stream.read(&mut piece)?;
+    if count > 0 { if queue.used_len() + count > 2097152 { return Result { is_ok: false, value: false, error: 13 }; }; cli_bytes_append(queue, &piece, 0, count)?; (); };
+    job_true()
+}

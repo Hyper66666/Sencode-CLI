@@ -1,0 +1,64 @@
+import tui;
+
+def interaction_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 99 }; }; tui_true() }
+def interaction_key(code: i64) -> TerminalEvent { TerminalEvent { kind: 1, code: code, modifiers: 0, width: 80, height: 30, data: string_new() } }
+def interaction_options() -> Vec<UiQuestionOption> { let options: Vec<UiQuestionOption> = vec_new(); options.push(UiQuestionOption { label: cli_text("方案一 中文😀"), description: cli_text("保持当前结构") }); options.push(UiQuestionOption { label: cli_text("方案二 é"), description: cli_text("新的实现") }); options }
+
+def interaction_questions() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "api", "model", "question"); tui_begin(&mut app)?; tui_set_draft(&mut app, "preserved draft 😀")?; app.queue.push(InputHistory { text: cli_text("queued remains") });
+    let enter = interaction_key(13); let esc = interaction_key(27); let down = interaction_key(1002); let up = interaction_key(1001);
+    tui_set_approval(&mut app, "question-one", "请选择实现", true)?; tui_question_options(&mut app, interaction_options())?;
+    let idle = TerminalEvent { kind: 0, code: 0, modifiers: 0, width: 80, height: 30, data: string_new() };
+    interaction_assert(tui_event(&mut app, &idle)?.kind == 0 and app.approval.len() > 0, "question waits for an explicit fresh input")?;
+    let pasted = TerminalEvent { kind: 2, code: 0, modifiers: 0, width: 80, height: 30, data: cli_text("yes\n/quit\n") };
+    interaction_assert(tui_event(&mut app, &pasted)?.kind == 0 and app.approval_selected == 0 and app.approval_draft.len() == 0, "paste cannot select or confirm an option")?;
+    tui_event(&mut app, &down)?; let chosen = tui_event(&mut app, &enter)?;
+    interaction_assert(chosen.kind == 5 and chosen.text.as_str() == "方案二 é" and chosen.context.as_str() == "question-one", "single Enter confirms selected original Unicode label")?;
+    interaction_assert(app.draft.as_str() == "preserved draft 😀" and app.queue.len() == 1, "question preserves composer and queue")?;
+    tui_set_approval(&mut app, "question-custom", "自定义回答", true)?; tui_question_options(&mut app, interaction_options())?; tui_event(&mut app, &up)?;
+    let opened = tui_event(&mut app, &enter)?; interaction_assert(app.approval_selected == 2 and opened.kind == 0 and app.approval_custom, "custom entry opens an independent answer editor")?;
+    interaction_assert(tui_event(&mut app, &enter)?.kind == 0 and app.approval.len() > 0, "empty custom answer is not submitted")?;
+    let answer = TerminalEvent { kind: 2, code: 0, modifiers: 0, width: 80, height: 30, data: cli_text("自定义 👨‍👩‍👧‍👦 é") }; tui_event(&mut app, &answer)?; let response = tui_event(&mut app, &enter)?;
+    interaction_assert(response.kind == 5 and response.text.as_str() == "自定义 👨‍👩‍👧‍👦 é", "custom answer preserves Unicode")?;
+    tui_set_approval(&mut app, "question-cancel", "取消", true)?; tui_question_options(&mut app, interaction_options())?;
+    let cancelled = tui_event(&mut app, &esc)?; interaction_assert(cancelled.kind == 7 and cancelled.text.len() == 0 and app.queue_paused, "Esc cancels the question semantically and pauses queue")?;
+    tui_finish(&mut app, false)?; interaction_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 1, "question cancellation cannot auto-dispatch queued work")?;
+    tui_set_approval(&mut app, "legacy-cancel", "Legacy text question", true)?; interaction_assert(tui_event(&mut app, &esc)?.kind == 7, "text-only question also supports semantic cancel")?;
+    tui_set_approval(&mut app, "permission", "Permission", false)?; let denied = tui_event(&mut app, &esc)?; interaction_assert(denied.kind == 5 and denied.text.as_str() == "no", "permission denial remains compatible")?;
+    tui_set_approval(&mut app, "layout", "窄屏选项布局", true)?; tui_question_options(&mut app, interaction_options())?; tui_event(&mut app, &up)?; tui_resize(&mut app, 32, 15)?;
+    interaction_assert(str_contains(tui_frame(&app)?.as_str(), "自定义回答") and not str_contains(tui_frame(&app)?.as_str(), "QUEUED /"), "narrow question keeps selected entry visible and hides pending cards")?;
+    let rows: Vec<UiLine> = vec_new(); tui_question_rows(&rows, &app, 1)?; interaction_assert(rows.len() == 1, "tiny choices viewport stays bounded")
+}
+
+def interaction_pending() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "api", "model", "pending"); tui_begin(&mut app)?; app.queue.push(InputHistory { text: cli_text("first queued") }); app.queue.push(InputHistory { text: cli_text("latest 中文😀") }); tui_set_draft(&mut app, "still typing")?;
+    let rows = tui_frame_rows(&app)?; let mut index = 0; let mut muted = false; while index < rows.len() { let row: &UiLine = rows.get(index); if str_contains(row.text.as_str(), "QUEUED / 2") { muted = row.style == 2; }; index = index + 1; };
+    interaction_assert(muted and str_contains(tui_frame(&app)?.as_str(), "latest 中文😀"), "queued insertions appear as muted cards above composer")?;
+    let esc = interaction_key(27); let recalled = tui_event(&mut app, &esc)?;
+    interaction_assert(recalled.kind == 0 and app.busy and app.queue.len() == 1 and app.draft.as_str() == "latest 中文😀\n\nstill typing" and not app.queue_paused, "Esc recalls newest insertion without losing current draft or cancelling")?;
+    app.keymap.mode = cli_text("vim"); app.vim = keys_vim_new(); tui_event(&mut app, &esc)?;
+    interaction_assert(app.busy and app.queue.len() == 0 and str_starts_with(app.draft.as_str(), "first queued\n\n"), "Vim uses the same queued recall priority")?;
+    app.queue.push(InputHistory { text: cli_text("keep after cancel") }); let cancel = TerminalEvent { kind: 4, code: 0, modifiers: 0, width: 80, height: 30, data: string_new() };
+    interaction_assert(tui_event(&mut app, &cancel)?.kind == 2 and app.queue_paused, "Ctrl+C explicitly cancels current request and pauses pending work")?; tui_finish(&mut app, false)?;
+    interaction_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 1, "cancelled turn cannot automatically start queued tasks")?;
+    app.keymap.mode = cli_text("default"); tui_set_draft(&mut app, "/")?; tui_event(&mut app, &esc)?; interaction_assert(app.queue.len() == 1 and not app.menu_open, "slash menu consumes Esc before recall")?;
+    app.queue.clear(); app.queue.push(InputHistory { text: ui_repeat("x", 65536)? }); tui_set_draft(&mut app, "y")?; let overflow = tui_event(&mut app, &esc)?;
+    interaction_assert(overflow.kind == 0 and app.queue.len() == 1 and app.draft.as_str() == "y" and str_contains(app.status.as_str(), "limit"), "oversized recall preserves both values and never falls through to cancel")
+}
+
+def interaction_local() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "api", "model", "local"); let enter = interaction_key(13); let esc = interaction_key(27); let stash = interaction_key(19);
+    tui_set_draft(&mut app, "first 中文😀")?; tui_event(&mut app, &stash)?; interaction_assert(app.draft.len() == 0 and app.stash_draft.as_str() == "first 中文😀", "Ctrl+S stashes without submitting")?;
+    tui_set_draft(&mut app, "second draft")?; tui_event(&mut app, &stash)?; interaction_assert(app.draft.as_str() == "first 中文😀" and app.stash_draft.as_str() == "second draft", "stash swap preserves both drafts")?;
+    tui_clear(&mut app)?; interaction_assert(app.stash_draft.as_str() == "second draft", "session projection clearing retains temporary stash")?;
+    let choices: Vec<UiCandidate> = vec_new(); choices.push(UiCandidate { id: cli_text("one"), label: cli_text("preview"), detail: cli_text("session"), value: cli_text("Historical prompt\nwith needle 中文") }); tui_set_candidates(&mut app, "prompt-history", "History", choices)?;
+    tui_event(&mut app, &stash)?; interaction_assert(app.stash_draft.as_str() == "second draft", "stash cannot penetrate an overlay")?;
+    let filter = TerminalEvent { kind: 2, code: 0, modifiers: 0, width: 80, height: 30, data: cli_text("needle") }; tui_event(&mut app, &filter)?; interaction_assert(tui_filtered_candidates(&app)?.len() == 1, "history filtering searches full prompt text")?;
+    let inserted = tui_event(&mut app, &enter)?; interaction_assert(inserted.kind == 0 and app.draft.as_str() == "Historical prompt\nwith needle 中文" and app.queue.len() == 0, "history Enter only fills draft")?;
+    let code: Vec<UiCandidate> = vec_new(); code.push(UiCandidate { id: cli_text("code"), label: cli_text("sg"), detail: string_new(), value: cli_text("println(\"中文\");\n") }); tui_set_candidates(&mut app, "copy-code", "Copy code", code)?;
+    let copied = tui_event(&mut app, &enter)?; interaction_assert(copied.kind == 6 and copied.text.as_str() == "println(\"中文\");\n" and app.draft.as_str() == "Historical prompt\nwith needle 中文", "code selection copies exact body and preserves draft")?;
+    let history: Vec<UiCandidate> = vec_new(); history.push(UiCandidate { id: cli_text("one"), label: cli_text("one"), detail: string_new(), value: cli_text("replace") }); tui_set_candidates(&mut app, "prompt-history", "History", history)?; tui_event(&mut app, &esc)?;
+    interaction_assert(app.draft.as_str() == "Historical prompt\nwith needle 中文", "Esc closes history without replacing draft")
+}
+
+def interaction_tests() -> Result<bool, i64> { interaction_questions()?; interaction_pending()?; interaction_local()?; println("interaction UI: choices/custom/cancel, pending recall, stash, history and code-copy passed"); tui_true() }

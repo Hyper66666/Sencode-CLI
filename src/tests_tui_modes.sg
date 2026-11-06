@@ -1,0 +1,46 @@
+import tui;
+
+def mode_check(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; tui_true()
+}
+
+def mode_footer_colors(app: &UiApp, current: &str, next: &str) -> Result<bool, i64> {
+    let rows = tui_frame_rows(app)?; let row: &UiLine = rows.get(app.height - 2);
+    let colored = tui_colored_line(row, false, false, true)?;
+    mode_check(str_contains(colored.as_str(), current) and (next.len() == 0 or str_contains(colored.as_str(), next)), "permission labels use independent semantic color spans")?;
+    let plain = tui_colored_line(row, false, false, false)?;
+    mode_check(plain.as_str() == row.text.as_str() and not str_contains(plain.as_str(), "\x1b"), "NO_COLOR keeps permission labels and removes every style escape")
+}
+
+def mode_tests() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "gpt-6  medium", "fixture");
+    let backtab = TerminalEvent { kind: 1, code: 9, modifiers: 1, width: 120, height: 35, data: string_new() };
+    tui_resize(&mut app, 120, 35)?; tui_set_draft(&mut app, "Keep draft 中文 [image1]")?;
+    let action = tui_event(&mut app, &backtab)?;
+    mode_check(action.kind == 9 and app.draft.as_str() == "Keep draft 中文 [image1]" and app.queue.len() == 0, "Shift+Tab emits only the reserved permission action and preserves draft")?;
+    mode_check(str_contains(tui_frame(&app)?.as_str(), "手动审批") and str_contains(tui_frame(&app)?.as_str(), "gpt-6  medium"), "model effort and permissions are visible")?;
+    mode_footer_colors(&app, "\x1b[38;5;117m手动审批", "")?;
+    app.permission = cli_text("自动审批"); mode_footer_colors(&app, "\x1b[33m自动审批", "")?;
+    app.permission = cli_text("手动审批");
+    tui_begin(&mut app)?; app.permission = cli_text("完全权限");
+    tui_target(&mut app, "next", "next-model  xhigh", "fixture")?;
+    let active = tui_frame(&app)?;
+    mode_check(str_contains(active.as_str(), "手动审批") and str_contains(active.as_str(), "下轮 完全权限"), "active permissions remain visible while the future mode changes")?;
+    mode_check(str_contains(active.as_str(), "gpt-6  medium") and not str_contains(active.as_str(), "next-model"), "active model and effort remain visible while the next target changes")?;
+    mode_footer_colors(&app, "\x1b[38;5;117m手动审批", "\x1b[31m完全权限")?;
+    app.permission = cli_text("自动审批"); mode_footer_colors(&app, "\x1b[38;5;117m手动审批", "\x1b[33m自动审批")?;
+    app.permission = cli_text("完全权限");
+    tui_set_approval(&mut app, "nonce", "Approve tool?", false)?;
+    mode_check(tui_event(&mut app, &backtab)?.kind == 0 and app.approval.len() > 0 and not app.approval_yes and app.draft.as_str() == "Keep draft 中文 [image1]", "approval owns Shift+Tab and cannot approve or change policy")?;
+    app.approval.clear(); let candidates: Vec<UiCandidate> = vec_new(); candidates.push(UiCandidate { id: cli_text("one"), label: cli_text("one"), detail: string_new(), value: cli_text("one") });
+    tui_set_candidates(&mut app, "fixture", "Choose", candidates)?;
+    mode_check(tui_event(&mut app, &backtab)?.kind == 0 and app.picker.len() > 0, "picker prevents mode shortcut from penetrating")?;
+    tui_close_picker(&mut app)?; tui_set_draft(&mut app, "/")?;
+    mode_check(tui_event(&mut app, &backtab)?.kind == 0 and app.draft.as_str() == "/" and app.menu_open, "slash completion owns focus and cannot change permissions")?;
+    app.menu_open = false; tui_finish(&mut app, true)?;
+    mode_check(app.active_permission.len() == 0 and app.active_model.len() == 0 and str_contains(tui_frame(&app)?.as_str(), "完全权限") and str_contains(tui_frame(&app)?.as_str(), "next-model  xhigh"), "completed turn exposes the selected permission mode and next model")?;
+    mode_footer_colors(&app, "\x1b[31m完全权限", "")?;
+    tui_true()
+}
+
+def main() -> i64 { let result = mode_tests(); if not result.is_ok { return 1; }; println("permission composer: Shift+Tab, modal focus, preserved draft, active/future footer and model effort passed"); 0 }

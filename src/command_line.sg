@@ -1,0 +1,93 @@
+import common;
+import std::args;
+import std::process;
+
+def cli_argument(index: i64) -> Result<String, i64> {
+    let capacity = arg_len(index)?;
+    if capacity > 1048576 { return string_result_err(13); };
+    let buffer = ffi_buffer_new(capacity + 1)?;
+    let count = arg_copy(index, buffer)?;
+    string_from_bytes_raw(buffer.ptr(), count)
+}
+
+def cli_arguments() -> Result<JsonDoc, i64> {
+    let arguments = json_doc_object()?;
+    let root = arguments.root();
+    let positionals = arguments.new_array()?;
+    let checks = arguments.new_array()?;
+    root.object_set("positionals", positionals)?;
+    root.object_set("checks", checks)?;
+    let mut literal = false;
+    let mut index = 0;
+    let count = args_len();
+    if count < 0 { return Result { is_ok: false, value: arguments, error: 0 - count }; };
+    while index < count {
+        let item = cli_argument(index)?;
+        if not literal and item.as_str() == "--" { literal = true; index = index + 1; continue; };
+        if literal or not str_starts_with(item.as_str(), "-") {
+            positionals.array_push(arguments.new_string(item.as_str())?)?;
+            index = index + 1;
+            continue;
+        };
+        let equals = str_index_of(item.as_str(), "=");
+        let mut option = if equals < 0 { item.clone()? } else { cli_byte_slice(item.as_str(), 0, equals)? };
+        if option.as_str() == "-p" { option = cli_text("--prompt"); };
+        if option.as_str() == "-h" { option = cli_text("--help"); };
+        if option.as_str() == "-c" { option = cli_text("--continue"); };
+        if option.as_str() == "-r" { option = cli_text("--resume"); };
+        let mut name = string_new();
+        if str_starts_with(option.as_str(), "--") { name = cli_byte_slice(option.as_str(), 2, option.len())?; };
+        if name.as_str() == "resume" {
+            if root.object_has("resume") or root.object_has("continue") { return Result { is_ok: false, value: arguments, error: 2 }; };
+            let mut value = string_new();
+            if equals >= 0 { value = cli_byte_slice(item.as_str(), equals + 1, item.len())?; } else {
+                if index + 1 < count { let next = cli_argument(index + 1)?; if not str_starts_with(next.as_str(), "-") { value = next.clone()?; index = index + 1; }; };
+            };
+            cli_put_string(&arguments, root, "resume", value.as_str())?;
+            index = index + 1;
+            continue;
+        };
+        let flag = name.as_str() == "help" or name.as_str() == "version" or name.as_str() == "auto-edit" or name.as_str() == "allow-commands" or name.as_str() == "plan" or name.as_str() == "json" or name.as_str() == "continue" or name.as_str() == "engine-stdio" or name.as_str() == "yes" or name.as_str() == "follow" or name.as_str() == "observe" or name.as_str() == "import-history";
+        if flag {
+            if equals >= 0 or root.object_has(name.as_str()) { return Result { is_ok: false, value: arguments, error: 2 }; };
+            if name.as_str() == "continue" and root.object_has("resume") { return Result { is_ok: false, value: arguments, error: 2 }; };
+            cli_put_bool(&arguments, root, name.as_str(), true)?;
+            index = index + 1;
+            continue;
+        };
+        let accepted = name.as_str() == "cwd" or name.as_str() == "prompt" or name.as_str() == "output-format" or name.as_str() == "database" or name.as_str() == "connection" or name.as_str() == "model" or name.as_str() == "effort" or name.as_str() == "goal" or name.as_str() == "max-requests" or name.as_str() == "token-budget" or name.as_str() == "check" or name.as_str() == "base-url" or name.as_str() == "protocol" or name.as_str() == "label" or name.as_str() == "tui" or name.as_str() == "permission-profile" or name.as_str() == "branch" or name.as_str() == "job-timeout-ms" or name.as_str() == "after" or name.as_str() == "background-host";
+        if not accepted and name.as_str() != "permissions" { cli_diagnostic("Unknown option:"); cli_diagnostic(item.as_str()); return Result { is_ok: false, value: arguments, error: 2 }; };
+        let value = if equals >= 0 { cli_byte_slice(item.as_str(), equals + 1, item.len())? } else {
+            index = index + 1;
+            if index >= count { return Result { is_ok: false, value: arguments, error: 2 }; };
+            cli_argument(index)?
+        };
+        if name.as_str() == "check" { checks.array_push(arguments.new_string(value.as_str())?)?; (); } else {
+            if root.object_has(name.as_str()) { return Result { is_ok: false, value: arguments, error: 2 }; };
+            cli_put_string(&arguments, root, name.as_str(), value.as_str())?;
+            ();
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: arguments, error: 0 }
+}
+
+def cli_option(document: &JsonDoc, key: &str, fallback: &str) -> Result<String, i64> {
+    if document.root().object_has(key) { return cli_json_string(document.root(), key); };
+    string_from_str(fallback)
+}
+
+def cli_flag(document: &JsonDoc, key: &str) -> bool {
+    if not document.root().object_has(key) { return false; };
+    document.root().object_get(key).value.bool_value().unwrap_or(false)
+}
+
+def cli_current_directory() -> Result<String, i64> {
+    let buffer = ffi_buffer_new(32768)?;
+    let count = process_current_dir_copy(buffer)?;
+    string_from_bytes_raw(buffer.ptr(), count)
+}
+
+def cli_help() -> &str {
+    "Sencode — Sengoo-native terminal coding agent\n\nsen [--cwd PATH] [-p PROMPT] [--connection ID] [--model MODEL]\nsen resume [SESSION_ID or unique title]\nsen -c                         Continue the latest project session\nsen -r [ID or search]          Resume picker or matching session\nsen connections list|add|edit|remove|select\nsen models\nsen mcp list|add|remove|doctor\nsen extensions list|inspect ID|add MANIFEST|enable ID [--yes]|disable ID|remove ID\nsen doctor\nsen worktree list|create PATH|remove PATH [--branch NAME] [--yes]\nsen agent start -p PROMPT [--connection ID] [--model ID]\nsen agent list|logs JOB_ID|attach JOB_ID|stop JOB_ID\n\n'sencode' is an equivalent command; development executable: sencode-sg.exe.\nNo arguments opens the fullscreen workbench in the current directory.\nresume without an ID continues the most recent current-project session.\n\nOptions:\n  -p, --prompt TEXT       One headless task\n  --output-format FORMAT text, json or stream-json\n  --tui MODE             fullscreen (default), scrolling or plain\n  --effort LEVEL         Thinking effort (default medium when supported)\n  --plan                 Read-only planning mode\n  --goal OBJECTIVE       Foreground goal with explicit recovery\n  --check COMMAND        Required goal verification, repeatable\n  --max-requests N        Shared request budget (default 50)\n  --token-budget N        Optional goal token limit\n  --permissions MODE     Override remembered manual, auto or full policy\n  --auto-edit            Authorize workspace file edits\n  --allow-commands       Authorize arbitrary non-interactive commands\n  --import-history       Explicitly import a reviewed .sencode archive when its catalog is missing\n  --database PATH        Select an isolated/shared state database\n  --help, --version\n\nType / for the command menu; arrows select; Enter or Tab completes.\nA separate Enter submits the completed command. /help shows availability.\nShift+Tab cycles manual approval, automatic file edits and full tool approval.\n/model /connections /new /resume /branch /rename /export /compact /context\n/agents /consult /plan /goal /skills /permissions /usage /copy /keys /read /terminal /exit\nExplicit background Agent jobs use --job-timeout-ms (default one hour).\nUse logs --after CURSOR, --follow or attach --observe for read-only viewing.\nGoal jobs retain foreground control and pause when it disconnects.\n\nWhile streaming, edit a draft or submit it to the pending queue.\nShift+Enter inserts a line; Ctrl+C cancels; Escape closes the active overlay.\nTERM=dumb and redirected output use plain text; NO_COLOR disables styling.\n"
+}

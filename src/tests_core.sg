@@ -1,0 +1,45 @@
+import policy;
+
+def require(value: bool, message: &str) -> i64 {
+    if not value { cli_diagnostic(message); return 1; };
+    0
+}
+
+def main() -> i64 {
+    let mut policy = policy_default();
+    policy.plan = true;
+    policy.interactive = false;
+    let child = policy_child(&policy, "general");
+    let mut failures = 0;
+    failures = failures + require(not child.interactive, "Children cannot acquire interactive approval authority from a headless parent");
+    failures = failures + require(policy_decision(&policy, "run_command", false) == 2, "Plan must reject arbitrary processes");
+    failures = failures + require(policy_decision(&child, "write_file", false) == 2, "Plan must reach descendants");
+    failures = failures + require(policy_decision(&policy, "mcp__fs__read", false) == 2, "MCP annotations cannot bypass Plan");
+    failures = failures + require(policy_decision(&policy, "write_plan", true) == 0, "Plan file is the exact write exception");
+    failures = failures + require(policy_decision(&policy, "write_plan", false) == 2, "Other plan paths must stay protected");
+    failures = failures + require(policy_decision(&child, "cancel_agent", false) == 2, "Children cannot cancel siblings");
+    failures = failures + require(policy_decision(&policy, "wait_agents", false) == 0, "Read-only planning can wait for its own children");
+    let mut goal = goal_new(2, 100);
+    failures = failures + require(goal_accept_request(&mut goal), "Goal starts active");
+    goal_usage(&mut goal, 45);
+    failures = failures + require(goal_accept_request(&mut goal), "Children share the same request budget");
+    failures = failures + require(not goal_accept_request(&mut goal) and goal.status == 3, "Request budget must stop work");
+    let mut near_limit = goal_new(50, 0);
+    near_limit.tokens = 9223372036854775800;
+    goal_usage(&mut near_limit, 100);
+    failures = failures + require(near_limit.tokens == 9223372036854775807 and near_limit.status == 3, "Usage overflow saturates and stops requests");
+    let mut verify = goal_new(50, 0);
+    goal_verify(&mut verify, true, false, "infrastructure");
+    failures = failures + require(verify.status == 2, "Unavailable verification must not complete");
+    verify.status = 1;
+    goal_verify(&mut verify, false, true, "same failure");
+    goal_verify(&mut verify, false, true, "same failure");
+    failures = failures + require(verify.status == 2, "Repeated failure must pause");
+    verify.status = 1;
+    goal_restore(&mut verify);
+    failures = failures + require(verify.status == 2, "Restart must not drive a goal automatically");
+    let safe = cli_terminal_safe("hello\x1b[31m世界");
+    if safe.is_ok() { failures = failures + require(not str_contains(safe.value.as_str(), "\x1b"), "Untrusted text must not inject terminal escapes"); } else { failures = failures + 1; };
+    if failures == 0 { println("policy and goal acceptance passed"); };
+    failures
+}

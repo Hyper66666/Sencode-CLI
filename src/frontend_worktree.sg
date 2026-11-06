@@ -1,0 +1,150 @@
+import tui;
+import worktree;
+
+// Explicit-user local work only. The execution child never receives a worktree
+// request, and this owner never writes shared state while Git reserves it.
+struct FrontWorktree {
+    job: WorktreeJob, spec: WorktreeSpec, key: String,
+    operation: String, target: String, active: bool, pending: bool, blocked: bool,
+}
+
+def front_worktree_new() -> FrontWorktree {
+    FrontWorktree { job: worktree_job_empty(), spec: worktree_empty_spec(), key: string_new(), operation: string_new(), target: string_new(), active: false, pending: false, blocked: false }
+}
+
+def front_worktree_owns(flow: &FrontWorktree) -> bool { flow.active or flow.pending or flow.blocked }
+
+def front_worktree_usage() -> &str {
+    "/worktree [list]\n/worktree create ABSOLUTE_PATH\n/worktree remove ABSOLUTE_PATH\n\nThe complete remaining text is one literal path, including spaces; no quotes or flags are needed. Creation uses detached HEAD and never switches this session's directory. For an exact new branch use: sen worktree create PATH --branch EXACT_NAME\nPlan permits list only. Creation and removal require a fresh preview and confirmation. Queued tasks stay paused until /queue resume."
+}
+
+def front_worktree_forget(flow: &mut FrontWorktree) {
+    flow.pending = false; flow.spec = worktree_empty_spec(); flow.key.clear(); ();
+}
+
+def front_worktree_close(flow: &mut FrontWorktree) -> Result<bool, i64> {
+    let closed = worktree_close(&mut flow.job);
+    flow.active = false; front_worktree_forget(flow);
+    if not closed.is_ok() or not closed.value or flow.job.cleanup_unknown { flow.blocked = true; };
+    if not closed.is_ok() { return state_bool_error(closed.error); };
+    Result { is_ok: true, value: not flow.blocked, error: 0 }
+}
+
+def front_worktree_failure(flow: &mut FrontWorktree, app: &mut UiApp, message: &str, code: i64) -> Result<bool, i64> {
+    front_worktree_close(flow); app.queue_paused = true; app.busy = flow.blocked;
+    let text = cli_text(message); text.push_str(" (code ")?; text.push_i64(code)?; text.push_str(")")?;
+    if flow.blocked { text.push_str("\nGit process cleanup is unknown. All submissions and state changes are blocked until this CLI exits.")?; (); };
+    tui_message(app, "notice", text.as_str())?;
+    tui_status(app, if flow.blocked { "Worktree cleanup unknown / exit required / no handoff" } else { "Worktree stopped / queue paused / inspect before retrying" })
+}
+
+def front_worktree_request(flow: &mut FrontWorktree, cwd: &str, policy: &AgentPolicy, app: &mut UiApp, value: &str, idle: bool) -> Result<bool, i64> {
+    if front_worktree_owns(flow) { return tui_message(app, "notice", "A worktree operation still owns this interface. Cancel it or finish its confirmation before another action."); };
+    if not idle or app.busy or not policy.interactive or policy.depth != 0 or app.approval.len() > 0 or app.picker.len() > 0 { return tui_message(app, "notice", "Worktree actions require the idle foreground interface. Wait for the current execution to finish."); };
+    let argument = str_trim(value)?;
+    let mut operation = cli_text("list"); let mut target = string_new();
+    if argument.len() > 0 and argument.as_str() != "list" {
+        let split = str_index_of(argument.as_str(), " ");
+        if split < 0 { return tui_message(app, "notice", front_worktree_usage()); };
+        operation = cli_byte_slice(argument.as_str(), 0, split)?;
+        target = str_trim(cli_byte_slice(argument.as_str(), split + 1, argument.len())?.as_str())?;
+        if operation.as_str() != "create" and operation.as_str() != "remove" or target.len() == 0 or not path_is_absolute(target.as_str()) { return tui_message(app, "notice", front_worktree_usage()); };
+    };
+    if operation.as_str() != "list" and policy.plan { return tui_message(app, "notice", "Plan mode refuses worktree creation and removal. /worktree list remains read only."); };
+    let started = worktree_inspect_start(cwd);
+    if not started.is_ok() { return front_worktree_failure(flow, app, "Cannot inspect this local Git checkout", started.error); };
+    flow.job = started.value; flow.operation = operation; flow.target = target; flow.active = true;
+    app.queue_paused = true; app.busy = true;
+    tui_status(app, "Inspecting Git worktrees / Ctrl+C cancels / queue paused")
+}
+
+def front_worktree_report(report: &JsonDoc) -> Result<String, i64> {
+    let text = cli_text("GIT WORKTREES / "); text.push_str(cli_json_optional_string(report.root(), "status").as_str())?; text.push_str("\n")?;
+    let message = cli_json_optional_string(report.root(), "message"); if message.len() > 0 { text.push_str(message.as_str())?; text.push_str("\n")?; (); };
+    if report.root().object_has("worktrees") {
+        let entries = report.root().object_get("worktrees")?;
+        let cwd = cli_json_optional_string(report.root(), "cwd"); let mut index = 0;
+        while index < entries.array_len()? {
+            let entry = entries.array_get(index)?; let path = cli_json_string(entry, "path")?;
+            text.push_str(if index == 0 { "[main] " } else { "       " })?;
+            text.push_str(if worktree_contains(path.as_str(), cwd.as_str())? { "* " } else { "  " })?;
+            text.push_str(path.as_str())?; text.push_str("  ")?;
+            let branch = cli_json_optional_string(entry, "branch"); text.push_str(if branch.len() == 0 { "(detached)" } else { branch.as_str() })?;
+            if cli_json_optional_i64(entry, "locked", 0) == 1 { text.push_str(" [locked]")?; (); };
+            if cli_json_optional_i64(entry, "prunable", 0) == 1 { text.push_str(" [prunable]")?; (); };
+            text.push_str("\n")?; index = index + 1;
+        };
+    };
+    let errors = cli_json_optional_string(report.root(), "git_stderr");
+    if errors.len() > 0 { text.push_str("\nGit diagnostic:\n")?; text.push_str(errors.as_str())?; text.push_str("\n")?; (); };
+    if report.root().object_has("refresh_required") and report.root().object_get("refresh_required")?.bool_value()? { text.push_str("Inspect again before another action; a started mutation is never replayed.\n")?; (); };
+    text.push_str("Queue paused. Use /queue resume explicitly when ready.")?;
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def front_worktree_preview(flow: &mut FrontWorktree, app: &mut UiApp, terminal: &Terminal) -> Result<bool, i64> {
+    let inspection = worktree_result(&flow.job)?;
+    let specification = worktree_mutation_spec(&inspection, flow.operation.as_str(), flow.target.as_str(), "");
+    if not specification.is_ok() { return front_worktree_failure(flow, app, "Target refused: use an exact supported local path and an idle clean secondary checkout for removal", specification.error); };
+    let spec = specification.value; let preview = worktree_preview(&spec)?; let key = worktree_approval_key(&spec)?;
+    let text = cli_text("Exact worktree preview / "); text.push_str(flow.operation.as_str())?; text.push_str("\n")?; text.push_str(preview.as_str())?;
+    tui_message(app, "tool", text.as_str())?;
+    let choices: Vec<UiCandidate> = vec_new();
+    choices.push(UiCandidate { id: cli_text("no"), label: cli_text("Cancel"), detail: cli_text("Keep all worktrees unchanged"), value: cli_text("no") });
+    choices.push(UiCandidate { id: cli_text("yes"), label: cli_text(if flow.operation.as_str() == "create" { "Create this detached worktree" } else { "Remove this exact clean worktree" }), detail: flow.target.clone()?, value: cli_text("yes") });
+    // Input already queued before this immutable preview is not fresh consent.
+    terminal.discard_input()?;
+    tui_set_candidates(app, "worktree-confirm", "Worktree operation / explicit approval", choices)?;
+    flow.active = false; flow.pending = true; flow.spec = spec; flow.key = key; app.busy = false;
+    tui_true()
+}
+
+def front_worktree_tick(flow: &mut FrontWorktree, state: &CliState, policy: &AgentPolicy, app: &mut UiApp, terminal: &Terminal) -> Result<bool, i64> {
+    if not flow.active { return tui_true(); };
+    app.queue_paused = true;
+    let polled = worktree_poll(state, policy, &mut flow.job);
+    if not polled.is_ok() { return front_worktree_failure(flow, app, "Git worktree polling stopped", polled.error); };
+    if not flow.job.done { return tui_true(); };
+    let report = worktree_result(&flow.job)?;
+    if flow.job.cleanup_unknown {
+        flow.active = false; flow.blocked = true; front_worktree_forget(flow); app.busy = true;
+        tui_message(app, "notice", front_worktree_report(&report)?.as_str())?;
+        return tui_status(app, "Worktree cleanup unknown / exit required / no handoff");
+    };
+    let status = cli_json_optional_string(report.root(), "status");
+    if flow.operation.as_str() != "list" and flow.job.spec.operation.as_str() == "inspect" and status.as_str() == "complete" and cli_json_optional_string(report.root(), "capability").as_str() == "ready" {
+        let preview = front_worktree_preview(flow, app, terminal);
+        if not preview.is_ok() { return front_worktree_failure(flow, app, "A fresh worktree approval could not be opened; nothing was authorized", preview.error); };
+        return preview;
+    };
+    flow.active = false; app.busy = false;
+    tui_message(app, "notice", front_worktree_report(&report)?.as_str())?;
+    tui_status(app, "Worktree finished / queue paused / /worktree lists again")
+}
+
+def front_worktree_approve(flow: &mut FrontWorktree, state: &CliState, policy: &AgentPolicy, app: &mut UiApp, approved: bool, idle: bool) -> Result<bool, i64> {
+    if not flow.pending { return tui_message(app, "notice", "This worktree approval is no longer active. Inspect and approve a new operation."); };
+    flow.pending = false; app.queue_paused = true;
+    if not approved { front_worktree_forget(flow); return tui_status(app, "Worktree operation cancelled / no mutation / queue paused"); };
+    if flow.blocked or flow.active or not idle or app.busy or policy.plan or not policy.interactive or policy.depth != 0 { front_worktree_forget(flow); return tui_message(app, "notice", "Worktree approval refused by the current foreground or Plan policy. Inspect again before retrying."); };
+    let specification = worktree_mutation_spec(&flow.spec.snapshot, flow.spec.operation.as_str(), flow.spec.target.as_str(), flow.spec.branch.as_str());
+    if not specification.is_ok() { front_worktree_forget(flow); return front_worktree_failure(flow, app, "The approved worktree target changed", specification.error); };
+    let key = flow.key.clone()?; front_worktree_forget(flow);
+    let started = worktree_start(state, policy, specification.value, true, key.as_str());
+    if not started.is_ok() { return front_worktree_failure(flow, app, "This exact worktree operation could not start; a fresh preview is required", started.error); };
+    flow.job = started.value; flow.active = true; app.busy = true;
+    tui_status(app, "Running approved Git worktree job / Ctrl+C cancels / queue paused")
+}
+
+def front_worktree_cancel(flow: &mut FrontWorktree, app: &mut UiApp) -> Result<bool, i64> {
+    app.queue_paused = true;
+    if flow.blocked { return tui_status(app, "Worktree cleanup unknown / exit required / state changes blocked"); };
+    if flow.pending { front_worktree_forget(flow); tui_close_picker(app)?; return tui_status(app, "Worktree operation cancelled / no mutation / queue paused"); };
+    if flow.active { worktree_cancel(&mut flow.job); return tui_status(app, "Cancelling worktree job / waiting for the whole Git tree to stop"); };
+    tui_true()
+}
+
+def front_worktree_dismiss(flow: &mut FrontWorktree, app: &mut UiApp) -> Result<bool, i64> {
+    if flow.pending and app.picker.as_str() != "worktree-confirm" { return front_worktree_cancel(flow, app); };
+    tui_true()
+}

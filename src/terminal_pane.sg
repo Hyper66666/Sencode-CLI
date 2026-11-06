@@ -1,0 +1,148 @@
+import tui;
+import pty_session;
+import pty_vt;
+
+// Only explicit user interaction can enter this pane. It is not a model tool.
+// It owns session execution as well as workspace write exclusion until the
+// entire PTY tree is quiescent. Unknown cleanup leaves the durable ledger live.
+struct TerminalPane {
+    active: bool, pending: bool, session: PtySession, execution: CliExecution,
+    spec: PtySessionSpec, key: String, call_id: String, screen: PtyVt,
+    input: Buffer, output: Buffer, previous: String, note: String, certified: bool,
+}
+def pane_new(cwd: &str) -> Result<TerminalPane, i64> {
+    Result { is_ok: true, value: TerminalPane { active: false, pending: false,
+        session: pty_session_empty(), execution: state_execution_error(0).value,
+        spec: pty_session_spec("", cwd)?, key: string_new(), call_id: string_new(),
+        screen: vt_new(2, 1), input: ffi_buffer_new(65536)?, output: ffi_buffer_new(4096)?,
+        previous: string_new(), note: string_new(), certified: false }, error: 0 }
+}
+def pane_columns(terminal: &Terminal) -> i64 { vt_clamp(terminal.width() - 4, 2, 240) }
+def pane_rows(terminal: &Terminal) -> i64 { vt_clamp(terminal.height() - 5, 1, 100) }
+def pane_prepare(pane: &mut TerminalPane, cwd: &str, choice: &str, terminal: &Terminal, policy: &AgentPolicy, app: &mut UiApp) -> Result<bool, i64> {
+    if pane.active or app.busy or policy.plan or not policy.interactive or policy.depth != 0 { return state_bool_error(7); };
+    let system = ui_env("SystemRoot")?;
+    let executable = if choice == "" or choice == "powershell" { path_join_string(system.as_str(), "System32/WindowsPowerShell/v1.0/powershell.exe")? } else {
+        if choice != "cmd" { return state_bool_error(2); }; path_join_string(system.as_str(), "System32/cmd.exe")?
+    };
+    // cmd.exe parses argv[0] itself and does not accept the mixed separators
+    // tolerated by CreateProcessW/PowerShell. Preview its actual native path.
+    let native_executable = canonical_path_string(executable.as_str())?;
+    let spec = pty_session_spec(native_executable.as_str(), cwd)?;
+    if choice == "cmd" { spec.args.push(cli_text("/D")); (); } else { spec.args.push(cli_text("-NoLogo")); spec.args.push(cli_text("-NoProfile")); (); };
+    let mut sized = spec; sized.columns = pane_columns(terminal); sized.rows = pane_rows(terminal);
+    let preview = pty_session_preview(cwd, &sized)?; let key = pty_session_approval_key(cwd, &sized)?;
+    pane.spec = sized; pane.key = key; pane.pending = true;
+    let text = cli_text("Start an interactive user terminal? It can modify this workspace; commands are not sandboxed. Closing the pane stops its entire process tree.\n\n");
+    text.push_str(preview.as_str())?; tui_message(app, "notice", text.as_str())?;
+    let choices: Vec<UiCandidate> = vec_new();
+    choices.push(UiCandidate { id: cli_text("no"), label: cli_text("Cancel"), detail: cli_text("Keep the workspace unchanged"), value: cli_text("no") });
+    choices.push(UiCandidate { id: cli_text("yes"), label: cli_text("Start user terminal"), detail: cli_text("Explicitly approve this exact launch"), value: cli_text("yes") });
+    tui_set_candidates(app, "terminal-launch", "Interactive terminal / explicit approval", choices)
+}
+def pane_start(pane: &mut TerminalPane, state: &CliState, cwd: &str, session: &str, policy: &AgentPolicy, approved: bool) -> Result<bool, i64> {
+    if not pane.pending { return state_bool_error(7); }; pane.pending = false;
+    if not approved { return tui_true(); };
+    if policy.plan or pane.active { return state_bool_error(7); };
+    let mut execution = cli_state_begin_maintenance(state, session)?;
+    let call_id = state_id("user-terminal-")?;
+    let metadata = json_doc_object()?; cli_put_string(&metadata, metadata.root(), "launch_sha256", pane.key.as_str())?;
+    let claimed = cli_state_tool_claim(state, &execution, call_id.as_str(), "user_terminal", metadata.serialize_string()?.as_str());
+    if not claimed.is_ok { cli_state_finish(state, &mut execution, "error")?; return state_bool_error(claimed.error); };
+    if not claimed.value { cli_state_finish(state, &mut execution, "error")?; return state_bool_error(12); };
+    let spec = pty_session_spec(pane.spec.executable.as_str(), pane.spec.cwd.as_str())?;
+    let mut owned = spec; owned.columns = pane.spec.columns; owned.rows = pane.spec.rows; let mut i = 0;
+    while i < pane.spec.args.len() { let value = pane.spec.args.get(i)?; owned.args.push(value); i = i + 1; };
+    let started = pty_session_start(state, cwd, policy, owned, true, pane.key.as_str());
+    if not started.is_ok {
+        cli_state_tool_complete(state, &execution, call_id.as_str(), "{\"started\":false}")?;
+        cli_state_finish(state, &mut execution, "error")?; return state_bool_error(started.error);
+    };
+    pane.screen = vt_new(pane.spec.columns, pane.spec.rows); pane.session = started.value;
+    pane.execution = execution; pane.call_id = call_id; pane.active = true; pane.certified = false;
+    pane.input.clear(); pane.previous.clear(); pane.note = cli_text("User terminal / model submissions are paused"); tui_true()
+}
+def pane_certify(pane: &mut TerminalPane, state: &CliState) -> Result<bool, i64> {
+    if pane.certified { return tui_true(); };
+    if not pane.session.exited or not pane.session.quiescent or pane.session.cleanup_unknown { return state_bool_error(12); };
+    let result = pty_session_status(&pane.session)?;
+    cli_state_tool_complete(state, &pane.execution, pane.call_id.as_str(), result.serialize_string()?.as_str())?;
+    cli_state_finish(state, &mut pane.execution, "idle")?; pane.certified = true;
+    pane.note = cli_text("Terminal finished / Esc returns to the original draft"); tui_true()
+}
+def pane_close(pane: &mut TerminalPane, state: &CliState) -> Result<bool, i64> {
+    if not pane.active { pane.pending = false; return tui_true(); };
+    pty_session_close(&mut pane.session)?; pane_certify(pane, state)?;
+    pane.active = false; pane.input.clear(); pane.previous.clear(); tui_true()
+}
+def pane_tick(pane: &mut TerminalPane, state: &CliState, policy: &AgentPolicy, terminal: &Terminal) -> Result<bool, i64> {
+    if not pane.active { return tui_true(); };
+    if policy.plan { return pane_close(pane, state); };
+    if not pane.certified {
+        let columns = if terminal.width() > 0 { pane_columns(terminal) } else { pane.screen.columns };
+        let rows = if terminal.height() > 0 { pane_rows(terminal) } else { pane.screen.rows };
+        if pane.screen.columns != columns or pane.screen.rows != rows { pty_session_resize(&mut pane.session, columns, rows)?; vt_resize(&mut pane.screen, columns, rows)?; pane.previous.clear(); (); };
+        let count = pty_session_read(&mut pane.session, &mut pane.output)?;
+        vt_feed(&mut pane.screen, &pane.output, count)?;
+        if pane.input.used_len() > 0 and not pane.session.exited {
+            let written = pty_session_write(&pane.session, policy, &pane.input, pane.input.used_len())?; pane.input.consume(written)?; ();
+        };
+        if pane.session.exited and pane.session.quiescent and count == 0 and pane.session.process.eof()? { vt_finish(&mut pane.screen)?; pane_certify(pane, state)?; (); };
+    };
+    tui_true()
+}
+def pane_bytes(event: &TerminalEvent, bracketed: bool) -> Result<String, i64> {
+    let out = string_new();
+    if event.kind == 2 {
+        if event.data.len() > 32768 { return string_result_err(13); };
+        if not bracketed and (str_contains(event.data.as_str(), "\n") or str_contains(event.data.as_str(), "\r")) { return string_result_err(7); };
+        if bracketed { out.push_str("\x1b[200~")?; (); }; out.push_str(event.data.as_str())?;
+        if bracketed { out.push_str("\x1b[201~")?; (); }; return Result { is_ok: true, value: out, error: 0 };
+    };
+    if event.kind == 4 { return Result { is_ok: true, value: cli_text("\x03"), error: 0 }; };
+    if event.kind != 1 { return Result { is_ok: true, value: out, error: 0 }; };
+    let code = event.code;
+    if code == 13 { out.push_str("\r")?; (); }; if code == 9 { out.push_str("\t")?; (); };
+    if code == 8 { out.push_str("\x7f")?; (); }; if code == 27 { out.push_str("\x1b")?; (); };
+    if code == 1001 { out.push_str("\x1b[A")?; (); }; if code == 1002 { out.push_str("\x1b[B")?; (); };
+    if code == 1003 { out.push_str("\x1b[C")?; (); }; if code == 1004 { out.push_str("\x1b[D")?; (); };
+    if code == 1005 { out.push_str("\x1b[H")?; (); }; if code == 1006 { out.push_str("\x1b[F")?; (); };
+    if code == 1007 { out.push_str("\x1b[3~")?; (); };
+    if code >= 1 and code <= 26 and code != 8 and code != 9 and code != 13 {
+        let byte = ffi_buffer_new(1)?; byte.push_u8(code)?; let value = string_from_bytes_raw(byte.ptr(), 1)?; out.push_str(value.as_str())?; ();
+    };
+    if event.data.len() > 0 and (code >= 32 and code < 1000 or code > 1010) { out.push_str(event.data.as_str())?; (); };
+    Result { is_ok: true, value: out, error: 0 }
+}
+def pane_event(pane: &mut TerminalPane, state: &CliState, event: &TerminalEvent) -> Result<bool, i64> {
+    if not pane.active { return tui_true(); };
+    if event.kind == 5 or event.kind == 1 and event.code == 17 or pane.certified and event.kind == 1 and event.code == 27 { return pane_close(pane, state); };
+    if pane.certified { return tui_true(); };
+    let encoded = pane_bytes(event, pane.screen.bracketed_paste);
+    if not encoded.is_ok { pane.note = cli_text("Paste refused: multiline input requires shell bracketed-paste support; limit 32 KiB"); return tui_true(); };
+    if pane.input.used_len() + encoded.value.len() > 65536 { pane.note = cli_text("Terminal input is busy; retry when its bounded queue drains"); return tui_true(); };
+    pane.input.append_str(encoded.value.as_str())?; tui_true()
+}
+def pane_paint(pane: &mut TerminalPane, terminal: &Terminal) -> Result<bool, i64> {
+    if not pane.active { return tui_true(); };
+    let rows: Vec<String> = vec_new(); let columns = pane.screen.columns;
+    rows.push(ui_fit("SENCODE / USER TERMINAL", columns)?); rows.push(ui_repeat("─", columns)?);
+    let mut y = 0; while y < pane.screen.rows { rows.push(vt_row(&pane.screen, y)?); y = y + 1; };
+    rows.push(ui_fit(pane.note.as_str(), columns)?);
+    rows.push(ui_fit("Ctrl+Q closes and stops tree / Ctrl+C goes to shell / composer draft kept", columns)?);
+    let frame = string_new(); let old = pane.previous.split("\n"); let output = cli_text("\x1b[?25l"); let margin = (terminal.width() - columns) / 2;
+    let mut index = 0;
+    while index < terminal.height() {
+        let line = ui_repeat(" ", if margin < 0 { 0 } else { margin })?;
+        if index < rows.len() { let row = rows.get(index)?; line.push_str(row.as_str())?; (); };
+        if index > 0 { frame.push_str("\n")?; (); }; frame.push_str(line.as_str())?;
+        let prior = old.next();
+        if not prior.is_some or prior.value.as_str() != line.as_str() {
+            output.push_str("\x1b[")?; output.push_i64(index + 1)?; output.push_str(";1H\x1b[0m\x1b[2K")?; output.push_str(line.as_str())?; ();
+        }; index = index + 1;
+    };
+    if not pane.certified and pane.screen.cursor_visible {
+        output.push_str("\x1b[")?; output.push_i64(pane.screen.y + 3)?; output.push_str(";")?; output.push_i64(margin + pane.screen.x + 1)?; output.push_str("H\x1b[?25h")?; ();
+    };
+    terminal.write(output.as_str())?; pane.previous = frame; tui_true()
+}

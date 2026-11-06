@@ -1,0 +1,53 @@
+import tui;
+
+def input_assert(value: bool, label: &str) -> Result<bool, i64> { if not value { println(label); return Result { is_ok: false, value: false, error: 1 }; }; tui_true() }
+def input_event(code: i64, text: &str) -> TerminalEvent { TerminalEvent { kind: if text.len() > 0 { 2 } else { 1 }, code: code, modifiers: 0, width: 100, height: 30, data: cli_text(text) } }
+def input_down(app: &mut UiApp, count: i64) -> Result<bool, i64> { let down = input_event(1002, ""); let mut index = 0; while index < count { tui_event(app, &down)?; index = index + 1; }; tui_true() }
+def input_reference(items: &Vec<UiCandidate>, path: &str) { items.push(UiCandidate { id: cli_text(path), label: cli_text(path), detail: cli_text(if str_ends_with(path, "/") { "directory" } else { "file" }), value: cli_text(path) }); (); }
+
+def input_tests() -> Result<i64, i64> {
+    let mut app = tui_new("D:/fixture", "fixture", "fixture", "fixture"); let enter = input_event(13, ""); let esc = input_event(27, ""); let clear = input_event(21, "");
+    let generic_registry = commands_registry(); input_assert(not str_contains(commands_names(&generic_registry)?.as_str(), "/queue") and str_contains(commands_names(&app.registry)?.as_str(), "/queue"), "queue capability is enabled only by the fullscreen host")?;
+    input_assert(commands_arguments("/permissions").len() == 5 and commands_arguments("/goal").len() == 2 and commands_arguments("/plan").len() == 1, "registry owns implemented argument candidates")?;
+    tui_set_draft(&mut app, "/permissions auto")?;
+    input_assert(app.menu_open and app.completion_kind.as_str() == "argument" and app.completions.len() == 1, "argument candidate filtering")?;
+    input_assert(tui_event(&mut app, &enter)?.kind == 0 and app.draft.as_str() == "/permissions auto-edit ", "argument Enter only completes")?;
+    input_assert(tui_event(&mut app, &enter)?.kind == 1, "argument requires a separate explicit execution Enter")?;
+    tui_set_draft(&mut app, "/goal Build the project")?; input_assert(not app.menu_open and tui_event(&mut app, &enter)?.kind == 1, "free-form Goal objectives are not trapped in an argument menu")?;
+
+    let paths: Vec<UiCandidate> = vec_new(); input_reference(&paths, "src/main.sg"); input_reference(&paths, "src/"); input_reference(&paths, "docs/中文 file.md"); input_reference(&paths, "../escape"); input_reference(&paths, "D:/absolute"); input_reference(&paths, "/rooted"); input_reference(&paths, "bad\nfile");
+    tui_set_references(&mut app, paths)?; input_assert(app.references.len() == 3, "reference boundary rejects escaping, absolute and control paths")?;
+    tui_set_draft(&mut app, "Read @src/m")?;
+    input_assert(tui_reference_query(&app)?.as_str() == "@src/m" and app.completion_kind.as_str() == "reference" and app.completions.len() == 1, "workspace reference prefix lookup")?;
+    input_assert(tui_event(&mut app, &enter)?.kind == 0 and app.draft.as_str() == "Read @src/main.sg " and app.queue.len() == 0, "reference Enter inserts without submission")?;
+    input_assert(tui_event(&mut app, &enter)?.kind == 1, "reference requires a separate explicit send")?;
+    tui_set_draft(&mut app, "Read @docs/")?; tui_event(&mut app, &enter)?;
+    input_assert(app.draft.as_str() == "Read @\"docs/中文 file.md\" ", "space and Unicode paths are quoted as one reference")?;
+    tui_set_draft(&mut app, "/goal @src/m")?;
+    input_assert(app.completion_kind.as_str() == "reference", "references also work in free-form command arguments")?;
+    tui_set_draft(&mut app, "读 @src/m next")?; app.cursor = str_index_of(app.draft.as_str(), " next"); tui_refresh_menu(&mut app)?; tui_event(&mut app, &enter)?;
+    input_assert(str_starts_with(app.draft.as_str(), "读 @src/main.sg ") and str_ends_with(app.draft.as_str(), " next"), "reference completion preserves text after the cursor")?;
+
+    tui_set_draft(&mut app, "")?; tui_begin(&mut app)?;
+    tui_set_draft(&mut app, "first queued task")?; tui_event(&mut app, &enter)?; tui_set_draft(&mut app, "second queued task")?; tui_event(&mut app, &enter)?;
+    tui_set_draft(&mut app, "untouched composer 中文")?; let queue_key = input_event(17, ""); tui_event(&mut app, &queue_key)?;
+    input_assert(app.queue_paused and app.picker.as_str() == "queue" and app.queue.len() == 2 and app.draft.as_str() == "untouched composer 中文", "queue inspection holds dispatch and preserves composer")?;
+    input_down(&mut app, 1)?; tui_event(&mut app, &enter)?; input_down(&mut app, 2)?; tui_event(&mut app, &enter)?;
+    input_assert(app.queue_edit_index == 0 and app.draft.as_str() == "first queued task" and app.picker.len() == 0, "queued task opens a distinct editor")?;
+    tui_event(&mut app, &clear)?; let edited = input_event(0, "edited queued task 中文"); tui_event(&mut app, &edited)?;
+    input_assert(tui_event(&mut app, &enter)?.kind == 0 and app.queue.get(0).text.as_str() == "edited queued task 中文" and app.draft.as_str() == "untouched composer 中文", "queued edit Enter saves without submitting or losing current draft")?;
+    tui_event(&mut app, &esc)?; tui_finish(&mut app, true)?;
+    input_assert(tui_take_submission(&mut app)?.kind == 0 and app.queue.len() == 2, "queue remains paused after saving and closing")?;
+    tui_event(&mut app, &queue_key)?; input_down(&mut app, 3)?; tui_event(&mut app, &enter)?;
+    input_assert(not app.queue_paused and app.draft.as_str() == "untouched composer 中文", "explicit queue Resume preserves composer")?;
+    input_assert(tui_take_submission(&mut app)?.text.as_str() == "edited queued task 中文" and tui_take_submission(&mut app)?.text.as_str() == "second queued task" and tui_take_submission(&mut app)?.kind == 0, "resumed queue dispatches edited tasks once in FIFO order")?;
+
+    tui_begin(&mut app)?; tui_set_draft(&mut app, "keep this task")?; tui_event(&mut app, &enter)?; tui_set_draft(&mut app, "keep composer")?;
+    tui_event(&mut app, &queue_key)?; input_down(&mut app, 1)?; tui_event(&mut app, &enter)?; input_down(&mut app, 2)?; tui_event(&mut app, &enter)?;
+    tui_event(&mut app, &clear)?; let discarded = input_event(0, "discard this edit"); tui_event(&mut app, &discarded)?; input_assert(tui_event(&mut app, &esc)?.kind == 0 and app.queue.get(0).text.as_str() == "keep this task" and app.draft.as_str() == "keep composer", "Escape discards only the queued edit")?;
+    input_down(&mut app, 1)?; tui_event(&mut app, &enter)?; input_down(&mut app, 3)?; input_assert(tui_event(&mut app, &enter)?.kind == 0 and app.queue.len() == 0 and app.busy, "cancelling one queued task never cancels the active request")?;
+    tui_event(&mut app, &esc)?; tui_set_draft(&mut app, "/queue")?; tui_event(&mut app, &enter)?; input_assert(tui_event(&mut app, &enter)?.kind == 0 and app.picker.as_str() == "queue", "/queue is handled entirely by the UI")?;
+    println("Input: registry arguments, bounded workspace references, two-step completion, queue inspection/edit/cancel/resume and draft isolation passed"); cli_ok(0)
+}
+
+def main() -> i64 { let result = input_tests(); if not result.is_ok { println(result.error); return 1; }; result.value }

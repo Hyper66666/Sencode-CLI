@@ -1,0 +1,106 @@
+import worktree;
+import command_line;
+import terminal;
+
+def worktree_cli_positional(arguments: &JsonDoc, index: i64) -> String {
+    let items = arguments.root().object_get("positionals");
+    if not items.is_ok() { return string_new(); };
+    let item = items.value.array_get(index);
+    if not item.is_ok() { return string_new(); };
+    item.value.string_value().unwrap_or(string_new())
+}
+
+def worktree_cli_usage() -> &str {
+    "Usage: sen worktree list\n       sen worktree create PATH [--branch EXACT_NEW_NAME] [--yes]\n       sen worktree remove PATH [--yes]\n\nCreation defaults to detached HEAD. Current/primary/dirty/active worktrees cannot be removed.\nMutations show an exact preview and require confirmation. Non-terminal use requires explicit --yes.\n--plan always refuses create/remove. --yes applies only to this exact current operation.\n"
+}
+
+def worktree_cli_report(report: &JsonDoc, arguments: &JsonDoc, list: bool) -> Result<i64,i64> {
+    let format = cli_option(arguments,"output-format","text")?;
+    if format.as_str() != "text" or cli_flag(arguments,"json") {
+        io_stdout_write(report.serialize_string()?.as_str())?; io_stdout_write("\n")?; io_stdout_flush()?;
+        ();
+    } else {
+        if list and cli_json_optional_string(report.root(),"capability").as_str() == "ready" {
+            let entries = report.root().object_get("worktrees")?;
+            let cwd = cli_json_string(report.root(),"cwd")?;
+            let mut index = 0;
+            while index < entries.array_len()? {
+                let entry = entries.array_get(index)?;
+                let path = cli_json_string(entry,"path")?;
+                let line = cli_text(if index == 0 { "  [main] " } else { "         " });
+                if worktree_contains(path.as_str(),cwd.as_str())? { line.push_str("* ")?; (); } else { line.push_str("  ")?; (); };
+                line.push_str(path.as_str())?;
+                let branch = cli_json_optional_string(entry,"branch");
+                line.push_str("  ")?; line.push_str(if branch.len() == 0 { "(detached)" } else { branch.as_str() })?;
+                if cli_json_optional_i64(entry,"locked",0) == 1 { line.push_str("  [locked]")?; (); };
+                if cli_json_optional_i64(entry,"prunable",0) == 1 { line.push_str("  [prunable]")?; (); };
+                line.push_str("\n")?; ui_output(line.as_str())?;
+                index = index + 1;
+            };
+        } else {
+            let message = cli_json_optional_string(report.root(),"message");
+            ui_output(message.as_str())?; ui_output("\n")?;
+            let errors = cli_json_optional_string(report.root(),"git_stderr");
+            if errors.len() > 0 { ui_output(errors.as_str())?; ui_output("\n")?; (); };
+        };
+        ();
+    };
+    let status = cli_json_optional_string(report.root(),"status");
+    cli_ok(if status.as_str() == "complete" { 0 } else { if status.as_str() == "cancelled" { 130 } else { 1 } })
+}
+
+def worktree_cli_wait(state: &CliState, policy: &AgentPolicy, terminal: &Terminal, job: &mut WorktreeJob) -> Result<JsonDoc,i64> {
+    let pending: Vec<TerminalEvent> = vec_new();
+    while not job.done {
+        if terminal.is_tty() and ui_poll_busy(terminal,&pending)? { worktree_cancel(job); };
+        worktree_poll(state,policy,job)?;
+        if not job.done { time_sleep_ms(5); (); };
+    };
+    worktree_result(job)
+}
+
+def worktree_cli_failure(arguments: &JsonDoc, status: &str, code: i64, message: &str) -> Result<i64,i64> {
+    let report = json_doc_object()?;
+    cli_put_i64(&report,report.root(),"schema",1)?;
+    cli_put_string(&report,report.root(),"status",status)?;
+    cli_put_i64(&report,report.root(),"code",code)?;
+    cli_put_string(&report,report.root(),"message",message)?;
+    worktree_cli_report(&report,arguments,false)
+}
+
+// Standalone management command; this does not register a model tool or pause
+// the fullscreen loop. main dispatches here before creating an agent session.
+def worktree_cli_run(state: &CliState, cwd: &str, arguments: &JsonDoc, terminal: &Terminal) -> Result<i64,i64> {
+    let first = worktree_cli_positional(arguments,0);
+    let action = worktree_cli_positional(arguments,1);
+    let target = worktree_cli_positional(arguments,2);
+    let count = arguments.root().object_get("positionals")?.array_len()?;
+    let listing = action.len() == 0 or action.as_str() == "list";
+    if first.as_str() != "worktree" or listing and target.len() > 0 or not listing and (action.as_str() != "create" and action.as_str() != "remove" or target.len() == 0) or count > 3 or listing and (arguments.root().object_has("branch") or cli_flag(arguments,"yes")) or action.as_str() == "remove" and arguments.root().object_has("branch") {
+        ui_output(worktree_cli_usage())?; return cli_ok(2);
+    };
+    let explicit = cli_flag(arguments,"yes");
+    let mut policy = policy_default(); policy.plan = cli_flag(arguments,"plan");
+    // --yes supplies explicit host-user authority for this command only; it
+    // never changes the permission policy of a model request or future run.
+    policy.interactive = terminal.is_tty() or explicit;
+    if not listing and policy.plan { return worktree_cli_failure(arguments,"refused",7,"Plan mode refuses worktree creation and removal, including --yes"); };
+    if not listing and not terminal.is_tty() and not explicit { return worktree_cli_failure(arguments,"refused",7,"Worktree mutation requires terminal confirmation or explicit --yes for this exact operation"); };
+    if terminal.is_tty() { terminal.enter_raw()?; (); };
+    let mut inspection = worktree_inspect_start(cwd)?;
+    let report = worktree_cli_wait(state,&policy,terminal,&mut inspection)?;
+    if listing or cli_json_optional_string(report.root(),"capability").as_str() != "ready" { return worktree_cli_report(&report,arguments,listing); };
+    let branch = cli_option(arguments,"branch","")?;
+    let specification = worktree_mutation_spec(&report,action.as_str(),target.as_str(),branch.as_str());
+    if not specification.is_ok() { return worktree_cli_failure(arguments,"refused",specification.error,"The target or branch is invalid, protected, locked, prunable or outside the supported local path boundary"); };
+    let spec = specification.value;
+    let preview = worktree_preview(&spec)?;
+    let key = worktree_approval_key(&spec)?;
+    let approved = if explicit { true } else { ui_confirm(terminal,preview.as_str())? };
+    if not approved { return worktree_cli_failure(arguments,"refused",7,"Worktree operation declined; nothing was started"); };
+    let started = worktree_start(state,&policy,spec,true,key.as_str());
+    if not started.is_ok() { return worktree_cli_failure(arguments,"refused",started.error,"Worktree operation could not acquire its exact approved execution boundary"); };
+    let mut job = started.value;
+    let result = worktree_cli_wait(state,&policy,terminal,&mut job)?;
+    worktree_cli_report(&result,arguments,false)
+}

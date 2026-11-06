@@ -1,0 +1,73 @@
+import common;
+
+// JSON Schema maxLength uses Unicode scalar values. Reject NUL before the
+// owned string is narrowed to the runtime's borrowed C-string view.
+def question_text_bounded(value: JsonValue, minimum: i64, maximum: i64) -> bool {
+    let parsed = value.string_value();
+    if not parsed.is_ok() { return false; };
+    let text = parsed.value;
+    if text.len() != text.as_str().len() { return false; };
+    let count = text.char_count();
+    count.is_ok() and count.value >= minimum and count.value <= maximum
+}
+
+def question_display_text_valid(text: &String, multiline: bool) -> bool {
+    let iter = text.chars();
+    loop {
+        let item = iter.next_codepoint();
+        if not item.is_some { break; };
+        if item.value < 32 or item.value >= 127 and item.value <= 159 {
+            if not multiline or item.value != 9 and item.value != 10 and item.value != 13 { iter.free(); return false; };
+        };
+    };
+    iter.free();
+    true
+}
+
+def question_options_checked(options: JsonValue) -> Result<bool, i64> {
+    if options.kind()? != JSON_KIND_ARRAY() { return Result { is_ok: true, value: false, error: 0 }; };
+    let count = options.array_len()?;
+    if count < 2 or count > 6 { return Result { is_ok: true, value: false, error: 0 }; };
+    let mut index = 0;
+    while index < count {
+        let item = options.array_get(index)?;
+        if item.kind()? != JSON_KIND_OBJECT() or not item.object_has("label") { return Result { is_ok: true, value: false, error: 0 }; };
+        let keys = item.object_keys()?; let mut key_index = 0;
+        while key_index < keys.root().array_len()? {
+            let key = keys.root().array_get(key_index)?.string_value()?;
+            if key.len() != key.as_str().len() or key.as_str() != "label" and key.as_str() != "description" { return Result { is_ok: true, value: false, error: 0 }; };
+            key_index = key_index + 1;
+        };
+        if not question_text_bounded(item.object_get("label")?, 1, 120) { return Result { is_ok: true, value: false, error: 0 }; };
+        let label = cli_json_string(item, "label")?;
+        let trimmed = str_trim(label.as_str())?;
+        if trimmed.len() == 0 or not question_display_text_valid(&label, false) { return Result { is_ok: true, value: false, error: 0 }; };
+        if item.object_has("description") and not question_text_bounded(item.object_get("description")?, 0, 400) { return Result { is_ok: true, value: false, error: 0 }; };
+        if item.object_has("description") { let description = cli_json_string(item, "description")?; if not question_display_text_valid(&description, true) { return Result { is_ok: true, value: false, error: 0 }; }; };
+        let mut previous = 0;
+        while previous < index {
+            let old = cli_json_string(options.array_get(previous)?, "label")?;
+            if str_trim(old.as_str())?.as_str() == trimmed.as_str() { return Result { is_ok: true, value: false, error: 0 }; };
+            previous = previous + 1;
+        };
+        index = index + 1;
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def question_options_valid(options: JsonValue) -> bool {
+    let valid = question_options_checked(options);
+    valid.is_ok() and valid.value
+}
+
+def question_arguments_valid(arguments: &JsonDoc) -> bool {
+    let root = arguments.root();
+    if not root.object_has("question") { return false; };
+    let text = root.object_get("question");
+    if not text.is_ok() or not question_text_bounded(text.value, 1, 8192) { return false; };
+    if root.object_has("options") {
+        let options = root.object_get("options");
+        if not options.is_ok() or not question_options_valid(options.value) { return false; };
+    };
+    true
+}

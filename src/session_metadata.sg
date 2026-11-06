@@ -1,0 +1,115 @@
+import common;
+
+// Non-executable provenance. It survives public-history import, unlike cached
+// context, approvals, checkpoints and tool recovery state.
+def session_origin(kind: &str, parent: &str, source: &str) -> Result<JsonDoc,i64> {
+    let document = json_doc_object()?;
+    cli_put_i64(&document, document.root(), "version", 1)?;
+    cli_put_string(&document, document.root(), "kind", kind)?;
+    if kind == "child" { cli_put_string(&document, document.root(), "parent_session_id", parent)?; (); };
+    if kind == "branch" { cli_put_string(&document, document.root(), "source_session_id", source)?; (); };
+    session_origin_sanitize(document.root())
+}
+
+def session_origin_sanitize(value: JsonValue) -> Result<JsonDoc,i64> {
+    if value.kind()? != JSON_KIND_OBJECT() or cli_json_optional_i64(value,"version",0) != 1 { return Result {is_ok:false,value:JsonDoc{handle:0},error:8}; };
+    let kind = cli_json_optional_string(value,"kind");
+    if kind.as_str() != "root" and kind.as_str() != "child" and kind.as_str() != "branch" { return Result {is_ok:false,value:JsonDoc{handle:0},error:8}; };
+    let output=json_doc_object()?; cli_put_i64(&output,output.root(),"version",1)?; cli_put_string(&output,output.root(),"kind",kind.as_str())?;
+    if kind.as_str() != "root" {
+        let key=if kind.as_str()=="child" {"parent_session_id"} else {"source_session_id"};
+        let identity=cli_json_string(value,key)?;
+        if identity.len()==0 or identity.len()>256 or cli_terminal_safe(identity.as_str())?.as_str()!=identity.as_str() { return Result {is_ok:false,value:JsonDoc{handle:0},error:8}; };
+        cli_put_string(&output,output.root(),key,identity.as_str())?; ();
+    }; Result {is_ok:true,value:output,error:0}
+}
+
+def session_title_placeholder(title: &str) -> Result<bool,i64> {
+    let clean=string_new();let source=cli_text(title);let chars=source.chars();
+    loop {let next=chars.next();if not next.is_some{break;};if not session_title_space(char_codepoint(next.value)?){clean.push_char(next.value)?; ();};};chars.free();
+    let lower=str_to_ascii_lower(clean.as_str())?;
+    Result {is_ok:true,value:lower.len()==0 or lower.as_str()=="newtask" or lower.as_str()=="newchat",error:0}
+}
+
+def session_title_replace(text: &str, needle: &str, replacement: &str) -> Result<String,i64> {
+    let out=string_new(); let mut start=0;
+    while start<text.len() {
+        let tail=cli_byte_slice(text,start,text.len())?; let at=str_index_of(tail.as_str(),needle);
+        if at<0 {out.push_str(tail.as_str())?;break;};
+        out.push_str(cli_byte_slice(tail.as_str(),0,at)?.as_str())?;out.push_str(replacement)?;start=start+at+needle.len();
+    }; Result{is_ok:true,value:out,error:0}
+}
+
+def session_title_visible(text: &str) -> Result<String,i64> {
+    // The title owns a small projection; it never retains the full prompt.
+    let clean=cli_terminal_safe(text)?; let lower=str_to_ascii_lower(clean.as_str())?;
+    let out=string_new();let mut start=0;
+    while start<clean.len() {
+        let tail=cli_byte_slice(lower.as_str(),start,lower.len())?;let at=str_index_of(tail.as_str(),"<system-reminder");
+        if at<0 {out.push_str(cli_byte_slice(clean.as_str(),start,clean.len())?.as_str())?;break;};
+        out.push_str(cli_byte_slice(clean.as_str(),start,start+at)?.as_str())?;
+        let remaining=cli_byte_slice(lower.as_str(),start+at,lower.len())?;let end=str_index_of(remaining.as_str(),"</system-reminder>");
+        if end<0 {break;};start=start+at+end+18;
+    };
+    let marker="<<<SENCODE_DESIGN_USER>>>";let mut visible=out;let mut offset=0;let mut last=-1;
+    while offset<visible.len(){let tail=cli_byte_slice(visible.as_str(),offset,visible.len())?;let at=str_index_of(tail.as_str(),marker);if at<0{break;};last=offset+at+marker.len();offset=last;};
+    if last>=0 {let candidate=str_trim(cli_byte_slice(visible.as_str(),last,visible.len())?.as_str())?;if candidate.len()>0{visible=candidate;};};
+    str_trim(visible.as_str())
+}
+
+def session_title_line(raw: &str) -> Result<String,i64> {
+    let mut line=str_trim(raw)?;
+    if str_starts_with(line.as_str(),"```") or str_starts_with(line.as_str(),"~~~") {return string_from_str("");};
+    let mut changed=true;
+    while changed and line.len()>0 {
+        changed=false;
+        if str_starts_with(line.as_str(),"> ") or str_starts_with(line.as_str(),"- ") or str_starts_with(line.as_str(),"* ") or str_starts_with(line.as_str(),"+ ") {
+            line=str_trim(cli_byte_slice(line.as_str(),2,line.len())?.as_str())?;changed=true;
+        } else if str_starts_with(line.as_str(),"[ ] ") or str_starts_with(line.as_str(),"[x] ") or str_starts_with(line.as_str(),"[X] ") {
+            line=str_trim(cli_byte_slice(line.as_str(),4,line.len())?.as_str())?;changed=true;
+        } else {
+            if str_starts_with(line.as_str(),"#") {let mut count=0;while count<line.len() and cli_byte_slice(line.as_str(),count,count+1)?.as_str()=="#" {count=count+1;};
+                if count==line.len() or cli_byte_slice(line.as_str(),count,count+1)?.as_str()==" " {line=str_trim(cli_byte_slice(line.as_str(),count,line.len())?.as_str())?;changed=true;};
+            };
+            if not changed {
+                let mut digits=0;let bytes=line.bytes();
+                loop {let next=bytes.next();if not next.is_some or next.value<48 or next.value>57{break;};digits=digits+1;};bytes.free();
+                if digits>0 and digits+2<=line.len() {
+                    let marker=cli_byte_slice(line.as_str(),digits,digits+2)?;
+                    if marker.as_str()==". " or marker.as_str()==") " {line=str_trim(cli_byte_slice(line.as_str(),digits+2,line.len())?.as_str())?;changed=true;};
+                };
+            };
+        };
+    };
+    line=session_title_replace(line.as_str(),"**","")?;line=session_title_replace(line.as_str(),"__","")?;line=session_title_replace(line.as_str(),"~~","")?;session_title_replace(line.as_str(),"`","")
+}
+
+def session_title_space(cp: i64) -> bool {
+    cp==9 or cp==10 or cp==11 or cp==12 or cp==13 or cp==32 or cp==133 or cp==160 or cp==5760 or cp>=8192 and cp<=8202 or cp==8232 or cp==8233 or cp==8239 or cp==8287 or cp==12288
+}
+
+def session_title_attachment(text: &str) -> Result<String,i64> {
+    let names=cli_byte_slice(text,7,text.len()-1)?;let parts=names.split(",");
+    loop {let part=parts.next();if not part.is_some{break;};let mut candidate=str_trim(part.value.as_str())?;
+        while candidate.len()>0 and (str_starts_with(candidate.as_str(),"\"") or str_starts_with(candidate.as_str(),"'")){candidate=cli_byte_slice(candidate.as_str(),1,candidate.len())?;};
+        while candidate.len()>0 and (str_ends_with(candidate.as_str(),"\"") or str_ends_with(candidate.as_str(),"'")){candidate=cli_byte_slice(candidate.as_str(),0,candidate.len()-1)?;};
+        let normalized=session_title_replace(candidate.as_str(),"\\","/")?;let path=normalized.split("/");let mut name=string_new();
+        loop{let next=path.next();if not next.is_some{break;};name=next.value;};path.free();name=str_trim(name.as_str())?;
+        if name.len()>0 and name.as_str()!="." and name.as_str()!=".." {parts.free();return Result{is_ok:true,value:name,error:0};};
+    };parts.free();string_from_str("")
+}
+
+def session_title(text: &str) -> Result<String,i64> {
+    let mut visible=session_title_visible(text)?;let lower=str_to_ascii_lower(visible.as_str())?;
+    if lower.as_str()=="[empty]" {return string_from_str("");};
+    if str_starts_with(lower.as_str(),"[image:") and str_ends_with(visible.as_str(),"]") {visible=session_title_attachment(visible.as_str())?;};
+    let joined=string_new();let lines=visible.split("\n");
+    loop {let next=lines.next();if not next.is_some{break;};let line=session_title_line(next.value.as_str())?;if joined.len()>0 {joined.push_str(" ")?; ();};joined.push_str(line.as_str())?;};lines.free();
+    let out=string_new();let chars=joined.chars();let mut count=0;let mut space=false;let mut overflow=false;
+    loop {let next=chars.next();if not next.is_some{break;};let cp=char_codepoint(next.value)?;
+        if session_title_space(cp) {if count>0{space=true;};} else {
+            if space {if count==30{overflow=true;break;};out.push_str(" ")?;count=count+1;space=false;};
+            if count==30{overflow=true;break;};out.push_char(next.value)?;count=count+1; ();
+        };
+    };chars.free();if overflow {out.push_str("…")?; ();};Result{is_ok:true,value:out,error:0}
+}

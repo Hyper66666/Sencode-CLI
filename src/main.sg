@@ -1,0 +1,327 @@
+import controller;
+import management;
+import views;
+import frontend;
+import engine;
+import job_commands;
+import worktree_cli;
+import extension_commands;
+import project_history;
+import session_target;
+import session_permissions;
+
+def main_resume(state: &CliState, cwd: &str, requested: &str) -> Result<String, i64> {
+    if requested.len() > 0 {
+        if cli_state_session_resumable(state, cwd, requested)? { return string_from_str(requested); };
+        let records = cli_state_resumable_sessions(state, cwd)?;
+        let items = records.root().object_get("sessions")?;
+        let needle = str_to_ascii_lower(requested)?;
+        let mut matched = string_new(); let mut index = 0;
+        while index < items.array_len()? {
+            let item = items.array_get(index)?; let title = str_to_ascii_lower(cli_json_string(item, "title")?.as_str())?;
+            if str_contains(title.as_str(), needle.as_str()) {
+                if matched.len() > 0 { cli_diagnostic("Several sessions match. Use sen -r to select one or provide its ID."); return string_result_err(12); };
+                matched = cli_json_string(item, "id")?;
+            };
+            index = index + 1;
+        };
+        if matched.len() > 0 { return Result { is_ok: true, value: matched, error: 0 }; };
+        cli_diagnostic("No matching session exists in this project. Select its project with --cwd."); return string_result_err(5);
+    };
+    let sessions = cli_state_resumable_sessions(state, cwd)?;
+    let items = sessions.root().object_get("sessions")?;
+    if requested.len() == 0 {
+        if items.array_len()? == 0 { cli_diagnostic("No sessions exist in the current project."); return string_result_err(5); };
+        return cli_json_string(items.array_get(0)?, "id");
+    };
+    string_result_err(5)
+}
+
+def main_options(arguments: &JsonDoc, cwd: &str, session: &str) -> Result<AgentOptions, i64> {
+    let directory = workspace_path(cwd, ".sencode/plans")?;
+    dir_create_all(directory.as_str())?;
+    let plan_path = path_join_string(directory.as_str(), session)?;
+    plan_path.push_str(".md")?;
+    let checks = json_doc_object()?;
+    checks.root().object_set("checks", checks.copy(arguments.root().object_get("checks")?)?)?;
+    let mut policy = policy_default();
+    policy.plan = cli_flag(arguments, "plan");
+    policy.auto_edit = cli_flag(arguments, "auto-edit");
+    policy.interactive = not arguments.root().object_has("prompt") and not arguments.root().object_has("goal") and cli_option(arguments, "output-format", "text")?.as_str() == "text";
+    let input: Vec<TerminalEvent> = vec_new();
+    let effort = connection_validate_effort(cli_option(arguments, "effort", "")?.as_str())?;
+    Result { is_ok: true, value: AgentOptions { cwd: cli_text(cwd), session: cli_text(session), connection: cli_option(arguments, "connection", "")?, model: cli_option(arguments, "model", "")?, effort: effort, format: cli_option(arguments, "output-format", "text")?, policy: policy, allow_commands: cli_flag(arguments, "allow-commands"), plan_path: plan_path, goal_text: cli_option(arguments, "goal", "")?, checks: checks, input: input }, error: 0 }
+}
+
+def main_doctor(state: &CliState, cwd: &str, terminal: &Terminal) -> Result<i64, i64> {
+    let report = diagnostics_doctor(state, cwd, terminal.is_tty())?;
+    output_document(&report)?;
+    cli_ok(0)
+}
+
+def main_skill_prompt(cwd: &str, name: &str, terminal: &Terminal, styled: bool) -> Result<String, i64> {
+    let buffer = ffi_buffer_new(32768)?;
+    let count = env_var_copy("USERPROFILE", buffer)?;
+    let home = string_from_buffer(buffer, count)?;
+    let catalog = skills_discover(cwd, home.as_str())?;
+    if name.len() == 0 { view_document(terminal, styled, "Skills", &catalog, "")?; return Result { is_ok: true, value: string_new(), error: 0 }; };
+    let instructions = skills_load(&catalog, name)?;
+    let prompt = cli_text("The user explicitly selected this file-based skill. It cannot grant permissions or override current Plan/Goal restrictions. Apply the following skill instructions within the current workspace:\n");
+    prompt.push_str(instructions.as_str())?;
+    Result { is_ok: true, value: prompt, error: 0 }
+}
+
+def main_welcome(state: &CliState, options: &AgentOptions, terminal: &Terminal) -> Result<bool, i64> {
+    let selected = view_selection(state, options.connection.as_str(), options.model.as_str())?;
+    ui_welcome(terminal, options.cwd.as_str(), cli_json_string(selected.root(), "connection")?.as_str(), cli_json_string(selected.root(), "model")?.as_str(), options.session.as_str())?;
+    if cli_json_string(selected.root(), "id")?.len() == 0 {
+        ui_notice(terminal, "Choose an API with /connections. Configure a new one using 'sen connections add'.")?;
+        ();
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main_interactive(state: &CliState, options: &mut AgentOptions, maximum_requests: i64, token_budget: i64, terminal: &Terminal, plain: bool, permission_profile: &str) -> Result<i64, i64> {
+    let mut profile = cli_text(permission_profile);
+    session_permissions_save(state, options.session.as_str(), &options.policy, options.allow_commands, profile.as_str())?;
+    let history: Vec<InputHistory> = vec_new();
+    let styled = terminal.is_tty() and options.format.as_str() == "text" and not plain;
+    let remembered = session_target_save(state, options.session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str());
+    if not remembered.is_ok() { ui_output("Model selection could not be saved while this session is active or unavailable.\n")?; (); };
+    if styled { main_welcome(state, options, terminal)?; (); };
+    loop {
+        let selected = view_selection(state, options.connection.as_str(), options.model.as_str())?;
+        let status = view_status(options.policy.plan, options.goal_text.len() > 0, options.policy.auto_edit, options.allow_commands, cli_json_string(selected.root(), "model")?.as_str())?;
+        if options.goal_text.len() == 0 {
+            let mode = cli_state_mode_load(state, options.session.as_str(), "goal")?;
+            if mode.root().object_has("value") {
+                let saved = mode.root().object_get("value")?;
+                let goal_status = cli_json_optional_i64(saved, "status", 0);
+                if goal_status == 2 or goal_status == 3 or goal_status == 5 { status.push_str(" | Goal paused: /goal resume")?; (); };
+            };
+        };
+        let read = ui_read_prompt_mode(terminal, &history, &options.input, status.as_str(), styled);
+        if not read.is_ok() { if read.error == 19 { continue; }; if read.error == 5 { return cli_ok(0); }; return cli_fail(read.error); };
+        let mut prompt = str_trim(read.value.as_str())?;
+        if prompt.len() == 0 { continue; };
+        history.push(InputHistory { text: prompt.clone()? });
+        if str_starts_with(prompt.as_str(), "/") {
+            let parsed = slash_command(prompt.as_str())?;
+            let command = cli_json_string(parsed.root(), "command")?;
+            let value = cli_json_string(parsed.root(), "value")?;
+            if command.as_str() == "/quit" or command.as_str() == "/exit" {
+                if styled { let hint = cli_join("Continue with: sen resume ", options.session.as_str())?; ui_notice(terminal, hint.as_str())?; (); };
+                return cli_ok(0);
+            };
+            if command.as_str() == "/help" { let registry = commands_scrolling_registry(); if styled { ui_section(terminal, "Commands", "")?; (); }; ui_output(commands_help(&registry, false)?.as_str())?; continue; };
+            if command.as_str() == "/model" {
+                if value.len() == 0 {
+                    let model = cli_json_string(selected.root(), "model")?;
+                    if styled { ui_section(terminal, "Model", model.as_str())?; (); } else { ui_output(model.as_str())?; (); };
+                    ui_output("\nUse /model MODEL to select the next request's model.\n")?;
+                    ();
+                } else { options.model = value.clone()?; options.effort.clear(); session_target_save(state, options.session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str())?; if styled { ui_section(terminal, "Model selected", value.as_str())?; (); }; };
+                continue;
+            };
+            if command.as_str() == "/connections" {
+                if value.len() == 0 { let records = management_connection_list(state)?; view_document(terminal, styled, "Connections", &records, "")?; (); } else {
+                    let record = cli_state_connection(state, value.as_str());
+                    if not record.is_ok() { ui_output("Connection unavailable. Use /connections to list saved API connections.\n")?; continue; };
+                    cli_state_set_default_connection(state, value.as_str())?;
+                    options.connection = value.clone()?;
+                    options.model = cli_json_string(record.value.root(), "model")?;
+                    options.effort.clear();
+                    session_target_save(state, options.session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str())?;
+                    if styled { ui_section(terminal, "Connection selected", value.as_str())?; (); };
+                };
+                continue;
+            };
+            if command.as_str() == "/resume" {
+                let resumed = main_resume(state, options.cwd.as_str(), value.as_str());
+                if not resumed.is_ok() { ui_output("No user conversation matches this project. Use sen -r to choose one.\n")?; continue; };
+                options.session = resumed.value;
+                let target = session_target_restore(state, options.session.as_str(), "", "", "")?;
+                if target.root().object_get("restored")?.bool_value()? { options.connection = cli_json_string(target.root(), "connection")?; options.model = cli_json_string(target.root(), "model")?; options.effort = cli_json_string(target.root(), "effort")?; };
+                let permissions = session_permissions_restore(state, options.session.as_str(), &mut options.policy)?;
+                options.allow_commands = permissions.root().object_get("allow_commands")?.bool_value()?;
+                profile = cli_json_string(permissions.root(), "profile")?;
+                options.plan_path = path_join_string(workspace_path(options.cwd.as_str(), ".sencode/plans")?.as_str(), options.session.as_str())?;
+                options.plan_path.push_str(".md")?;
+                let plan = cli_state_mode_load(state, options.session.as_str(), "plan")?;
+                options.policy.plan = plan.root().object_has("value") and plan.root().object_get("value")?.object_get("active")?.bool_value()?;
+                options.goal_text = string_new();
+                if styled { main_welcome(state, options, terminal)?; (); };
+                ui_output("Session selected. Saved Goals remain paused until /goal resume.\n")?;
+                continue;
+            };
+            if command.as_str() == "/context" { let context = cli_state_recent_history(state, options.session.as_str(), 12)?; view_document(terminal, styled, "Context", &context, options.session.as_str())?; continue; };
+            if command.as_str() == "/usage" { let usage = cli_state_usage_summary(state)?; view_document(terminal, styled, "Usage", &usage, "")?; continue; };
+            if command.as_str() == "/agents" { let sessions = cli_state_agent_sessions(state, options.cwd.as_str())?; view_document(terminal, styled, "Agents", &sessions, options.session.as_str())?; continue; };
+            if command.as_str() == "/permissions" {
+                if value.len() == 0 and styled {
+                    ui_section(terminal, "Permissions", status.as_str())?;
+                    ui_output("/permissions manual          Review edits, commands and MCP\n/permissions auto-edit       Automatically approve workspace edits\n/permissions full            Automatically approve edits, commands and MCP\n/permissions allow-commands  Allow noninteractive commands\nCommands use your OS privileges; there is no system sandbox.\n")?;
+                    continue;
+                };
+                if value.as_str() == "auto-edit" or value.as_str() == "auto" { permission_apply(&mut options.policy, "auto"); options.allow_commands = false; };
+                if value.as_str() == "ask" or value.as_str() == "manual" { permission_apply(&mut options.policy, "manual"); options.allow_commands = false; };
+                if value.as_str() == "full" { permission_apply(&mut options.policy, "full"); options.allow_commands = true; };
+                if value.as_str() == "allow-commands" { options.allow_commands = true; };
+                session_permissions_save(state, options.session.as_str(), &options.policy, options.allow_commands, profile.as_str())?;
+                ui_output("Permissions updated. Commands run with this user's OS privileges; there is no system sandbox.\n")?;
+                continue;
+            };
+            if command.as_str() == "/plan" {
+                if value.as_str() == "approve" { options.policy.plan = false; ui_output("Plan approved; execution permissions still apply.\n")?; continue; };
+                options.policy.plan = true;
+                if value.len() == 0 { ui_output("Plan mode enabled. /plan approve permits execution.\n")?; continue; };
+                prompt = value.clone()?;
+            } else { if command.as_str() == "/goal" {
+                if value.as_str() == "pause" { options.goal_text = string_new(); ui_output("Goal paused. Use /goal resume to continue explicitly.\n")?; continue; };
+                if value.as_str() == "resume" {
+                    let mode = cli_state_mode_load(state, options.session.as_str(), "goal")?;
+                    if not mode.root().object_has("value") { ui_output("No saved Goal exists.\n")?; continue; };
+                    let saved = mode.root().object_get("value")?;
+                    options.goal_text = cli_json_string(saved, "objective")?;
+                    options.checks.root().object_set("checks", options.checks.copy(saved.object_get("checks")?)?)?;
+                    ();
+                } else { options.goal_text = value.clone()?; };
+                if options.goal_text.len() == 0 { ui_output("Use /goal OBJECTIVE or /goal resume.\n")?; continue; };
+                prompt = options.goal_text.clone()?;
+            } else { if command.as_str() == "/skills" {
+                let skill = main_skill_prompt(options.cwd.as_str(), value.as_str(), terminal, styled);
+                if not skill.is_ok() { ui_output("Skill unavailable. Use /skills to list discovered skills.\n")?; continue; };
+                prompt = skill.value;
+                if prompt.len() == 0 { continue; };
+            } else { if command.as_str() == "/compact" {
+                let compact = engine_dispatch(state, options, "Compact the current conversation", "compact", maximum_requests, token_budget, terminal, profile.as_str());
+                if not compact.is_ok() { cli_diagnostic("Compaction failed; existing context was retained."); };
+                if styled { ui_turn_end(terminal, compact.is_ok())?; (); };
+                continue;
+            } else { if command.as_str() == "/consult" {
+                if value.len() == 0 { ui_output("Use /consult QUESTION to request a read-only multi-model review.\n")?; continue; };
+                if styled { ui_section(terminal, "Consultation", "Collecting independent model reports · Ctrl+C cancels")?; (); };
+                let reports = engine_dispatch(state, options, value.as_str(), "consult", maximum_requests, token_budget, terminal, profile.as_str());
+                if reports.is_ok() { let document = json_parse(reports.value.as_str())?; view_document(terminal, styled, "Consultation", &document, "")?; (); } else { ui_output("Consultation stopped. The selected provider has not been changed.\n")?; (); };
+                if styled { ui_turn_end(terminal, reports.is_ok())?; (); };
+                continue;
+            } else { ui_output("Unknown slash command. Use /help.\n")?; continue; }; }; }; }; };
+        };
+        let result = engine_dispatch(state, options, prompt.as_str(), "turn", maximum_requests, token_budget, terminal, profile.as_str());
+        // A finished foreground turn never silently resumes a saved Goal when
+        // the user sends an ordinary follow-up. /goal resume is explicit.
+        if options.goal_text.len() > 0 { options.goal_text = string_new(); };
+        if styled { ui_turn_end(terminal, result.is_ok())?; (); };
+        if result.is_ok() { output_result(options.format.as_str(), options.session.as_str(), result.value.as_str(), 0)?; (); } else {
+            output_result(options.format.as_str(), options.session.as_str(), "Request stopped. No provider failover or ambiguous tool replay was performed.", result.error)?;
+            cli_diagnostic("Request stopped; inspect /context or doctor for diagnostics.");
+        };
+    };
+    cli_ok(0)
+}
+
+def main_run() -> Result<i64, i64> {
+    let arguments = cli_arguments()?;
+    if cli_flag(&arguments, "help") { ui_output(cli_help())?; return cli_ok(0); };
+    if cli_flag(&arguments, "version") { ui_output("sencode 0.1.0-dev.0 (Sengoo native)\n")?; return cli_ok(0); };
+    if management_positional(&arguments, 0).as_str() == "probe" {
+        let current = cli_current_directory()?;
+        let probe = json_doc_object()?;
+        cli_put_i64(&probe, probe.root(), "schema", 1)?;
+        cli_put_string(&probe, probe.root(), "cwd", current.as_str())?;
+        let positionals = probe.new_array()?;
+        let source = arguments.root().object_get("positionals")?;
+        let mut index = 1;
+        while index < source.array_len()? { positionals.array_push(probe.copy(source.array_get(index)?)?)?; index = index + 1; };
+        probe.root().object_set("positionals", positionals)?;
+        output_document(&probe)?;
+        return cli_ok(0);
+    };
+    let format = cli_option(&arguments, "output-format", "text")?;
+    if format.as_str() != "text" and format.as_str() != "json" and format.as_str() != "stream-json" { return cli_ok(2); };
+    let tui_mode = cli_option(&arguments, "tui", "fullscreen")?;
+    if tui_mode.as_str() != "fullscreen" and tui_mode.as_str() != "scrolling" and tui_mode.as_str() != "plain" { return cli_ok(2); };
+    let mut permission_profile = cli_option(&arguments, "permission-profile", "strict")?;
+    if permission_profile.as_str() != "strict" and permission_profile.as_str() != "backend" { return cli_ok(2); };
+    let current = cli_current_directory()?;
+    let requested = cli_option(&arguments, "cwd", current.as_str())?;
+    let cwd = canonical_path_string(requested.as_str())?;
+    if not dir_exists(cwd.as_str()) { return cli_ok(2); };
+    let database = if arguments.root().object_has("database") { cli_json_string(arguments.root(), "database")? } else { cli_state_default_path()? };
+    let action = management_positional(&arguments, 0);
+    let background_host = arguments.root().object_has("background-host");
+    if cli_flag(&arguments,"import-history") and (background_host or (action.len() > 0 and action.as_str() != "resume") or cli_flag(&arguments,"engine-stdio")) { return cli_ok(2); };
+    if background_host and (not arguments.root().object_has("database") or action.len() > 0 or cli_flag(&arguments, "engine-stdio")) { return cli_ok(2); };
+    if action.as_str() != "worktree" and arguments.root().object_has("branch") { return cli_ok(2); };
+    if cli_flag(&arguments, "yes") and action.as_str() != "worktree" and (action.as_str() != "extensions" or management_positional(&arguments, 1).as_str() != "enable") { return cli_ok(2); };
+    let job_command = action.as_str() == "agent" or action.as_str() == "attach" or action.as_str() == "logs" or action.as_str() == "stop";
+    if not job_command and (cli_flag(&arguments, "follow") or cli_flag(&arguments, "observe") or arguments.root().object_has("after") or arguments.root().object_has("job-timeout-ms")) { return cli_ok(2); };
+    let state = if background_host or cli_flag(&arguments, "engine-stdio") or job_command { job_open_state(database.as_str())? } else { cli_state_open(database.as_str())? };
+    if background_host { return job_host_run(&state, cli_json_string(arguments.root(), "background-host")?.as_str(), current_executable_string()?.as_str()); };
+    let terminal = terminal_open()?;
+    if job_command { return job_commands(&state, &arguments, cwd.as_str(), &terminal); };
+    if action.as_str() == "worktree" { return worktree_cli_run(&state, cwd.as_str(), &arguments, &terminal); };
+    if action.as_str() == "extensions" { return extension_commands(&state, &arguments, &terminal); };
+    if action.as_str() == "doctor" { return main_doctor(&state, cwd.as_str(), &terminal); };
+    if action.as_str() == "models" {
+        let records = config_snapshot(&state)?; let catalog = model_selection_snapshot(&records, "", "", "")?;
+        let source = catalog.root().object_get("connections")?; let rows = records.root().object_get("connections")?; let mut index = 0;
+        while index < source.array_len()? { rows.array_get(index)?.object_set("models", records.copy(source.array_get(index)?.object_get("models")?)?)?; index = index + 1; };
+        output_document(&records)?; return cli_ok(0);
+    };
+    if action.as_str() == "mcp" { return management_mcp(cwd.as_str(), &arguments, &terminal); };
+    if terminal.is_tty() and format.as_str() == "text" and ui_ansi(&terminal) and tui_mode.as_str() != "plain" { terminal.enter_raw()?; (); };
+    if action.as_str() == "connections" { return management_connections(&state, &arguments, &terminal); };
+    if action.len() > 0 and action.as_str() != "resume" { return cli_ok(2); };
+    if action.len() > 0 and (arguments.root().object_has("resume") or cli_flag(&arguments, "continue")) { return cli_ok(2); };
+    let wants_resume = action.as_str() == "resume" or cli_flag(&arguments, "continue") or arguments.root().object_has("resume");
+    if cli_flag(&arguments,"import-history") and (not wants_resume or cli_flag(&arguments,"engine-stdio")) { return cli_ok(2); };
+    project_history_open(&state,cwd.as_str(),cli_flag(&arguments,"import-history"))?;
+    let requested_session = if arguments.root().object_has("resume") { cli_json_string(arguments.root(), "resume")? } else { management_positional(&arguments, 1) };
+    // The private engine must accept the frontend's newly created, empty
+    // session. Public resume has a stricter user-conversation predicate.
+    let session = if wants_resume {
+        if cli_flag(&arguments, "engine-stdio") {
+            if requested_session.len() == 0 or not cli_state_session_in_project(&state, cwd.as_str(), requested_session.as_str())? { return cli_ok(5); };
+            requested_session.clone()?
+        } else { main_resume(&state, cwd.as_str(), requested_session.as_str())? }
+    } else { cli_state_create_session(&state, cwd.as_str())? };
+    let mut options = main_options(&arguments, cwd.as_str(), session.as_str())?;
+    if not cli_flag(&arguments, "engine-stdio") {
+        let target = session_target_restore(&state, session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str())?;
+        options.connection = cli_json_string(target.root(), "connection")?; options.model = cli_json_string(target.root(), "model")?; options.effort = cli_json_string(target.root(), "effort")?;
+        if arguments.root().object_has("effort") and cli_json_optional_string(arguments.root(), "effort").len() == 0 { options.effort.clear(); (); };
+        let permissions = session_permissions_restore(&state, session.as_str(), &mut options.policy)?;
+        options.allow_commands = permissions.root().object_get("allow_commands")?.bool_value()?;
+        if not arguments.root().object_has("permission-profile") { permission_profile = cli_json_string(permissions.root(), "profile")?; };
+        if arguments.root().object_has("auto-edit") { permission_apply(&mut options.policy, "auto"); options.allow_commands = false; };
+        if arguments.root().object_has("permissions") { if not permission_apply(&mut options.policy, cli_json_string(arguments.root(), "permissions")?.as_str()) { return cli_ok(2); }; options.allow_commands = options.policy.full_access; };
+        if arguments.root().object_has("allow-commands") { options.allow_commands = true; };
+    };
+    let plan_mode = cli_state_mode_load(&state, session.as_str(), "plan")?;
+    if plan_mode.root().object_has("value") {
+        let saved = plan_mode.root().object_get("value")?;
+        if saved.object_has("active") { options.policy.plan = options.policy.plan or saved.object_get("active")?.bool_value()?; };
+    };
+    let maximum_requests = cli_parse_unsigned(cli_option(&arguments, "max-requests", "50")?.as_str(), 10)?;
+    let token_budget = cli_parse_unsigned(cli_option(&arguments, "token-budget", "0")?.as_str(), 10)?;
+    if maximum_requests < 1 or maximum_requests > 10000 { return cli_ok(2); };
+    if cli_flag(&arguments, "engine-stdio") { return engine_stdio(&state, &mut options, maximum_requests, token_budget, &terminal); };
+    let prompt = if arguments.root().object_has("prompt") { cli_json_string(arguments.root(), "prompt")? } else { options.goal_text.clone()? };
+    if prompt.len() > 0 {
+        let result = engine_dispatch(&state, &mut options, prompt.as_str(), "turn", maximum_requests, token_budget, &terminal, permission_profile.as_str());
+        if result.is_ok() { output_result(options.format.as_str(), session.as_str(), result.value.as_str(), 0)?; return cli_ok(0); };
+        output_result(options.format.as_str(), session.as_str(), "Request failed or was paused.", result.error)?;
+        return cli_ok(if result.error == 19 { 130 } else { 1 });
+    };
+    if terminal.is_tty() and format.as_str() == "text" and ui_ansi(&terminal) and tui_mode.as_str() == "fullscreen" {
+        return frontend_run(&state, &mut options, maximum_requests, token_budget, &terminal, wants_resume and requested_session.len() == 0 and not cli_flag(&arguments, "continue"), permission_profile.as_str());
+    };
+    main_interactive(&state, &mut options, maximum_requests, token_budget, &terminal, tui_mode.as_str() == "plain", permission_profile.as_str())
+}
+
+def main() -> i64 {
+    let result = main_run();
+    if not result.is_ok() { let diagnostic = cli_text("Sencode could not complete the operation. Error code: "); diagnostic.push_i64(result.error); cli_diagnostic(diagnostic.as_str()); return if result.error == 2 { 2 } else { if result.error == 19 { 130 } else { 1 } }; };
+    result.value
+}

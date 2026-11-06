@@ -1,0 +1,137 @@
+import state;
+import job_contract;
+
+struct JobStore { db: SqliteDb, path: String }
+
+def job_open_state(path:&str)->Result<CliState,i64>{
+    let started=time_unix_ms();
+    loop{let opened=cli_state_open(path);if opened.is_ok(){return opened;};if opened.error!=11 or time_since_ms(started)>3000{return opened;};time_sleep_ms(5);};
+    state_open_error(11)
+}
+
+def job_migration_lock(path:&str)->Result<FileLock,i64>{
+    let started=time_unix_ms();
+    loop{let acquired=file_lock(path);if acquired.is_ok(){return acquired;};if acquired.error!=11 or time_since_ms(started)>3000{return acquired;};time_sleep_ms(5);};
+    Result{is_ok:false,value:FileLock{handle:0},error:11}
+}
+
+def job_store_open(state: &CliState) -> Result<JobStore, i64> {
+    let path = cli_join(state.path.as_str(), ".jobs.sqlite3")?;
+    let lock_path = state_lock_path(state.path.as_str(), "jobs-migration", "v1")?;
+    let migration = job_migration_lock(lock_path.as_str())?;
+    let db = sqlite_open(path.as_str())?; db.busy_timeout(2000)?;
+    let version = { let mut query = db.prepare("PRAGMA user_version")?; query.step()?; query.integer(0)? };
+    if version != 0 and version != 1 { return Result { is_ok: false, value: JobStore { db: SqliteDb { handle: 0 }, path: string_new() }, error: 8 }; };
+    if version == 0 {
+        let mut tx = db.transaction()?;
+        tx.exec("CREATE TABLE cli_jobs(id TEXT PRIMARY KEY,generation TEXT NOT NULL,session_id TEXT NOT NULL,cwd TEXT NOT NULL,connection_id TEXT NOT NULL,model_id TEXT NOT NULL,request_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',host_pid INTEGER NOT NULL DEFAULT 0,host_creation_identity INTEGER NOT NULL DEFAULT 0,endpoint TEXT NOT NULL,submit_json TEXT NOT NULL CHECK(json_valid(submit_json)),admitted INTEGER NOT NULL DEFAULT 0,goal INTEGER NOT NULL DEFAULT 0,first_sequence INTEGER NOT NULL DEFAULT 1,last_sequence INTEGER NOT NULL DEFAULT 0,lifetime_ms INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL); CREATE UNIQUE INDEX cli_jobs_one_live_session ON cli_jobs(session_id) WHERE state IN('created','bootstrapping','admitted','running','waiting_interaction','stopping'); CREATE TABLE cli_job_events(job_id TEXT NOT NULL REFERENCES cli_jobs(id),sequence INTEGER NOT NULL,payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),byte_length INTEGER NOT NULL,PRIMARY KEY(job_id,sequence)); PRAGMA user_version=1")?;
+        tx.commit()?; ();
+    };
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON")?;
+    Result { is_ok: true, value: JobStore { db: db, path: path }, error: 0 }
+}
+
+def job_store_create(store: &JobStore, state: &CliState, session: &str, cwd: &str, submit: &JsonDoc, lifetime_ms: i64) -> Result<JsonDoc, i64> {
+    if lifetime_ms < 1000 or lifetime_ms > 86400000 { return job_object_error(2); };
+    if not cli_state_session_in_project(state, cwd, session)? { return job_object_error(7); };
+    let id = state_id("job-")?; let generation = state_id("host-")?;
+    let digest = state_digest(id.as_str())?; let endpoint = cli_join("sencode-job-", digest.as_str())?;
+    let request = cli_json_string(submit.root(), "id")?;
+    let connection = cli_json_string(submit.root(), "connection")?;
+    let model = cli_json_string(submit.root(), "model")?;
+    let raw = submit.serialize_string()?;
+    if raw.len() > 262144 { return job_object_error(13); };
+    let goal = cli_json_optional_string(submit.root(), "goal").len() > 0;
+    let mut insert = store.db.prepare("INSERT INTO cli_jobs(id,generation,session_id,cwd,connection_id,model_id,request_id,state,endpoint,submit_json,goal,lifetime_ms,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'created',?,?,?,?,?,?)")?;
+    insert.bind_text(1,id.as_str())?; insert.bind_text(2,generation.as_str())?; insert.bind_text(3,session)?; insert.bind_text(4,cwd)?; insert.bind_text(5,connection.as_str())?; insert.bind_text(6,model.as_str())?; insert.bind_text(7,request.as_str())?;
+    insert.bind_text(8,endpoint.as_str())?; insert.bind_text(9,raw.as_str())?; insert.bind_i64(10,if goal {1}else{0})?; insert.bind_i64(11,lifetime_ms)?; insert.bind_i64(12,time_unix_ms())?; insert.bind_i64(13,time_unix_ms())?; insert.step()?;
+    job_store_load(store,id.as_str())
+}
+
+def job_store_load(store: &JobStore, id: &str) -> Result<JsonDoc, i64> {
+    let mut row = store.db.prepare("SELECT id,generation,session_id,cwd,connection_id,model_id,request_id,state,reason,host_pid,host_creation_identity,endpoint,admitted,goal,first_sequence,last_sequence,lifetime_ms FROM cli_jobs WHERE id=?")?;
+    row.bind_text(1,id)?; if not row.step()? { return job_object_error(5); };
+    let document = job_message("snapshot",row.text(0)?.as_str(),row.text(1)?.as_str())?;
+    cli_put_string(&document,document.root(),"session_id",row.text(2)?.as_str())?; cli_put_string(&document,document.root(),"cwd",row.text(3)?.as_str())?;
+    cli_put_string(&document,document.root(),"connection_id",row.text(4)?.as_str())?; cli_put_string(&document,document.root(),"model",row.text(5)?.as_str())?;
+    cli_put_string(&document,document.root(),"request_id",row.text(6)?.as_str())?; cli_put_string(&document,document.root(),"state",row.text(7)?.as_str())?; cli_put_string(&document,document.root(),"reason",row.text(8)?.as_str())?;
+    cli_put_i64(&document,document.root(),"host_pid",row.integer(9)?)?; cli_put_i64(&document,document.root(),"host_creation_identity",row.integer(10)?)?;
+    cli_put_string(&document,document.root(),"endpoint",row.text(11)?.as_str())?; cli_put_bool(&document,document.root(),"admitted",row.integer(12)? != 0)?; cli_put_bool(&document,document.root(),"goal",row.integer(13)? != 0)?;
+    cli_put_i64(&document,document.root(),"first_sequence",row.integer(14)?)?; cli_put_i64(&document,document.root(),"last_sequence",row.integer(15)?)?; cli_put_i64(&document,document.root(),"lifetime_ms",row.integer(16)?)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def job_store_receipt(store: &JobStore, id: &str, receipt: &ProcessLaunchReceipt) -> Result<bool, i64> {
+    let mut row = store.db.prepare("UPDATE cli_jobs SET host_pid=?,host_creation_identity=?,updated_at=? WHERE id=? AND state='created' AND host_pid=0")?;
+    row.bind_i64(1,receipt.pid)?; row.bind_i64(2,receipt.creation_identity)?; row.bind_i64(3,time_unix_ms())?; row.bind_text(4,id)?; row.step()?;
+    if store.db.changes()? != 1 { return state_bool_error(7); }; job_true()
+}
+
+def job_store_status(store: &JobStore, id: &str, generation: &str, status: &str, reason: &str) -> Result<bool, i64> {
+    let mut row = store.db.prepare("UPDATE cli_jobs SET state=?,reason=?,updated_at=? WHERE id=? AND generation=?")?;
+    row.bind_text(1,status)?; row.bind_text(2,reason)?; row.bind_i64(3,time_unix_ms())?; row.bind_text(4,id)?; row.bind_text(5,generation)?; row.step()?;
+    if store.db.changes()? != 1 { return state_bool_error(7); }; job_true()
+}
+
+def job_store_admit(store: &JobStore, id: &str, generation: &str) -> Result<JsonDoc, i64> {
+    let mut tx = store.db.transaction()?;
+    let mut update = tx.prepare("UPDATE cli_jobs SET admitted=1,state='admitted',updated_at=? WHERE id=? AND generation=? AND admitted=0 AND state='created'")?;
+    update.bind_i64(1,time_unix_ms())?; update.bind_text(2,id)?; update.bind_text(3,generation)?; update.step()?;
+    let mut changed = tx.prepare("SELECT changes()")?; changed.step()?; if changed.integer(0)? != 1 { return job_object_error(12); };
+    let mut query = tx.prepare("SELECT submit_json FROM cli_jobs WHERE id=?")?; query.bind_text(1,id)?; query.step()?;
+    let command = json_parse(query.text(0)?.as_str())?; tx.commit()?;
+    Result { is_ok: true, value: command, error: 0 }
+}
+
+def job_store_event(store: &JobStore, id: &str, generation: &str, event: &JsonDoc) -> Result<i64, i64> {
+    let raw = event.serialize_string()?; if raw.len() > 1048576 { return cli_fail(13); };
+    let mut tx = store.db.transaction()?;
+    let mut counter = tx.prepare("UPDATE cli_jobs SET last_sequence=last_sequence+1,updated_at=? WHERE id=? AND generation=?")?; counter.bind_i64(1,time_unix_ms())?; counter.bind_text(2,id)?; counter.bind_text(3,generation)?; counter.step()?;
+    let mut current = tx.prepare("SELECT last_sequence FROM cli_jobs WHERE id=? AND generation=?")?; current.bind_text(1,id)?; current.bind_text(2,generation)?; if not current.step()? { return cli_fail(7); }; let sequence = current.integer(0)?;
+    let mut insert = tx.prepare("INSERT INTO cli_job_events VALUES(?,?,?,?)")?; insert.bind_text(1,id)?; insert.bind_i64(2,sequence)?; insert.bind_text(3,raw.as_str())?; insert.bind_i64(4,raw.len())?; insert.step()?;
+    // Retain at most 512 frames of at most 1 MiB, and independently 16 MiB.
+    let mut prune = tx.prepare("DELETE FROM cli_job_events WHERE job_id=? AND (sequence<=?-512 OR sequence<(SELECT COALESCE(MIN(sequence),0) FROM (SELECT sequence,SUM(byte_length) OVER(ORDER BY sequence DESC) AS total FROM cli_job_events WHERE job_id=?) WHERE total<=16777216))")?;
+    prune.bind_text(1,id)?; prune.bind_i64(2,sequence)?; prune.bind_text(3,id)?; prune.step()?;
+    let mut first = tx.prepare("UPDATE cli_jobs SET first_sequence=(SELECT MIN(sequence) FROM cli_job_events WHERE job_id=?) WHERE id=?")?; first.bind_text(1,id)?; first.bind_text(2,id)?; first.step()?;
+    tx.commit()?; cli_ok(sequence)
+}
+
+def job_store_logs(store: &JobStore, id: &str, after: i64, limit: i64) -> Result<JsonDoc, i64> {
+    if after < 0 or limit < 1 or limit > 256 { return job_object_error(2); };
+    let snapshot = job_store_load(store,id)?;
+    let first = cli_json_optional_i64(snapshot.root(),"first_sequence",1);
+    let document = job_message(if after < first - 1 { "cursor_expired" } else { "logs" },id,cli_json_string(snapshot.root(),"generation")?.as_str())?;
+    document.root().object_set("snapshot",document.copy(snapshot.root())?)?;
+    let events = document.new_array()?; document.root().object_set("events",events)?;
+    if after < first - 1 { return Result { is_ok:true,value:document,error:0 }; };
+    let mut query = store.db.prepare("SELECT sequence,payload_json FROM cli_job_events WHERE job_id=? AND sequence>? ORDER BY sequence LIMIT ?")?; query.bind_text(1,id)?; query.bind_i64(2,after)?; query.bind_i64(3,limit)?;
+    let mut bytes = 0;
+    while query.step()? {
+        let raw = query.text(1)?; if bytes + raw.len() > 1048576 { break; }; bytes = bytes + raw.len();
+        let event = json_parse(raw.as_str())?; let wrapped = document.new_object()?; wrapped.object_set("sequence",document.new_i64(query.integer(0)?)?)?; wrapped.object_set("event",document.copy(event.root())?)?; events.array_push(wrapped)?; ();
+    };
+    Result { is_ok:true,value:document,error:0 }
+}
+
+def job_store_list(store: &JobStore) -> Result<JsonDoc, i64> {
+    let document = json_parse("{\"schema\":1,\"jobs\":[]}")?;
+    let mut row = store.db.prepare("SELECT id FROM cli_jobs ORDER BY created_at DESC,id LIMIT 256")?;
+    while row.step()? { let job = job_store_load(store,row.text(0)?.as_str())?; document.root().object_get("jobs")?.array_push(document.copy(job.root())?)?; (); };
+    Result { is_ok:true,value:document,error:0 }
+}
+
+// This only recovers operational observation. It never clears shared execution,
+// tool ledger or cleanup authority, and never resubmits the saved envelope.
+def job_snapshot(state:&CliState,store:&JobStore,id:&str)->Result<JsonDoc,i64> {
+    let snapshot=job_store_load(store,id)?;
+    if job_terminal(cli_json_string(snapshot.root(),"state")?.as_str()){return Result{is_ok:true,value:snapshot,error:0};};
+    let pid=cli_json_optional_i64(snapshot.root(),"host_pid",0);let birth=cli_json_optional_i64(snapshot.root(),"host_creation_identity",0);
+    if pid<=0 or birth<=0{return Result{is_ok:true,value:snapshot,error:0};};
+    let alive=process_identity_matches(pid,birth)?;
+    if alive{return Result{is_ok:true,value:snapshot,error:0};};
+    let lock_path=state_lock_path(state.path.as_str(),"job-host",id)?;
+    let lease=file_lock(lock_path.as_str())?;
+    let still_gone=not process_identity_matches(pid,birth)?;
+    if still_gone{job_store_status(store,id,cli_json_string(snapshot.root(),"generation")?.as_str(),"interrupted","host_exited_no_replay")?; (); };
+    job_store_load(store,id)
+}

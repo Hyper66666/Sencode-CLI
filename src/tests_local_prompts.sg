@@ -1,0 +1,102 @@
+import local_prompts;
+import command_line;
+
+extern "C" {
+    fn sengoo_json_bounded_live_documents() -> i64;
+    fn sengoo_json_bounded_reserved_bytes() -> i64;
+}
+
+def local_expect(condition: bool, label: &str) -> Result<bool, i64> {
+    if not condition { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def local_test_fill(count: i64) -> Result<String, i64> {
+    let chunk = cli_text("x"); let mut doubled = 0;
+    while doubled < 10 { let copy = chunk.clone()?; chunk.push_str(copy.as_str())?; doubled = doubled + 1; };
+    let out = string_new();
+    while out.len() + chunk.len() <= count { out.push_str(chunk.as_str())?; };
+    while out.len() < count { out.push_str("x")?; };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def local_code_tests() -> Result<bool, i64> {
+    let found = local_code_blocks("before\n```python\nprint('世界😀')\n```\n~~~sg\nanswer()\n~~~\nafter")?;
+    let blocks = found.root().object_get("blocks")?;
+    local_expect(blocks.array_len()? == 2 and cli_json_string(blocks.array_get(0)?, "language")?.as_str() == "python" and cli_json_string(blocks.array_get(0)?, "code")?.as_str() == "print('世界😀')\n" and cli_json_string(blocks.array_get(1)?, "code")?.as_str() == "answer()\n", "Complete backtick and tilde fences copy only exact code")?;
+    let windows = local_code_blocks("```sh\r\nprintf 'x'\r\n```\r\n")?;
+    local_expect(cli_json_string(windows.root().object_get("blocks")?.array_get(0)?, "code")?.as_str() == "printf 'x'\r\n", "Code extraction preserves CRLF")?;
+    let nested = local_code_blocks("````md\n```\ninside\n~~~\n`````")?;
+    local_expect(cli_json_string(nested.root().object_get("blocks")?.array_get(0)?, "code")?.as_str() == "```\ninside\n~~~\n", "Shorter or different markers remain code; a longer matching fence closes")?;
+    let partial = local_code_blocks("```sg\ncomplete\n```\n~~~sh\nunfinished")?;
+    local_expect(partial.root().object_get("blocks")?.array_len()? == 1 and partial.root().object_get("incomplete")?.bool_value()?, "Incomplete streamed tails are flagged and never selectable")?;
+    let empty = local_code_blocks("```\n```")?;
+    local_expect(empty.root().object_get("blocks")?.array_len()? == 1 and cli_json_string(empty.root().object_get("blocks")?.array_get(0)?, "code")?.len() == 0, "Empty complete blocks remain exact")?;
+    let indentation = local_code_blocks("   ~~~\n body\n   ~~~\n    ```\nnot a fence\n    ```")?;
+    local_expect(indentation.root().object_get("blocks")?.array_len()? == 1 and not indentation.root().object_get("incomplete")?.bool_value()?, "At most three leading spaces can introduce fences")?;
+    let inline = local_code_blocks("inline ```code``` and ~~two~~\n``\nnot fenced\n``")?;
+    local_expect(inline.root().object_get("blocks")?.array_len()? == 0, "Inline and short delimiters do not create copy targets")?;
+    let text = string_new(); let mut count = 0;
+    while count < 33 { text.push_str("```\nx\n```\n")?; count = count + 1; };
+    let excessive = local_code_blocks(text.as_str());
+    local_expect(not excessive.is_ok() and excessive.error == 13, "Code target count has a stable bound")?;
+    let oversized = cli_text("```\n"); oversized.push_str(local_test_fill(262145)?.as_str())?; oversized.push_str("\n```")?;
+    local_expect(not local_code_blocks(oversized.as_str()).is_ok(), "Oversized code blocks fail without returning partial targets")?;
+    local_expect(not local_code_blocks(local_test_fill(2097153)?.as_str()).is_ok(), "Markdown input size is bounded before parsing")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def local_fixture_message(state: &CliState, id: &str, session: &str, role: &str, text: &str, revision: i64, created: i64) -> Result<bool, i64> {
+    let mut insert = state.db.prepare("INSERT INTO messages(id,session_id,role,text,revision,created_at) VALUES(?,?,?,?,?,?)")?;
+    insert.bind_text(1, id)?; insert.bind_text(2, session)?; insert.bind_text(3, role)?; insert.bind_text(4, text)?;
+    insert.bind_i64(5, revision)?; insert.bind_i64(6, created)?; insert.step()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def local_history_tests(database: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let cwd = canonical_path_string(path_parent_string(database)?.as_str())?;
+    let mut project = state.db.prepare("INSERT INTO projects(id,directory,display_name,created_at,updated_at) VALUES('retained-project-id',?,'Fixture',1,1)")?;
+    project.bind_text(1, cwd.as_str())?; project.step()?;
+    state.db.exec("INSERT INTO projects(id,directory,display_name,created_at,updated_at) VALUES('foreign-project-id','foreign-only-fixture','Foreign',1,1); INSERT INTO sessions(id,project_id,title,created_at,updated_at) VALUES('local-a','retained-project-id','Local A',1,1),('local-b','retained-project-id','Local B',1,1),('local-archived','retained-project-id','Archived',1,1),('foreign','foreign-project-id','Foreign',1,1); UPDATE sessions SET archived=1 WHERE id='local-archived'")?;
+    local_fixture_message(&state, "old-revision", "local-a", "user", "old prompt", 1000, 10)?;
+    local_fixture_message(&state, "newest", "local-b", "user", "最新提示 世界😀", 1, 20)?;
+    local_fixture_message(&state, "literal", "local-b", "user", "Literal %_Needle", 2, 15)?;
+    local_fixture_message(&state, "assistant", "local-a", "assistant", "assistant secret", 1001, 30)?;
+    local_fixture_message(&state, "foreign", "foreign", "user", "foreign secret", 2000, 40)?;
+    local_fixture_message(&state, "archived", "local-archived", "user", "archived secret", 3000, 50)?;
+    local_fixture_message(&state, "cancelled", "local-a", "user", "cancelled secret", 4000, 60)?;
+    state.db.exec("UPDATE messages SET cancelled=1 WHERE id='cancelled'")?;
+    local_fixture_message(&state, "too-large", "local-a", "user", local_test_fill(65537)?.as_str(), 5000, 70)?;
+    let all = local_prompt_history(&state, cwd.as_str(), "")?; let prompts = all.root().object_get("prompts")?;
+    local_expect(prompts.array_len()? == 3 and cli_json_string(prompts.array_get(0)?, "id")?.as_str() == "newest", "Recall uses retained project identity, only active user messages, and time before cross-session revision")?;
+    let literal = local_prompt_history(&state, cwd.as_str(), "%_needle")?;
+    local_expect(literal.root().object_get("prompts")?.array_len()? == 1 and cli_json_string(literal.root().object_get("prompts")?.array_get(0)?, "id")?.as_str() == "literal", "Prompt search treats SQL wildcard characters as literal text")?;
+    let unicode = local_prompt_history(&state, cwd.as_str(), "世界😀")?;
+    local_expect(unicode.root().object_get("prompts")?.array_len()? == 1, "Prompt search preserves Unicode")?;
+    let injection = local_prompt_history(&state, cwd.as_str(), "%' OR 1=1--")?;
+    local_expect(injection.root().object_get("prompts")?.array_len()? == 0, "Search terms are parameter-bound")?;
+    let mut count = 0;
+    while count < 101 { let id = cli_text("row-"); id.push_i64(count)?; local_fixture_message(&state, id.as_str(), "local-a", "user", "bounded prompt", count, 100 + count)?; count = count + 1; };
+    let capped = local_prompt_history(&state, cwd.as_str(), "")?;
+    local_expect(capped.root().object_get("prompts")?.array_len()? == 100 and capped.root().object_get("limited")?.bool_value()?, "Recall never returns more than 100 records")?;
+    state.db.exec("DELETE FROM messages WHERE session_id IN('local-a','local-b')")?;
+    let payload = local_test_fill(65536)?; count = 0;
+    while count < 9 { let id = cli_text("budget-"); id.push_i64(count)?; local_fixture_message(&state, id.as_str(), "local-a", "user", payload.as_str(), count, 1000 + count)?; count = count + 1; };
+    let bounded = local_prompt_history(&state, cwd.as_str(), "")?;
+    local_expect(bounded.root().object_get("prompts")?.array_len()? == 8 and bounded.root().object_get("limited")?.bool_value()?, "Prompt recall total raw bytes never exceeds 512 KiB")?;
+    let long_query = local_prompt_history(&state, cwd.as_str(), local_test_fill(513)?.as_str());
+    local_expect(not long_query.is_ok() and long_query.error == 2, "Search input has a fixed bound")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let pure = local_code_tests(); if not pure.is_ok() { println(pure.error); return 1; };
+    if sengoo_json_bounded_live_documents() != 0 or sengoo_json_bounded_reserved_bytes() != 0 { cli_diagnostic("Code extraction success and rejection must release document admission"); return 3; };
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", ""); if not database.is_ok() { return 2; };
+    if database.value.len() > 0 { let persisted = local_history_tests(database.value.as_str()); if not persisted.is_ok() { println(persisted.error); return 1; }; };
+    if sengoo_json_bounded_live_documents() != 0 or sengoo_json_bounded_reserved_bytes() != 0 { cli_diagnostic("Prompt recall success and rejection must release document admission"); return 3; };
+    println("local prompt recall scope, limits, literal search and complete fenced code acceptance passed");
+    0
+}

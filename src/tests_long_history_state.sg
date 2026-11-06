@@ -1,0 +1,72 @@
+import state;
+import command_line;
+
+def long_history_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def long_history_seed(state: &CliState, session: &str, count: i64) -> Result<bool, i64> {
+    let mut insert = state.db.prepare("WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM n WHERE value<?) INSERT INTO messages(id,session_id,role,text,created_at,completed_at,revision) SELECT ?||'-row-'||value,?,'user','message-'||value,value,value,value FROM n")?;
+    insert.bind_i64(1, count)?; insert.bind_text(2, session)?; insert.bind_text(3, session)?; insert.step()?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def long_history_test(database: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let cwd = path_parent_string(database)?;
+    let session = cli_state_create_session(&state, cwd.as_str())?;
+    long_history_seed(&state, session.as_str(), 1105)?;
+    let history = cli_state_history(&state, session.as_str())?;
+    let messages = history.root().object_get("messages")?;
+    if messages.array_len()? != 1105 {
+        println(messages.array_len()?);
+        cli_diagnostic("REPRODUCED: full public history silently omitted rows after message 1000");
+        return state_bool_error(99);
+    };
+    long_history_expect(cli_json_string(messages.array_get(1104)?, "content")?.as_str() == "message-1105", "Full history preserves the newest row")?;
+    long_history_expect(cli_state_history_count(&state, session.as_str())? == 1105 and history.root().object_get("total_messages")?.number_i64()? == 1105 and history.root().object_get("offset")?.number_i64()? == 0, "Full history metadata uses the absolute count")?;
+    let range = cli_state_history_range(&state, session.as_str(), 1000, 5)?;
+    long_history_expect(range.root().object_get("offset")?.number_i64()? == 1000 and range.root().object_get("messages")?.array_len()? == 5 and cli_json_string(range.root().object_get("messages")?.array_get(0)?, "content")?.as_str() == "message-1001", "Range offsets cross the old 1000-row boundary")?;
+    let tail = cli_state_history_tail(&state, session.as_str(), 1100)?;
+    long_history_expect(tail.root().object_get("offset")?.number_i64()? == 1100 and tail.root().object_get("messages")?.array_len()? == 5 and cli_json_string(tail.root().object_get("messages")?.array_get(4)?, "content")?.as_str() == "message-1105", "Strict tail includes every row after messages_seen")?;
+    let recent = cli_state_recent_history(&state, session.as_str(), 512)?;
+    long_history_expect(recent.root().object_get("offset")?.number_i64()? == 593 and recent.root().object_get("total_messages")?.number_i64()? == 1105 and recent.root().object_get("messages")?.array_len()? == 512 and cli_json_string(recent.root().object_get("messages")?.array_get(511)?, "content")?.as_str() == "message-1105", "UI recent window is ascending and retains the latest512")?;
+    let invalid_range = cli_state_history_range(&state, session.as_str(), 1100, 6);
+    let invalid_tail = cli_state_history_tail(&state, session.as_str(), 1106);
+    let invalid_recent = cli_state_recent_history(&state, session.as_str(), 0);
+    long_history_expect(not invalid_range.is_ok() and invalid_range.error == 2 and not invalid_tail.is_ok() and invalid_tail.error == 10 and not invalid_recent.is_ok() and invalid_recent.error == 2, "Invalid offsets and windows fail without silently clipping")?;
+
+    let rich = cli_state_create_session(&state, cwd.as_str())?;
+    long_history_seed(&state, rich.as_str(), 900)?;
+    let mut structured = state.db.prepare("INSERT INTO shared_history(message_id,session_id,message_json,execution_id,fence) SELECT id,session_id,json_object('role',role,'content',text,'extra',json_array(1,2,3,4,5,6,7,8,9,10,11,12)), 'fixture',0 FROM messages WHERE session_id=?")?;
+    structured.bind_text(1, rich.as_str())?; structured.step()?;
+    let rich_full = cli_state_history(&state, rich.as_str());
+    if rich_full.is_ok() or rich_full.error != 13 { println(rich_full.is_ok()); println(rich_full.error); };
+    long_history_expect(not rich_full.is_ok() and rich_full.error == 13, "Full node admission fails explicitly rather than returning a prefix")?;
+    let rich_recent = cli_state_recent_history(&state, rich.as_str(), 512)?;
+    let actual = rich_recent.root().object_get("messages")?.array_len()?;
+    long_history_expect(actual > 0 and actual < 512 and rich_recent.root().object_get("offset")?.number_i64()? == 900 - actual and cli_json_string(rich_recent.root().object_get("messages")?.array_get(actual - 1)?, "content")?.as_str() == "message-900", "Rich UI history shrinks only its newest window and reports the actual offset")?;
+    let strict_rich = cli_state_history_tail(&state, rich.as_str(), 0);
+    long_history_expect(not strict_rich.is_ok() and strict_rich.error == 13, "Canonical tail never uses adaptive UI truncation")?;
+
+    let huge = cli_state_create_session(&state, cwd.as_str())?;
+    long_history_seed(&state, huge.as_str(), 1)?;
+    let mut oversize = state.db.prepare("UPDATE messages SET text=CAST(zeroblob(16777217) AS TEXT) WHERE session_id=?")?;
+    oversize.bind_text(1, huge.as_str())?; oversize.step()?;
+    let huge_full = cli_state_history(&state, huge.as_str());
+    let huge_recent = cli_state_recent_history(&state, huge.as_str(), 512);
+    long_history_expect(not huge_full.is_ok() and huge_full.error == 13 and not huge_recent.is_ok() and huge_recent.error == 13, "Oversized newest single row is rejected before text allocation, never replaced by older content")?;
+    long_history_expect(cli_state_history_count(&state, huge.as_str())? == 1, "Rejected reads preserve the oversized row")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", "").unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let result = long_history_test(database.as_str());
+    if not result.is_ok() { println(result.error); return 1; };
+    if sengoo_json_bounded_live_documents() != 0 or sengoo_json_bounded_reserved_bytes() != 0 { cli_diagnostic("History regression retained bounded JSON admission"); return 1; };
+    println("long history state passed"); 0
+}

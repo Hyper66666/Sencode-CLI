@@ -1,0 +1,85 @@
+import engine_request;
+import command_line;
+import std::time;
+
+extern "C" {
+    fn sengoo_json_bounded_live_documents() -> i64;
+    fn sengoo_json_bounded_reserved_bytes() -> i64;
+}
+
+def image_expect(condition: bool, label: &str) -> Result<bool, i64> {
+    if not condition { cli_diagnostic(label); return Result { is_ok: false, value: false, error: 99 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def image_capability_tests() -> Result<bool, i64> {
+    let config = json_parse("{\"enabledModels\":[{\"id\":\"vision\",\"capabilities\":{\"visionSupported\":true}},{\"id\":\"plain\",\"capabilities\":{\"visionSupported\":false}}]}")?;
+    image_expect(connection_images_supported(config.root(), "vision")? and not connection_images_supported(config.root(), "plain")? and not connection_images_supported(config.root(), "unlisted-vision-name")?, "Vision input is enabled only for an explicitly configured exact model")?;
+    let cap = config.new_object()?; cli_put_bool(&config, cap, "visionSupported", false)?; config.root().object_set("capabilities", cap)?;
+    image_expect(not connection_images_supported(config.root(), "vision")?, "An explicit connection denial narrows model capability")?;
+    let bad_paths = json_parse("{\"images\":[\"relative.png\"]}")?;
+    let nul_paths = json_parse("{\"images\":[\"C:/visible\\u0000hidden.png\"]}")?;
+    image_expect(not image_paths_valid(bad_paths.root().object_get("images")?) and not image_paths_valid(nul_paths.root().object_get("images")?), "Only complete absolute paths can be explicitly attached")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def image_local_validation(history: &JsonDoc, captured: &JsonDoc, grants: &JsonDoc) -> Result<bool, i64> {
+    let empty = json_doc_object()?;
+    let denied = image_request_history(history, false, grants);
+    let untrusted = image_request_history(history, true, &empty);
+    image_expect(not denied.is_ok() and denied.error == 7 and not untrusted.is_ok() and untrusted.error == 7, "Capability and session grants are both required before hydration")?;
+    let hydrated = image_request_history(history, true, grants)?;
+    let parts = hydrated.root().object_get("messages")?.array_get(0)?.object_get("content_parts")?;
+    image_expect(parts.array_len()? == 2 and cli_json_string(parts.array_get(0)?, "text")?.as_str() == "Inspect original 世界😀" and cli_json_string(parts.array_get(1)?, "mime")?.as_str() == "image/png", "Ephemeral hydration preserves text order and the inspected MIME")?;
+    let altered = json_doc_object()?;
+    altered.root().object_set("image_refs", altered.copy(captured.root().object_get("image_refs")?)?)?;
+    cli_put_string(&altered, altered.root().object_get("image_refs")?.array_get(0)?, "sha256", "0000000000000000000000000000000000000000000000000000000000000000")?;
+    let wrong_grants = image_request_merge_grants(&empty, &altered)?;
+    let wrong_history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"mismatch\"}]}")?;
+    wrong_history.root().object_get("messages")?.array_get(0)?.object_set("image_refs", wrong_history.copy(altered.root().object_get("image_refs")?)?)?;
+    let mismatch = image_request_history(&wrong_history, true, &wrong_grants);
+    image_expect(not mismatch.is_ok() and mismatch.error == 12, "The captured digest is checked against original bytes before encoding")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def image_request_tests(path: &str, base: &str) -> Result<bool, i64> {
+    let paths = json_doc_object()?; let images = paths.new_array()?; paths.root().object_set("images", images)?; images.array_push(paths.new_string(path)?)?;
+    let captured = image_request_capture(images)?;
+    let empty = json_doc_object()?;
+    let grants = image_request_merge_grants(&empty, &captured)?;
+    let again = image_request_merge_grants(&grants, &captured)?;
+    image_expect(again.root().object_get("image_grants")?.array_len()? == 1, "Repeated explicit attachments do not grow duplicate grants")?;
+    let history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"Inspect original 世界😀\"}]}")?;
+    history.root().object_get("messages")?.array_get(0)?.object_set("image_refs", history.copy(captured.root().object_get("image_refs")?)?)?;
+    image_expect(not str_contains(history.serialize_string()?.as_str(), "base64") and not captured.root().object_get("image_refs")?.array_get(0)?.object_has("data"), "Public history stores references and hashes without encoded image bytes")?;
+    // End these independent 16-MiB document reservations before starting the
+    // transport's own bounded documents; aggregate admission remains enforced.
+    let mut validation = 0;
+    while validation < 3 {
+        image_local_validation(&history, &captured, &grants)?;
+        image_expect(sengoo_json_bounded_live_documents() == 0 and sengoo_json_bounded_reserved_bytes() == 0, "Repeated failed and successful hydration releases all bounded document admission")?;
+        validation = validation + 1;
+    };
+    let tools = json_parse("{\"tools\":[]}")?;
+    let mut protocol = 0;
+    while protocol < 3 {
+        let connection = ProviderConnection { id: cli_text("image-fixture"), base: cli_text(base), model: cli_text("fixture"), effort: string_new(), protocol: protocol, images: true };
+        let mut request = engine_request_start_with_grants("image-request", &connection, "fixture-key", &history, &tools, &grants)?;
+        let started = time_unix_ms();
+        loop { request.poll()?; if request.finished() { break; }; if time_since_ms(started) > 15000 { request.cancel(); return Result { is_ok: false, value: false, error: 11 }; }; time_sleep_ms(1); };
+        let result = request.result()?;
+        image_expect(cli_json_string(result.root(), "content")?.as_str() == "image accepted 世界😀", "The selected engine received a real image request")?;
+        protocol = protocol + 1;
+    };
+    image_expect(sengoo_file_snapshot_live_handle_count() == 0 and sengoo_file_snapshot_live_bytes() == 0, "Image hydration releases immutable file snapshots")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let capability = image_capability_tests(); if not capability.is_ok() { println(capability.error); return 1; };
+    let path = cli_argument(0); let base = cli_argument(1);
+    if not path.is_ok() or not base.is_ok() or path.value.len() == 0 or base.value.len() == 0 { return 2; };
+    let result = image_request_tests(path.value.as_str(), base.value.as_str()); if not result.is_ok() { println(result.error); return 1; };
+    println("explicit image references, exact capability, catalog grants and three-protocol engine hydration passed");
+    0
+}
