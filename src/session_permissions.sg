@@ -13,9 +13,9 @@ def session_permissions_value(mode: &str, commands: bool, profile: &str) -> Resu
 }
 
 def session_permissions_load(state: &CliState, session: &str) -> Result<JsonDoc, i64> {
-    let modes = cli_state_modes(state, session)?;
-    if not modes.root().object_has("cli_permissions") { return session_permissions_value("manual", false, "strict"); };
-    let value = modes.root().object_get("cli_permissions")?;
+    let modes = cli_state_mode_load(state, session,"cli_permissions")?;
+    if not modes.root().object_has("value") { return session_permissions_value("manual", false, "strict"); };
+    let value = modes.root().object_get("value")?;
     if value.kind()? != JSON_KIND_OBJECT() or cli_json_optional_i64(value, "schema", 0) != 1 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
     session_permissions_value(cli_json_string(value, "mode")?.as_str(), value.object_get("allow_commands")?.bool_value()?, cli_json_string(value, "profile")?.as_str())
 }

@@ -61,10 +61,18 @@ def image_request_tests(path: &str, base: &str) -> Result<bool, i64> {
         validation = validation + 1;
     };
     let tools = json_parse("{\"tools\":[]}")?;
+    // Real engine requests carry a system entry. Keep local hydration-only
+    // checks separate from that host contract and retain the identity metadata.
+    let engine_history = context_empty_history()?;
+    let system = engine_history.new_object()?;
+    cli_put_string(&engine_history, system, "role", "system")?;
+    cli_put_string(&engine_history, system, "content", "Synthetic image engine fixture")?;
+    engine_history.root().object_get("messages")?.array_push(system)?;
+    engine_history.root().object_get("messages")?.array_push(engine_history.copy(history.root().object_get("messages")?.array_get(0)?)?)?;
     let mut protocol = 0;
     while protocol < 3 {
         let connection = ProviderConnection { id: cli_text("image-fixture"), base: cli_text(base), model: cli_text("fixture"), effort: string_new(), protocol: protocol, images: true };
-        let mut request = engine_request_start_with_grants("image-request", &connection, "fixture-key", &history, &tools, &grants)?;
+        let mut request = engine_request_start_with_grants("image-request", &connection, "fixture-key", &engine_history, &tools, &grants)?;
         let started = time_unix_ms();
         loop { request.poll()?; if request.finished() { break; }; if time_since_ms(started) > 15000 { request.cancel(); return Result { is_ok: false, value: false, error: 11 }; }; time_sleep_ms(1); };
         let result = request.result()?;

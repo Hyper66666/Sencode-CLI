@@ -54,31 +54,32 @@ def retry_http_date(value: &str) -> Result<i64, i64> {
     cli_ok(((days * 24 + hour) * 60 + minute) * 60000 + second * 1000)
 }
 
-// A valid server delay above the local bound means do not retry. Clamping it
-// down would violate Retry-After and can amplify a provider outage.
+// Retry-After is bounded to five minutes per wait. All waits remain pollable
+// so user cancellation and budgets can stop the sequence immediately.
 def retry_after_delay(header: &str, now_ms: i64) -> Result<i64, i64> {
     if header.len() == 0 or header.len() > 128 or now_ms < 0 { return cli_fail(2); };
     let trimmed = str_trim(header)?;
     let seconds = cli_parse_unsigned(trimmed.as_str(), 10);
-    if seconds.is_ok() { if seconds.value > 30 { return cli_fail(13); }; return cli_ok(seconds.value * 1000); };
+    if seconds.is_ok() { if seconds.value > 300 { return cli_fail(13); }; return cli_ok(seconds.value * 1000); };
     let date = retry_http_date(trimmed.as_str())?;
     if date <= now_ms { return cli_ok(0); };
-    if date - now_ms > 30000 { return cli_fail(13); };
+    if date - now_ms > 300000 { return cli_fail(13); };
     cli_ok(date - now_ms)
 }
 
 def request_retry(evidence: &RetryEvidence, retry_after: &str, now_ms: i64, waited_ms: i64) -> RetryDecision {
-    if evidence.attempt < 1 or evidence.attempt >= 3 or waited_ms < 0 or waited_ms >= 30000 { return retry_decision(false, 0, "attempt or wait limit reached"); };
-    if evidence.stream_observed or evidence.side_effects { return retry_decision(false, 0, "stream or side effect already observed; inspect before retrying"); };
-    let rejected = evidence.status == 429 or evidence.status == 500 or evidence.status == 502 or evidence.status == 503 or evidence.status == 504;
-    let before_send = evidence.status == 0 and not evidence.request_started and (evidence.error == 9 or evidence.error == 11);
-    if not rejected and not before_send { return retry_decision(false, 0, "failure is not safely retryable"); };
-    let mut delay = if evidence.attempt == 1 { 250 } else { 500 };
+    if evidence.error == 19 { return retry_decision(false, 0, "request cancelled by user"); };
+    if evidence.side_effects { return retry_decision(false, 0, "tool outcome requires verification; model retry cannot replay tools"); };
+    if evidence.attempt < 1 or evidence.attempt >= 6 or waited_ms < 0 { return retry_decision(false, 0, "five retries exhausted"); };
+    // User policy: every model-request failure gets up to five retries. A
+    // partial model response is provisional; no tool is admitted before its
+    // complete validated turn. Never rerun a tool to implement this policy.
+    let mut delay = 250; let mut power = 1;
+    while power < evidence.attempt { delay = delay * 2; power = power + 1; };
     if retry_after.len() > 0 {
         let parsed = retry_after_delay(retry_after, now_ms);
-        if not parsed.is_ok() { return retry_decision(false, 0, "Retry-After is invalid or exceeds the local wait bound"); };
-        if parsed.value > delay { delay = parsed.value; };
+        if parsed.is_ok() and parsed.value > delay { delay = parsed.value; };
+        if not parsed.is_ok() and parsed.error == 13 { delay = 300000; };
     };
-    if delay > 30000 - waited_ms { return retry_decision(false, 0, "server delay exceeds remaining bounded wait"); };
-    retry_decision(true, delay, if rejected { "provider rejected the attempt before streaming" } else { "transport proved request emission never began" })
+    retry_decision(true, delay, "retrying model request; completed tools retained")
 }

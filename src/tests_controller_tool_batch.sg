@@ -20,6 +20,7 @@ def batch_integration(database: &str, cwd: &str) -> Result<bool, i64> {
     let mut policy = policy_default(); policy.interactive = false; policy.auto_edit = true;
     let input: Vec<TerminalEvent> = vec_new();
     let options = AgentOptions { cwd: cli_text(cwd), session: session, connection: cli_text("fixture"), model: cli_text("fixture-model"), effort: string_new(), format: cli_text("json"), policy: policy, allow_commands: false, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let current = ProviderConnection { id: options.connection.clone()?, base: cli_text("http://127.0.0.1:1"), model: options.model.clone()?, effort: string_new(), protocol: 0, images: false };
     let terminal = terminal_open()?;
     let scheduler = scheduler_new();
     let task = scheduler_add(&scheduler, 0, "fixture", cwd, true)?;
@@ -44,11 +45,11 @@ def batch_integration(database: &str, cwd: &str) -> Result<bool, i64> {
     let jobs: Vec<ControllerBatchJob> = vec_new();
     let results: Vec<String> = vec_new(); results.push(string_new()); results.push(string_new());
     let mut batch = ControllerReadBatch { schedule: schedule, jobs: jobs, results: results, first: 0, published: 0 };
-    let first_step = controller_batch_step(&state, &execution, &options, &history, reads.root(), &mut batch, &scheduler, task, &mut goal, &terminal, &children, &child_states);
+    let first_step = controller_batch_step(&state, &execution, &options, &current, &history, reads.root(), &mut batch, &scheduler, task, &mut goal, &terminal, &children, &child_states);
     if not first_step.is_ok() { controller_batch_drain(&state, &execution, &options, &mut batch, &scheduler, task, &terminal); return first_step; };
     batch_expect(batch.jobs.len() == 2 and tool_schedule_active(&batch.schedule) == 2, "both hardened Git jobs start before either is awaited")?;
     loop {
-        let stepped = controller_batch_step(&state, &execution, &options, &history, reads.root(), &mut batch, &scheduler, task, &mut goal, &terminal, &children, &child_states);
+        let stepped = controller_batch_step(&state, &execution, &options, &current, &history, reads.root(), &mut batch, &scheduler, task, &mut goal, &terminal, &children, &child_states);
         if not stepped.is_ok() { controller_batch_drain(&state, &execution, &options, &mut batch, &scheduler, task, &terminal); return stepped; };
         if stepped.value { break; };
         time_sleep_ms(1);
@@ -62,7 +63,7 @@ def batch_integration(database: &str, cwd: &str) -> Result<bool, i64> {
     batch_call(&calls, "before-write", "git_status", "{}")?;
     batch_call(&calls, "create-note", "write_file", "{\"path\":\"batch-note.txt\",\"content\":\"new value 世界\"}")?;
     batch_call(&calls, "after-write", "read_file", "{\"path\":\"batch-note.txt\"}")?;
-    batch_expect(controller_execute_batch(&state, &execution, &options, &history, calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "real mixed read write read batch completes")?;
+    batch_expect(controller_execute_batch(&state, &execution, &options, &current, &history, calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "real mixed read write read batch completes")?;
     let note = workspace_path(cwd, "batch-note.txt")?;
     batch_expect(workspace_read(note.as_str(), 1000)?.as_str() == "new value 世界", "approved write remains functional and Unicode is intact")?;
     let saved_read = cli_state_tool_result(&state, options.session.as_str(), "after-write")?;
@@ -72,12 +73,12 @@ def batch_integration(database: &str, cwd: &str) -> Result<bool, i64> {
     file_write_str(note.as_str(), "external current value")?;
     let replay = json_parse("[]")?;
     batch_call(&replay, "create-note", "write_file", "{\"path\":\"batch-note.txt\",\"content\":\"must not replay\"}")?;
-    batch_expect(controller_execute_batch(&state, &execution, &options, &history, replay.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "completed admission reuses its result")?;
+    batch_expect(controller_execute_batch(&state, &execution, &options, &current, &history, replay.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "completed admission reuses its result")?;
     batch_expect(workspace_read(note.as_str(), 1000)?.as_str() == "external current value", "durable replay cannot overwrite newer external content")?;
     let duplicate = json_parse("[]")?;
     batch_call(&duplicate, "duplicate-write", "write_file", "{\"path\":\"duplicate.txt\",\"content\":\"first\"}")?;
     batch_call(&duplicate, "duplicate-write", "write_file", "{\"path\":\"duplicate.txt\",\"content\":\"second\"}")?;
-    let rejected = controller_execute_batch(&state, &execution, &options, &history, duplicate.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states);
+    let rejected = controller_execute_batch(&state, &execution, &options, &current, &history, duplicate.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states);
     batch_expect(not rejected.is_ok() and rejected.error == 2 and not file_exists(workspace_path(cwd, "duplicate.txt")?.as_str()), "duplicate IDs reject whole batch before its first write")?;
     batch_expect(controller_tool_prior(&state, &execution, "duplicate-write")? == 0, "duplicate batch cannot create durable execution claims")?;
 

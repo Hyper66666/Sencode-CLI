@@ -1,7 +1,9 @@
 import agent;
 import transport;
 import connection;
+import request_identity;
 import scheduler;
+import request_retry;
 import std::time;
 
 // Host-owned sessions, credentials and provider choices are captured at start.
@@ -127,7 +129,7 @@ def children_start(children: &Children, scheduler: &Scheduler, parent_id: i64, p
     let last = json_parse("{\"content\":\"\",\"tool_calls\":[]}")?;
     let flags: Vec<i64> = vec_new();
     let mut flag = 0;
-    while flag < 9 { if not flags.push(0) { return cli_fail(8); }; flag = flag + 1; };
+    while flag < 11 { if not flags.push(0) { return cli_fail(8); }; flag = flag + 1; };
     flags.set(8, time_monotonic_ms());
     let id = scheduler_add(scheduler, parent_id, options.connection.connection_id(), options.cwd.as_str(), not policy.plan)?;
     let task = ChildTask { id: id, parent: parent_id, options: options, policy: policy, history: history, tools: tools, last: last, flags: flags };
@@ -175,6 +177,19 @@ def children_done(children: &Children, parent_id: i64) -> bool {
     true
 }
 
+def children_retry(children: &Children, task: &ChildTask, goal: &GoalState, code: i64, status: i64, header: &str) -> Result<bool, i64> {
+    if goal.status != 1 { return Result { is_ok: true, value: false, error: 0 }; };
+    let evidence = RetryEvidence { attempt: children_flag(task, 9), status: status, error: code, request_started: true, stream_observed: true, side_effects: false };
+    let retry = request_retry(&evidence, header, time_unix_ms(), 0);
+    if not retry.retry { return Result { is_ok: true, value: false, error: 0 }; };
+    task.flags.set(0, 0); task.flags.set(10, time_monotonic_ms() + retry.delay_ms);
+    cli_put_string(&task.last, task.last.root(), "content", "")?;
+    let event = json_doc_object()?;
+    cli_put_i64(&event, event.root(), "retry", children_flag(task, 9))?;
+    children_event(children, task, "retry", &event)?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
 def children_poll(children: &Children, scheduler: &Scheduler, goal: &mut GoalState) -> Result<bool, i64> {
     let mut active = children.active.len();
     while active > 0 {
@@ -208,6 +223,7 @@ def children_poll(children: &Children, scheduler: &Scheduler, goal: &mut GoalSta
             if error == 0 {
                 let result = stream.job.result();
                 if not result.is_ok() { error = result.error; } else {
+                    task.flags.set(9, 0); task.flags.set(10, 0);
                     task.last.root().object_set("turn", task.last.copy(result.value.root())?)?;
                     cli_put_string(&task.last, task.last.root(), "content", cli_json_optional_string(result.value.root(), "content").as_str())?;
                     task.history.root().object_get("messages")?.array_push(task.history.copy(result.value.root())?)?;
@@ -222,7 +238,11 @@ def children_poll(children: &Children, scheduler: &Scheduler, goal: &mut GoalSta
                     };
                 };
             };
-            if error != 0 { stream.job.cancel(); children_report(children, scheduler, task, error)?; (); };
+            if error != 0 {
+                let retry = children_retry(children, task, goal, error, stream.job.http.status, stream.job.http.retry_after.as_str())?;
+                stream.job.cancel();
+                if not retry { children_report(children, scheduler, task, error)?; (); };
+            };
         } else { if not children.active.push(stream) { return Result { is_ok: false, value: false, error: 8 }; }; };
         active = active - 1;
     };
@@ -231,12 +251,14 @@ def children_poll(children: &Children, scheduler: &Scheduler, goal: &mut GoalSta
         let task: &ChildTask = children.tasks.get(index);
         let phase = children_flag(task, 0);
         if phase < 3 and phase != 1 and scheduler_is_cancelled(scheduler, task.id) { children_report(children, scheduler, task, 19)?; (); } else {
-            if phase == 0 {
+            if phase == 0 and time_monotonic_ms() >= children_flag(task, 10) {
                 if agent_context_bytes(&task.history)? > 786432 { children_report(children, scheduler, task, 13)?; (); } else {
                     if scheduler_acquire_model(scheduler, task.id)? {
                         if not scheduler_take_request(scheduler, task.id, goal) { children_report(children, scheduler, task, 13)?; (); } else {
                             task.flags.set(7, children_flag(task, 7) + 1);
-                            let started = provider_job_start_with_effort_scoped(task.options.connection.base_url(), task.options.connection.protocol_id(), task.options.connection.model_id(), task.options.connection.effort_id(), task.options.connection.connection_id(), task.options.credential.as_str(), &task.history, &task.tools);
+                            task.flags.set(9, children_flag(task, 9) + 1);
+                            let identified = request_identity_history(&task.history, &task.options.connection)?;
+                            let started = provider_job_start_with_effort_scoped(task.options.connection.base_url(), task.options.connection.protocol_id(), task.options.connection.model_id(), task.options.connection.effort_id(), task.options.connection.connection_id(), task.options.credential.as_str(), &identified, &task.tools);
                             if started.is_ok() {
                                 let stream = ChildStream { id: task.id, job: started.value };
                                 if not children.active.push(stream) { return Result { is_ok: false, value: false, error: 8 }; };
@@ -246,7 +268,7 @@ def children_poll(children: &Children, scheduler: &Scheduler, goal: &mut GoalSta
                                 ();
                             } else {
                                 children_account(children, scheduler, task, goal, 0, 0)?;
-                                children_report(children, scheduler, task, started.error)?;
+                                if not children_retry(children, task, goal, started.error, 0, "")? { children_report(children, scheduler, task, started.error)?; (); };
                                 ();
                             };
                         };
@@ -277,7 +299,10 @@ def children_result(children: &Children, id: i64) -> Result<JsonDoc, i64> {
     cli_put_string(&result, result.root(), "role", task.options.role.as_str())?;
     cli_put_string(&result, result.root(), "connection_id", task.options.connection.connection_id())?;
     cli_put_string(&result, result.root(), "model", task.options.connection.model_id())?;
-    cli_put_string(&result, result.root(), "content", cli_json_optional_string(task.last.root(), "content").as_str())?;
+    // Stream previews belong to Agent cards. A running child's most recent
+    // model response is not its final result and must not wake status narration.
+    let content = if children_flag(task, 0) >= 3 { cli_json_optional_string(task.last.root(), "content") } else { string_new() };
+    cli_put_string(&result, result.root(), "content", content.as_str())?;
     Result { is_ok: true, value: result, error: 0 }
 }
 
@@ -292,6 +317,14 @@ def children_list(children: &Children) -> Result<JsonDoc, i64> {
         index = index + 1;
     };
     Result { is_ok: true, value: result, error: 0 }
+}
+
+def children_terminal_count(children: &Children, parent: i64) -> i64 {
+    let mut count = 0; let mut index = 0;
+    while index < children.tasks.len() { let task: &ChildTask = children.tasks.get(index);
+        if (parent == 0 or task.parent == parent) and children_flag(task, 0) >= 3 { count = count + 1; };
+        index = index + 1;
+    }; count
 }
 
 // A claim exposes a tool only after inherited authority and cwd serialization.

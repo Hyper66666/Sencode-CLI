@@ -52,6 +52,18 @@ def timeline_animation_tests() -> Result<bool, i64> {
     timeline_assert(tick.len() > 0 and str_contains(tick.as_str(), "Working") and not str_contains(tick.as_str(), "run_command") and not str_contains(tick.as_str(), "╭") and not str_contains(tick.as_str(), "\x1b[?25"), "animation only repaints the conversation tail without borders or cursor visibility writes")?;
     timeline_assert(app.draft.as_str() == "my unchanged draft" and app.cursor == app.draft.len() and app.scroll == 0, "motion preserves draft cursor and following position")?;
     timeline_assert(not str_contains(tui_frame(&app)?.as_str(), "Thinking"), "no extra thinking row is introduced")?;
+    let messages_before = app.messages.len(); let one_row = tui_live_rows(&app);
+    tui_reconnect(&mut app, "正在重连中... 1/5 · HTTP 502 Bad Gateway")?;
+    let reconnect = tui_frame(&app)?;
+    timeline_assert(tui_live_rows(&app) == one_row + 1 and app.messages.len() == messages_before and str_index_of(reconnect.as_str(), "正在重连中") < str_index_of(reconnect.as_str(), "Working"), "one transient retry row above Working does not append transcript notices")?;
+    tui_reconnect(&mut app, "正在重连中... 2/5 · TLS handshake failed")?;
+    timeline_assert(tui_live_rows(&app) == one_row + 1 and app.draft.as_str() == "my unchanged draft", "retry updates replace the same row and preserve the draft")?;
+    tui_reconnect(&mut app, "")?;
+    timeline_assert(tui_live_rows(&app) == one_row, "successful reconnect removes its transient row")?;
+    let before_retry = app.messages.len();
+    tui_delta(&mut app, "partial failed response")?;
+    tui_discard_retry_stream(&mut app)?;
+    timeline_assert(app.streaming.len() == 0 and app.messages.len() == before_retry and app.draft.as_str() == "my unchanged draft", "retry replaces only provisional response, retains draft and completed tools")?;
     timeline_assert(tui_animation_due(&app, app.animation_tick + 1), "visible conversation activity schedules its next tick")?;
     app.animate_tools = false; tui_paint_update(&mut app, true)?; app.animation_tick = app.animation_tick + 1;
     let reduced = tui_paint_update(&mut app, true)?;
@@ -71,7 +83,9 @@ def timeline_animation_tests() -> Result<bool, i64> {
     app.approval.clear(); app.animation_tick = (app.messages.get(0).tool_started + 2400) / 120;
     timeline_assert(str_contains(tui_frame(&app)?.as_str(), "running  2s"), "slow tool retains an elapsed-time label")?;
     tui_tool(&mut app, "req/animated", "run_command", "completed", "", "")?;
+    tui_reconnect(&mut app, "正在重连中... 5/5")?;
     tui_finish(&mut app, true)?;
+    timeline_assert(app.reconnect.len() == 0, "terminal completion clears retry state")?;
     tui_paint_update(&mut app, true)?; app.animation_tick = app.animation_tick + 1;
     let frozen = tui_paint_update(&mut app, true)?;
     timeline_assert(not tui_animation_due(&app, app.animation_tick + 1) and frozen.len() == 0, "completed card freezes completely")?;

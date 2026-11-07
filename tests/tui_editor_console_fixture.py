@@ -142,7 +142,7 @@ def worker(args):
         # A preserved history anchor replaces the transient status line. Follow
         # output explicitly before checking the cancellation status itself.
         console.key(0x23, "", 8)
-        cancelled = wait(console, process, lambda s: "Paused / cancelled" in s["text"] and "NEXT MESSAGE" not in s["text"], "explicit Ctrl+C cancel")
+        cancelled = wait(console, process, lambda s: "Cancelled" in s["text"] and "NEXT MESSAGE" not in s["text"], "explicit Ctrl+C cancel")
         assert "kept draft 中文" in composer(cancelled)
         evidence["checks"].append("explicit-ctrl-c-cancels-vim-stream-and-preserves-draft")
 

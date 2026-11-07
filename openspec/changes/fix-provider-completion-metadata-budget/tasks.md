@@ -1,0 +1,7 @@
+- [x] Integration: isolate a valid completion rejected by the installed parser.
+- [x] Integration: use bounded structural event parsing and closed diagnostics.
+- [x] Integration: pass native protocol, transport, retry and diagnostic suites.
+- [x] Integration: pass production continuation, recovery and cancel fixtures.
+- [x] Integration: verify live history-shaped completion with the repaired parser.
+- [x] Integration: package and update both local aliases with rollback evidence.
+- [x] Integration: validate OpenSpec and record exact executable evidence.

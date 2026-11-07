@@ -228,7 +228,7 @@ def worker(args):
         console.key(0x1B, "\x1b")
         wait(console, process, lambda s: "QUEUED TASKS" not in s["text"] and "NEXT MESSAGE" in s["text"], "close paused queue")
         console.key(0x1B, "\x1b")
-        cancelled = wait(console, process, lambda s: "Paused / cancelled" in s["text"] and "kept composer 中文" in s["text"] and "queue paused" in s["text"], "cancel preserves draft")
+        cancelled = wait(console, process, lambda s: "Cancelled" in s["text"] and "kept composer 中文" in s["text"] and "queue paused" in s["text"], "cancel preserves draft")
         evidence["snapshots"]["cancelled"] = cancelled
         evidence["checks"].append("cancel-preserves-draft-and-partial-text")
 
@@ -449,7 +449,7 @@ def production_worker(args):
         wait(console, process, lambda s: "MODELS  /" not in s["text"], "close busy model picker")
         console.inject("kept draft 中文")
         console.key(0x1B, "\x1b")
-        wait(console, process, lambda s: "Paused / cancelled" in s["text"] and "kept draft 中文" in s["text"], "cancel and preserve draft", timeout=20)
+        wait(console, process, lambda s: "Cancelled" in s["text"] and "kept draft 中文" in s["text"], "cancel and preserve draft", timeout=20)
         evidence["checks"].append("model-menu-during-stream-and-cancellation")
         console.key(0, "\x15", 8)
         console.command("render fixture")
@@ -497,7 +497,7 @@ def production_worker(args):
         console.command("question cancel fixture")
         wait(console, process, lambda s: "QUESTION" in s["text"] and "保留现有实现" in s["text"], "question to cancel")
         console.key(0x1B, "\x1b")
-        wait(console, process, lambda s: "Paused / cancelled" in s["text"] and "NEXT MESSAGE" not in s["text"], "question cancellation pauses turn")
+        wait(console, process, lambda s: "Cancelled" in s["text"] and "NEXT MESSAGE" not in s["text"], "question cancellation pauses turn")
         assert SlowProvider.calls.count("question cancel fixture") == 1, SlowProvider.calls
         evidence["checks"].append("model-question-Esc-cancels-without-sending-an-answer")
         console.command("pending insertion fixture")
@@ -520,7 +520,7 @@ def production_worker(args):
         assert "新增条件：只修改渲染" not in SlowProvider.calls, SlowProvider.calls
         evidence["snapshots"]["recalled-insertion"] = recalled
         console.key(0x43, "\x03", 8)
-        wait(console, process, lambda s: "Paused / cancelled" in s["text"] and "NEXT MESSAGE" not in s["text"] and "保留草稿" in s["text"], "explicit cancellation after recall")
+        wait(console, process, lambda s: "Cancelled" in s["text"] and "NEXT MESSAGE" not in s["text"] and "保留草稿" in s["text"], "explicit cancellation after recall")
         console.key(0x23)  # End selects the end of the complete multiline draft.
         console.key(0, "\x15", 8)
         evidence["checks"].append("pending-grey-preview-overlay-focus-Esc-recall-and-draft-merge")
@@ -531,11 +531,11 @@ def production_worker(args):
         console.key(0x53, "\x13", 8)
         wait(console, process, lambda s: "stashed" in s["text"].lower() and "│ > 暂存长草稿" not in s["text"], "Ctrl+S temporarily stashes draft")
         slash("/history")
-        wait(console, process, lambda s: "PROJECT PROMPTS" in s["text"], "project prompt history selector")
+        wait(console, process, lambda s: "SESSION INPUTS / latest 10" in s["text"], "session input history selector")
         console.inject("local conveniences fixture")
         wait(console, process, lambda s: "local conveniences fixture" in s["text"], "history search")
         console.key(0x0D, "\r")
-        wait(console, process, lambda s: "History prompt inserted" in s["text"] and "PROJECT PROMPTS" not in s["text"] and "│ > local conveniences fixture" in s["text"], "history Enter inserts without sending")
+        wait(console, process, lambda s: "History prompt inserted" in s["text"] and "SESSION INPUTS" not in s["text"] and "│ > local conveniences fixture" in s["text"], "history Enter inserts without sending")
         assert len(SlowProvider.calls) == model_calls, SlowProvider.calls
         console.key(0x53, "\x13", 8)
         wait(console, process, lambda s: "│ > 暂存长草稿 中文" in s["text"], "stash exchanges without loss")
@@ -547,7 +547,7 @@ def production_worker(args):
         console.key(0x1B, "\x1b")
         wait(console, process, lambda s: "COPY CODE" not in s["text"], "copy selector cancel leaves clipboard untouched")
         assert len(SlowProvider.calls) == model_calls, SlowProvider.calls
-        evidence["checks"].append("local-project-history-stash-exchange-and-code-selector-no-model-calls")
+        evidence["checks"].append("local-session-history-stash-exchange-and-code-selector-no-model-calls")
         console.command("approval fixture")
         wait(console, process, lambda s: "PERMISSION REQUIRED" in s["text"], "write permission")
         console.inject("yes")

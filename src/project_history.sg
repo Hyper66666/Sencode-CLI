@@ -148,12 +148,12 @@ def project_history_import(state: &CliState, tables: &Vec<ProjectHistoryTable>) 
     while index < tables.len() {
         let item: &ProjectHistoryTable = tables.get(index);
         if item.name.as_str()=="shared_modes"{
-            let mut modes=tx.prepare("SELECT session_id,mode_json,updated_at FROM project_history.ph_shared_modes")?;
+            let mut modes=tx.prepare("SELECT session_id,mode_json,updated_at,(SELECT json_group_object(key,json(m.mode_json -> fullkey)) FROM json_each(m.mode_json) WHERE key IN('cli_target','session_origin','goal')) FROM project_history.ph_shared_modes m")?;
             while modes.step()?{
                 let identity=modes.text(0)?;let raw=modes.text(1)?;
                 // Both storage readers must classify the same provenance. A
                 // duplicate member is ambiguous across SQLite and the DOM.
-                let safe=project_history_import_modes(raw.as_str())?;
+                let safe=project_history_import_modes(modes.text(3)?.as_str())?;
                 let mut duplicate=tx.prepare("WITH tree AS(SELECT id,parent,key FROM json_tree(?)),origins AS(SELECT id FROM tree WHERE parent=0 AND key='session_origin') SELECT 1 FROM tree WHERE (parent=0 AND key='session_origin') OR (parent IN(SELECT id FROM origins) AND key IN('version','kind','parent_session_id','source_session_id')) GROUP BY parent,key HAVING count(*)>1 LIMIT 1")?;
                 duplicate.bind_text(1,raw.as_str())?;if duplicate.step()?{return state_bool_error(8);};
                 if safe.root().object_has("session_origin") {

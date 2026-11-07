@@ -17,6 +17,13 @@ def ui_spans_empty() -> Vec<UiSpan> { let spans: Vec<UiSpan> = vec_new(); spans 
 def ui_ids_empty() -> Vec<i64> { let ids: Vec<i64> = vec_new(); ids }
 def ui_history_empty() -> Vec<InputHistory> { let rows: Vec<InputHistory> = vec_new(); rows }
 
+def ui_history_add(history: &Vec<InputHistory>, text: &str) -> Result<bool, i64> {
+    if text.len() == 0 or text.len() > 65536 { return Result { is_ok: false, value: false, error: 2 }; };
+    if history.len() == 0 or history.get(history.len() - 1).text.as_str() != text {
+        history.push(InputHistory { text: cli_text(text) }); while history.len() > 10 { history.remove(0); (); }; ();
+    }; Result { is_ok: true, value: true, error: 0 }
+}
+
 def ui_spans_copy(source: &Vec<UiSpan>, shift: i64, limit: i64) -> Vec<UiSpan> {
     let spans: Vec<UiSpan> = vec_new(); let mut index = 0;
     while index < source.len() { let span: &UiSpan = source.get(index); let start = span.start + shift; let end = if span.end + shift > limit { limit } else { span.end + shift };

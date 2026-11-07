@@ -5,17 +5,22 @@ import terminal;
 def tui_explore_kind(name: &str) -> i64 {
     if name == "read_file" { return 1; };
     if name == "list_directory" { return 2; };
-    if name == "search" or name == "find_files" { return 3; }; 0
+    if name == "search" or name == "find_files" { return 3; };
+    if name == "wait_agents" or name == "list_agents" { return 4; }; 0
 }
+
+def tui_group_family(name: &str) -> i64 { let kind = tui_explore_kind(name); if kind == 4 { 2 } else { if kind > 0 { 1 } else { 0 } } }
 
 def tui_group_start(app: &UiApp, slot: i64) -> i64 {
     let mut start = slot;
-    while start > 0 and tui_explore_kind(app.messages.get(start - 1).tool_name.as_str()) > 0 { start = start - 1; }; start
+    let family = tui_group_family(app.messages.get(slot).tool_name.as_str());
+    while start > 0 and tui_group_family(app.messages.get(start - 1).tool_name.as_str()) == family { start = start - 1; }; start
 }
 
 def tui_group_end(app: &UiApp, slot: i64) -> i64 {
     let mut end = slot + 1;
-    while end < app.messages.len() and tui_explore_kind(app.messages.get(end).tool_name.as_str()) > 0 { end = end + 1; }; end
+    let family = tui_group_family(app.messages.get(slot).tool_name.as_str());
+    while end < app.messages.len() and tui_group_family(app.messages.get(end).tool_name.as_str()) == family { end = end + 1; }; end
 }
 
 def tui_group_open(app: &UiApp, id: i64) -> bool {
@@ -24,19 +29,25 @@ def tui_group_open(app: &UiApp, id: i64) -> bool {
 
 def tui_group_rows(rows: &Vec<UiLine>, app: &UiApp, start: i64, end: i64, width: i64) -> Result<bool, i64> {
     let id = app.messages.get(start).id; let open = tui_group_open(app, id); let mut files = 0; let mut dirs = 0; let mut searches = 0; let mut pending = 0; let mut failed = 0;
+    let coordination = tui_group_family(app.messages.get(start).tool_name.as_str()) == 2;
     let seen: Vec<InputHistory> = vec_new(); let mut index = start;
     while index < end { let message: &UiMessage = app.messages.get(index); let kind = tui_explore_kind(message.tool_name.as_str());
         if message.tool_status.as_str() == "running" { pending = pending + 1; } else { if message.tool_status.as_str() != "completed" { failed = failed + 1; } else {
             let key = cli_text(message.tool_name.as_str()); key.push_str(":")?; key.push_str(str_to_ascii_lower(message.tool_detail.as_str())?.as_str())?;
             let mut duplicate = false; let mut scan = 0; while scan < seen.len() { if seen.get(scan).text.as_str() == key.as_str() { duplicate = true; }; scan = scan + 1; };
-            if kind == 3 { searches = searches + 1; } else { if not duplicate { if kind == 1 { files = files + 1; } else { dirs = dirs + 1; }; seen.push(InputHistory { text: key }); (); }; };
+            if kind == 3 { searches = searches + 1; } else { if not duplicate and not coordination { if kind == 1 { files = files + 1; } else { dirs = dirs + 1; }; seen.push(InputHistory { text: key }); (); }; };
         }; }; index = index + 1;
     };
     md_row(rows, "", 0, id)?;
-    let title = cli_text(if open { "▾ " } else { "▸ " }); title.push_str(if pending > 0 { "Exploring " } else { "Explored " })?;
+    let title = cli_text(if open { "▾ " } else { "▸ " });
+    if coordination {
+        title.push_str(if pending > 0 { "Waiting for agents" } else { "Agent status" })?;
+        if end - start > 1 { title.push_str(" · ")?; title.push_i64(end - start)?; title.push_str(" checks")?; (); };
+    } else { title.push_str(if pending > 0 { "Exploring " } else { "Explored " })?;
     title.push_i64(files)?; title.push_str(if files == 1 { " file" } else { " files" })?;
     if dirs > 0 { title.push_str(" · ")?; title.push_i64(dirs)?; title.push_str(if dirs == 1 { " directory" } else { " directories" })?; (); };
     if searches > 0 { title.push_str(" · ")?; title.push_i64(searches)?; title.push_str(if searches == 1 { " search" } else { " searches" })?; (); };
+    };
     if pending > 0 { title.push_str(" · ")?; title.push_i64(pending)?; title.push_str(" pending")?; (); };
     if failed > 0 { title.push_str(" · ")?; title.push_i64(failed)?; title.push_str(" failed")?; (); };
     let fitted = ui_fit(title.as_str(), width)?; let spans: Vec<UiSpan> = vec_new();

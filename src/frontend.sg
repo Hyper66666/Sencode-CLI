@@ -18,6 +18,7 @@ import tui_agents;
 import permissions;
 import session_target;
 import session_permissions;
+import input_history;
 
 struct FrontHost {
     process: ProcessHandle, input: Buffer, output: Buffer, errors: Buffer,
@@ -101,6 +102,13 @@ def front_permission_sync(options: &AgentOptions, app: &mut UiApp, host: &FrontH
     app.permission = label; tui_true()
 }
 
+def front_finish_plan(options: &mut AgentOptions, app: &mut UiApp, host: &FrontHost) -> Result<bool, i64> {
+    if not options.policy.plan { return tui_true(); };
+    policy_finish_plan(&mut options.policy);
+    tui_mode(app, "BUILD")?;
+    front_permission_sync(options, app, host)
+}
+
 def front_permission_set(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, host: &mut FrontHost, mode: &str) -> Result<bool, i64> {
     let selected = view_selection(state, options.connection.as_str(), options.model.as_str())?;
     let metadata = cli_state_connection_metadata(state, cli_json_optional_string(selected.root(), "id").as_str());
@@ -116,9 +124,21 @@ def front_permission_set(state: &CliState, options: &mut AgentOptions, app: &mut
 
 def front_history(state: &CliState, options: &AgentOptions, app: &mut UiApp) -> Result<bool, i64> {
     tui_clear(app)?;
+    app.history = input_history_load(state, options.session.as_str())?;
+    app.history_index = app.history.len(); app.history_draft.clear(); app.history_dirty = false; app.history_retry_at = 0;
     let history = cli_state_recent_history(state, options.session.as_str(), 512)?;
     tui_history_messages(app, &history)?;
     Result { is_ok: true, value: true, error: 0 }
+}
+
+def front_remember_input(state: &CliState, options: &AgentOptions, app: &mut UiApp, final_attempt: bool) -> Result<bool, i64> {
+    if not app.history_dirty or not final_attempt and time_monotonic_ms() < app.history_retry_at { return tui_true(); };
+    let saved = input_history_save(state, options.session.as_str(), &app.history);
+    if not saved.is_ok() { app.history_retry_at = time_monotonic_ms() + 100;
+        if final_attempt { return state_bool_error(saved.error); };
+        return tui_true();
+    };
+    app.history_dirty = false; app.history_retry_at = 0; tui_true()
 }
 
 def front_session_time(timestamp: i64) -> Result<String, i64> {
@@ -144,13 +164,16 @@ def front_sessions(state: &CliState, options: &AgentOptions, app: &mut UiApp) ->
 }
 
 def front_prompt_history(state: &CliState, options: &AgentOptions, app: &mut UiApp, query: &str) -> Result<bool, i64> {
-    let history = local_prompt_history(state, options.cwd.as_str(), query)?; let prompts = history.root().object_get("prompts")?;
     let choices: Vec<UiCandidate> = vec_new(); let mut index = 0;
-    while index < prompts.array_len()? { let prompt = prompts.array_get(index)?; let text = cli_json_string(prompt, "text")?;
-        choices.push(UiCandidate { id: cli_json_string(prompt, "id")?, label: pending_preview(text.as_str(), 140)?, detail: cli_json_string(prompt, "session_id")?, value: text }); index = index + 1;
+    let lowered = str_to_ascii_lower(query)?;
+    while index < app.history.len() { let slot = app.history.len() - index - 1; let text = app.history.get(slot).text.clone()?;
+        if query.len() == 0 or str_contains(str_to_ascii_lower(text.as_str())?.as_str(), lowered.as_str()) {
+            let id = cli_text("input-"); id.push_i64(slot)?;
+            choices.push(UiCandidate { id: id, label: pending_preview(text.as_str(), 140)?, detail: string_new(), value: text }); ();
+        }; index = index + 1;
     };
-    if choices.len() == 0 { return tui_status(app, "No matching project prompt history"); };
-    tui_set_candidates(app, "prompt-history", "PROJECT PROMPTS / Enter inserts into draft", choices)
+    if choices.len() == 0 { return tui_status(app, "No matching session input history"); };
+    tui_set_candidates(app, "prompt-history", "SESSION INPUTS / latest 10 / Enter inserts into draft", choices)
 }
 
 def front_copy_code(app: &mut UiApp) -> Result<bool, i64> {
@@ -254,6 +277,7 @@ def front_switch(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, 
     if app.busy { tui_message(app, "notice", "Wait for the current execution to stop before switching sessions.")?; return tui_true(); };
     if not cli_state_session_in_project(state, options.cwd.as_str(), session)? { return state_bool_error(5); };
     front_stop(host)?;
+    front_remember_input(state, options, app, true)?;
     front_remember_target(state, options, app, host)?;
     front_remember_permissions(state, options, app, host, true)?;
     let target = session_target_restore(state, session, "", "", "")?;
@@ -261,11 +285,11 @@ def front_switch(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, 
         options.connection = cli_json_string(target.root(), "connection")?; options.model = cli_json_string(target.root(), "model")?; options.effort = cli_json_string(target.root(), "effort")?;
     };
     options.session = cli_text(session);
+    app.draft.clear(); app.cursor = 0;
     options.goal_text.clear();
     options.plan_path = path_join_string(workspace_path(options.cwd.as_str(), ".sencode/plans")?.as_str(), session)?;
     options.plan_path.push_str(".md")?;
-    let plan = cli_state_mode_load(state, session, "plan")?;
-    options.policy.plan = plan.root().object_has("value") and plan.root().object_get("value")?.object_get("active")?.bool_value()?;
+    policy_finish_plan(&mut options.policy);
     let permissions = session_permissions_restore(state, session, &mut options.policy)?;
     options.allow_commands = permissions.root().object_get("allow_commands")?.bool_value()?;
     *host = front_spawn(state, options)?;
@@ -319,6 +343,21 @@ def front_event(host: &mut FrontHost, app: &mut UiApp, event: &JsonDoc, terminal
     if request.len() == 0 and kind.as_str() != "notice" { return tui_true(); };
     if request.len() > 0 and (host.active.len() == 0 or request.as_str() != host.active.as_str()) { return tui_true(); };
     let text = cli_json_optional_string(event.root(), "text");
+    if kind.as_str() == "retry" {
+        let source = cli_json_optional_string(event.root(), "session_id");
+        if source.len() > 0 and source.as_str() != app.session.as_str() { return tui_true(); };
+        let detail = json_parse(text.as_str())?;
+        if detail.root().object_has("replace_partial") and detail.root().object_get("replace_partial")?.bool_value()? { tui_discard_retry_stream(app)?; (); };
+        let label = cli_text("正在重连中... ");
+        label.push_i64(cli_json_optional_i64(detail.root(), "retry", 1))?; label.push_str("/5 · ")?;
+        label.push_str(cli_json_optional_string(detail.root(), "error").as_str())?;
+        return tui_reconnect(app, label.as_str());
+    };
+    if kind.as_str() == "request_completed" {
+        let source = cli_json_optional_string(event.root(), "session_id");
+        if source.len() == 0 or source.as_str() == app.session.as_str() { return tui_reconnect(app, ""); };
+        return tui_true();
+    };
     if kind.as_str() == "phase" { return tui_activity(app, text.as_str()); };
     if kind.as_str() == "continuation" { return tui_continuation(app); };
     if kind.as_str() == "diff" { return tui_message(app, "diff", text.as_str()); };
@@ -362,7 +401,8 @@ def front_event(host: &mut FrontHost, app: &mut UiApp, event: &JsonDoc, terminal
         if not success and content.len() > 0 { tui_message(app, "notice", content.as_str())?; (); };
         tui_agents_finish(&host.agents, app, success)?;
         let code = cli_json_optional_i64(event.root(), "code", if success { 0 } else { 1 });
-        tui_finish_outcome(app, success, cli_json_optional_i64(event.root(), "elapsed_ms", -1), if success { "completed" } else { if code == 19 { "cancelled" } else { "stopped" } })?;
+        let reason = if event.root().object_has("diagnostic") { cli_json_optional_string(event.root().object_get("diagnostic")?, "reason") } else { string_new() };
+        tui_finish_outcome(app, success, cli_json_optional_i64(event.root(), "elapsed_ms", -1), if success { "completed" } else { if code == 19 or reason.as_str() == "cancelled" { "cancelled" } else { if str_starts_with(reason.as_str(), "goal_") { "paused" } else { "stopped" } } })?;
         host.active.clear();
         return tui_true();
     };
@@ -375,7 +415,7 @@ def front_tool_event(app: &mut UiApp, key: &str, text: &str) -> Result<bool, i64
     if name.len() == 0 { return tui_true(); };
     let status = cli_json_optional_string(root, "status");
     let detail = if root.object_has("arguments") { tui_tool_detail(root.object_get("arguments")?)? } else { string_new() };
-    let error = if status.as_str() == "failed" and root.object_has("result") { tui_tool_error_text(root.object_get("result")?)? } else { string_new() };
+    let error = if (status.as_str() == "failed" or status.as_str() == "paused") and root.object_has("result") { tui_tool_error_text(root.object_get("result")?)? } else { string_new() };
     let unknown = root.object_has("result") and root.object_get("result")?.object_has("outcome_unknown") and tui_tool_outcome(root.object_get("result")?) == 0;
     tui_tool(app, key, name.as_str(), if unknown { "interrupted" } else { status.as_str() }, detail.as_str(), error.as_str())
 }
@@ -527,7 +567,7 @@ def front_command(state: &CliState, options: &mut AgentOptions, app: &mut UiApp,
             choices.push(UiCandidate { id: cli_text("approve"), label: cli_text("Save Markdown export"), detail: host.export_path.clone()?, value: cli_text("yes") });
             return tui_set_candidates(app, "export", "Confirm conversation export / overwrites target", choices);
         };
-        if name.as_str() == "/plan" { if value.as_str() == "approve" { options.policy.plan = false; front_target(state, options, app)?; return tui_message(app, "notice", "Plan approved. Execution permissions still apply."); }; options.policy.plan = true; front_target(state, options, app)?; if value.len() == 0 { return tui_message(app, "notice", "Plan mode enabled; /plan approve permits execution."); }; prompt = value.clone()?; } else {
+        if name.as_str() == "/plan" { if value.as_str() == "approve" { front_finish_plan(options, app, host)?; return tui_message(app, "notice", "Plan approved; planning is cleared. Execution permissions still apply."); }; options.policy.plan = true; front_target(state, options, app)?; if value.len() == 0 { return tui_message(app, "notice", "Plan mode enabled for the next turn only; it exits when that turn finishes or stops."); }; prompt = value.clone()?; } else {
             if name.as_str() == "/goal" {
                 if value.as_str() == "resume" { let saved = cli_state_mode_load(state, options.session.as_str(), "goal")?; if not saved.root().object_has("value") { return tui_message(app, "notice", "No saved Goal exists."); }; let goal = saved.root().object_get("value")?; options.goal_text = cli_json_string(goal, "objective")?; options.checks.root().object_set("checks", options.checks.copy(goal.object_get("checks")?)?)?; (); } else { options.goal_text = value.clone()?; };
                 if options.goal_text.len() == 0 { return tui_message(app, "notice", "Use /goal OBJECTIVE or /goal resume."); }; prompt = options.goal_text.clone()?;
@@ -554,7 +594,7 @@ def front_action(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, 
         };
         return front_command(state, options, app, host, action.text.as_str(), maximum, tokens);
     };
-    if action.kind == 2 { app.queue_paused = true; front_control(host, "cancel")?; return tui_status(app, "Stopping / waiting for tool cleanup"); };
+    if action.kind == 2 { app.queue_paused = true; if not app.busy { front_finish_plan(options, app, host)?; return tui_status(app, "Cancelled"); }; front_control(host, "cancel")?; return tui_status(app, "Stopping / waiting for tool cleanup"); };
     if action.kind == 3 { host.exit_requested = true; return front_control(host, "shutdown"); };
     if action.kind == 4 {
         if action.context.as_str() == "permission-mode" { return front_permission_set(state, options, app, host, action.text.as_str()); };
@@ -671,8 +711,12 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
     if resume_picker { front_sessions(state, options, &mut app)?; (); };
     let mut painted = 0; let mut needs_paint = true;
     loop {
+        let turn_was_busy = app.busy;
         let pumped = front_pump(&mut host, &mut app, terminal);
         if not pumped.is_ok() { front_pump_failure(&mut host, &mut app, pumped.error)?; needs_paint = true; (); } else { if pumped.value { needs_paint = true; }; };
+        // Runs before another key or queued submission can start a new turn.
+        // Includes normal result, provider rejection, cancel, EOF and bad IPC.
+        if turn_was_busy and not app.busy or host.stopped_at > 0 and options.policy.plan { front_finish_plan(options, &mut app, &host)?; needs_paint = true; (); };
         if host.exit_requested { break; };
         let worktree_was_active = worktrees.active;
         front_worktree_tick(&mut worktrees, state, &options.policy, &mut app, terminal)?;
@@ -694,6 +738,7 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
         };
         let action = if event.kind == 6 { let mouse = terminal.mouse(); tui_mouse(&mut app, &mouse)? } else { front_input(options.cwd.as_str(), &mut app, &event)? };
         let confirm_was_open = front_confirmation(&app);
+        if app.history_dirty and not app.busy and host.active.len() == 0 { front_remember_input(state, options, &mut app, false)?; (); };
         let mut terminal_command = false; let mut terminal_choice = string_new();
         let mut worktree_command = false; let mut worktree_value = string_new(); let mut quit_command = false;
         if action.kind == 1 {
@@ -721,8 +766,9 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
                 if started.is_ok and pane.active { terminal.discard_input()?; (); }; started
             } else { front_action(state, options, &mut app, &mut host, &action, maximum, tokens) }
         }; }; };
-        if not handled.is_ok() { let text = cli_text("Action stopped, code "); text.push_i64(handled.error)?; tui_message(&mut app, "notice", text.as_str())?; (); };
+        if not handled.is_ok() { if not app.busy and options.policy.plan { front_finish_plan(options, &mut app, &host)?; (); }; let text = cli_text("Action stopped, code "); text.push_i64(handled.error)?; tui_message(&mut app, "notice", text.as_str())?; (); };
         front_permission_sync(options, &mut app, &host)?;
+        if app.history_dirty and not app.busy and host.active.len() == 0 { front_remember_input(state, options, &mut app, false)?; (); };
         if host.target_dirty and not app.busy and host.active.len() == 0 and host.input.used_len() == 0 { front_remember_target(state, options, &mut app, &mut host)?; needs_paint = true; (); };
         if host.permissions_dirty and host.ready and not app.busy and host.active.len() == 0 and host.input.used_len() == 0 and time_monotonic_ms() >= host.permission_retry_at { front_remember_permissions(state, options, &mut app, &mut host, false)?; needs_paint = true; (); };
         if pane.pending and app.picker.as_str() != "terminal-launch" { pane.pending = false; };
@@ -740,8 +786,11 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
     };
     let worktree_closed = front_worktree_close(&mut worktrees);
     pane_close(&mut pane, state)?; front_stop(&mut host)?;
+    front_finish_plan(options, &mut app, &host)?;
+    let history_saved = front_remember_input(state, options, &mut app, true);
     front_remember_target(state, options, &mut app, &mut host)?;
     front_remember_permissions(state, options, &mut app, &mut host, true)?; terminal.leave_fullscreen()?;
+    if not history_saved.is_ok() { ui_output("Input history could not be saved. The session may still be active.\n")?; return cli_fail(history_saved.error); };
     if not worktree_closed.is_ok() or not worktree_closed.value { return cli_fail(12); };
     cli_ok(0)
 }

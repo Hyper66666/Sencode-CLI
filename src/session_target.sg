@@ -16,8 +16,8 @@ def session_target_sanitize(value: JsonValue) -> Result<JsonDoc, i64> {
 }
 
 def session_target_load(state: &CliState, session: &str) -> Result<JsonDoc, i64> {
-    let modes = cli_state_modes(state, session)?;
-    if modes.root().object_has("cli_target") { return session_target_sanitize(modes.root().object_get("cli_target")?); };
+    let modes = cli_state_mode_load(state, session,"cli_target")?;
+    if modes.root().object_has("value") { return session_target_sanitize(modes.root().object_get("value")?); };
     let mut query = state.db.prepare("SELECT COALESCE(selected_connection_id,''),COALESCE(selected_model_id,'') FROM sessions WHERE id=?")?;
     query.bind_text(1, session)?; if not query.step()? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 5 }; };
     let result = json_doc_object()?; let connection = query.text(0)?; let model = query.text(1)?;

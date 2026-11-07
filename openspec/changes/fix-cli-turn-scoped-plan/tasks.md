@@ -1,0 +1,5 @@
+- [x] Policy/controller: enforce one-turn scope and non-latching artifact metadata (`plan_turn`, `plan_turn_host`).
+- [x] Engine/main: clear Plan after dispatch, rejection and interruption; ignore historical activation (`plan_turn`, `plan_turn_host`).
+- [x] Frontend: clear UI before next input/queue, including broken execution host; preserve base permissions (`plan_turn_host`).
+- [x] Integration: run existing Plan, permissions, model-routing and recovery gates on a fixed candidate; document evidence in `verification.md`.
+- [x] Delivery: package, install-smoke and update local sen/sencode with rollback verification (`candidate-2/local-install-evidence.json`).

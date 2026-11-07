@@ -19,6 +19,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     maximum_connection = 0
     barrier = threading.Event()
     errors = []
+    retry_counts = collections.Counter()
 
     def log_message(self, *args):
         pass
@@ -27,6 +28,13 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         model = request["model"]
         connection = self.headers["Authorization"].removeprefix("Bearer fixture-key-")
+        if model == "retry-child":
+            with self.lock:
+                self.retry_counts[model] += 1
+                attempt = self.retry_counts[model]
+            if attempt <= 2:
+                self.send_error(400)
+                return
         initial = model.startswith("child-")
         if initial:
             with self.lock:

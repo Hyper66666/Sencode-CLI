@@ -1,0 +1,23 @@
+import provider;
+
+// Diagnostic runner for synthetic/public NDJSON events. Never prints payloads.
+def provider_event_probe() -> Result<i64, i64> {
+    let mut turn = provider_turn();
+    let mut index = 0;
+    loop {
+        let bytes = ffi_buffer_new(2097152)?;
+        let count = io_stdin_read_line(bytes)?;
+        if count == 0 { break; };
+        let text = string_from_bytes_raw(bytes.ptr(), count)?;
+        let line = str_trim(text.as_str())?;
+        let result = turn.event(1, line.as_str());
+        if not result.is_ok() {
+            println(index); println(result.error); println(turn.failure_label()); return cli_ok(1);
+        };
+        index = index + 1;
+    };
+    if not turn.finish().is_ok() { println("invalid terminal"); return cli_ok(1); };
+    println("valid"); cli_ok(0)
+}
+
+def main() -> i64 { let result = provider_event_probe(); if not result.is_ok() { println(result.error); return 1; }; result.value }

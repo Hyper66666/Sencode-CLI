@@ -1,0 +1,62 @@
+import tool_spec;
+import tui;
+import execution_diagnostics;
+
+def goal_footer_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return Result { is_ok: false, value: false, error: 1 }; }; tui_true()
+}
+
+def goal_footer_tests() -> Result<bool, i64> {
+    let legacy = json_parse("{\"summary\":\"ready\"}")?;
+    let proposed = json_parse("{\"summary\":\"verified\",\"checks\":[\"test -f output.txt\",\"printf '中文'\"]}")?;
+    let blank = json_parse("{\"summary\":\"ready\",\"checks\":[\"  \"]}")?;
+    let nul = json_parse("{\"summary\":\"ready\",\"checks\":[\"exit 0\\u0000bad\"]}")?;
+    let wrong = json_parse("{\"summary\":\"ready\",\"checks\":[3]}")?;
+    let empty = json_parse("{\"summary\":\"ready\",\"checks\":[]}")?;
+    goal_footer_expect(tool_spec_valid("finish_goal", &legacy) and tool_spec_valid("finish_goal", &proposed), "Legacy calls and executable model acceptance remain valid")?;
+    goal_footer_expect(not tool_spec_valid("finish_goal", &blank) and not tool_spec_valid("finish_goal", &nul) and not tool_spec_valid("finish_goal", &wrong) and not tool_spec_valid("finish_goal", &empty), "Blank, NUL, mistyped and empty model checks are rejected")?;
+    let mut goal = goal_new(50, 0); goal_verify(&mut goal, false, false, "permission required");
+    goal_footer_expect(goal.status == 2 and goal.last_failure.as_str() == "permission required", "Unavailable verifier preserves the pause reason")?;
+    goal.status = 1; goal_verify(&mut goal, true, true, "");
+    goal_footer_expect(goal.status == 4 and goal.last_failure.len() == 0, "Only successful verification completes and clears the old failure")?;
+    let mut app = tui_new("fixture", "fixture", "fixture", "session"); let mut index = 0;
+    while index < 3 {
+        tui_resize(&mut app, if index == 0 { 80 } else { if index == 1 { 120 } else { 160 } }, 35)?;
+        tui_status(&mut app, "Ready / type a task or /")?;
+        let rows = tui_frame_rows(&app)?; let footer: &UiLine = rows.get(app.height - 2);
+        goal_footer_expect(str_contains(footer.text.as_str(), "手动审批") and str_contains(footer.text.as_str(), "/help") and footer.style == 2, "Compact footer retains colored permissions and dim help at all widths")?;
+        goal_footer_expect(str_trim(rows.get(app.height - 1).text.as_str())?.len() == 0 and not str_contains(tui_frame(&app)?.as_str(), "Enter send"), "Idle footer has no repeated shortcut list or routine readiness")?;
+        index = index + 1;
+    };
+    tui_begin(&mut app)?; app.permission = cli_text("自动审批 · 文件编辑");
+    tui_set_approval(&mut app, "unicode-permission", "Approve tool?", false)?;
+    index = 0;
+    while index < 3 {
+        tui_resize(&mut app, if index == 0 { 80 } else { if index == 1 { 120 } else { 160 } }, 35)?;
+        let rows = tui_frame_rows(&app)?; let footer: &UiLine = rows.get(app.height - 2);
+        let colored = tui_colored_line(footer, false, false, true)?;
+        goal_footer_expect(str_contains(colored.as_str(), "\x1b[38;5;117m手动审批") and str_contains(colored.as_str(), "\x1b[33m自动审批 | 文件编辑"), "Normalized permission labels retain independent UTF-8-safe color spans during approval")?;
+        goal_footer_expect(tui_colored_line(footer, false, false, false)?.as_str() == footer.text.as_str(), "No-color footer remains identical after permission normalization")?;
+        tui_paint_update(&mut app, true)?;
+        goal_footer_expect(tui_paint_update(&mut app, true)?.len() == 0, "Idle approval footer sends no repeated paint or cursor reset")?;
+        index = index + 1;
+    };
+    app.approval.clear(); tui_finish(&mut app, true)?;
+    tui_status(&mut app, "Copied to clipboard")?;
+    goal_footer_expect(str_contains(tui_frame(&app)?.as_str(), "Copied to clipboard"), "Actionable transient notice remains visible")?;
+    tui_begin(&mut app)?;
+    goal_footer_expect(str_contains(tui_footer(&app), "Esc stop") and not str_contains(tui_footer(&app), "Ctrl+R"), "Running footer offers focused controls")?;
+    tui_finish_outcome(&mut app, false, 1000, "paused")?;
+    goal_footer_expect(app.status.as_str() == "Goal paused" and str_contains(tui_frame(&app)?.as_str(), "Paused after 1s") and not str_contains(tui_frame(&app)?.as_str(), "cancelled"), "Verification pause never claims cancellation")?;
+    tui_begin(&mut app)?; tui_finish_outcome(&mut app, false, 1000, "cancelled")?;
+    goal_footer_expect(app.status.as_str() == "Cancelled", "Explicit cancellation is labeled truthfully")?;
+    tui_set_approval(&mut app, "fixture", "Run exact acceptance command?", false)?;
+    goal_footer_expect(str_contains(tui_footer(&app), "Enter confirm") and not str_contains(tui_footer(&app), "/help"), "Approval controls replace ordinary hints")?;
+    let input: Vec<TerminalEvent> = vec_new(); engine_control_init(&input)?; engine_control_begin(&input, "fixture")?;
+    execution_diagnostic_failure(&input, "goal_checks_failed", "goal_verification", "finish_goal", "check", false)?;
+    let diagnostic = execution_diagnostic_document(&input, 12)?;
+    goal_footer_expect(str_contains(execution_diagnostic_content(&diagnostic)?.as_str(), "Goal paused") and not str_contains(execution_diagnostic_content(&diagnostic)?.as_str(), "Tool execution failed"), "Goal pauses have a specific actionable diagnostic")?;
+    tui_true()
+}
+
+def main() -> i64 { let result = goal_footer_tests(); if not result.is_ok() { return 1; }; println("Goal acceptance schema, pause reasons and compact contextual footer passed"); 0 }

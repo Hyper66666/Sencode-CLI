@@ -1,23 +1,47 @@
 import state;
 
+def request_attempt_copy(document: &JsonDoc, value: JsonValue, execution: &CliExecution) -> Result<JsonValue, i64> {
+    if cli_json_optional_string(value,"status").as_str() != "running" or cli_json_optional_string(value,"execution_id").as_str() == execution.id.as_str() { return document.copy(value); };
+    // The new fenced owner has already proved the previous executor quiescent.
+    // An unfinished network-attempt record is interrupted, never success or a
+    // reason to replay it. Tool-outcome uncertainty is checked independently.
+    let result = document.new_object()?; let mut index = 0;
+    while index < value.object_len()? {
+        let key = value.object_key(index)?;
+        if key.as_str() != "status" and key.as_str() != "error" { result.object_set(key.as_str(),document.copy(value.object_get(key.as_str())?)?)?; (); };
+        index = index + 1;
+    };
+    cli_put_string(document,result,"status","interrupted")?; cli_put_i64(document,result,"error",12)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
 // Fenced attempt evidence is separate from conversation data and never stores
 // credentials, raw error bodies, request headers or hidden provider state.
 def request_attempt_save(state: &CliState, execution: &CliExecution, id: &str, connection: &str, model: &str, purpose: &str, attempt: i64, status: &str, code: i64, input_tokens: i64, output_tokens: i64, usage_reported: bool) -> Result<bool, i64> {
-    let document = json_parse("{\"schema\":1,\"attempts\":[]}")?;
+    let document = json_parse_limits("{\"schema\":1,\"attempts\":[]}", 1048576, 8192)?;
     let target = document.root().object_get("attempts")?;
     let previous = cli_state_mode_load(state, execution.session.as_str(), "request_attempts")?;
     if previous.root().object_has("value") {
         let source = previous.root().object_get("value")?.object_get("attempts")?;
         if source.array_len()? > 256 { return Result { is_ok: false, value: false, error: 13 }; };
-        let mut index = 0;
+        let mut index = 0; let mut replacement = -1; let mut oldest = -1;
         while index < source.array_len()? {
             let value = source.array_get(index)?;
-            if cli_json_optional_string(value, "id").as_str() != id {
-                if source.array_len()? >= 256 and index == 0 {
-                    if cli_json_optional_string(value, "status").as_str() == "running" { return Result { is_ok: false, value: false, error: 13 }; };
-                } else { target.array_push(document.copy(value)?)?; (); };
-                ();
+            if cli_json_optional_string(value,"id").as_str() == id {
+                if replacement >= 0 { return Result { is_ok: false, value: false, error: 12 }; };
+                replacement = index;
             };
+            if oldest < 0 and not (cli_json_optional_string(value,"status").as_str() == "running" and cli_json_optional_string(value,"execution_id").as_str() == execution.id.as_str()) { oldest = index; };
+            index = index + 1;
+        };
+        // Replacing an existing record needs no eviction. For a new record,
+        // retire the oldest settled/predecessor entry, never a live request.
+        let evicted = if replacement < 0 and source.array_len()? == 256 { oldest } else { -1 };
+        if replacement < 0 and source.array_len()? == 256 and evicted < 0 { return Result { is_ok: false, value: false, error: 13 }; };
+        index = 0;
+        while index < source.array_len()? {
+            let value = source.array_get(index)?;
+            if index != replacement and index != evicted { target.array_push(request_attempt_copy(&document,value,execution)?)?; (); };
             index = index + 1;
         };
     };
@@ -40,4 +64,25 @@ def request_attempt_finish(state: &CliState, execution: &CliExecution, id: &str,
     // Preserve absence instead of recording invented zero provider usage.
     if reported { cli_state_usage(state, execution, id, connection, model, input, output)?; (); };
     Result { is_ok: true, value: true, error: 0 }
+}
+
+// Closed, sanitized observations remain available after the live TUI closes.
+def request_attempt_diagnostic(state: &CliState, execution: &CliExecution, id: &str, observed: &JsonDoc) -> Result<bool, i64> {
+    let previous = cli_state_mode_load(state, execution.session.as_str(), "request_attempts")?;
+    let document = json_doc_object_limits(1048576, 8192)?;
+    let data = document.copy(previous.root().object_get("value")?)?;
+    let attempts = data.object_get("attempts")?; let mut index = 0;
+    while index < attempts.array_len()? {
+        let item = attempts.array_get(index)?;
+        if cli_json_optional_string(item, "id").as_str() == id {
+            cli_put_i64(&document, item, "http_status", cli_json_optional_i64(observed.root(), "status", 0))?;
+            cli_put_string(&document, item, "response_stage", cli_json_optional_string(observed.root(), "response_stage").as_str())?;
+            cli_put_string(&document, item, "response_failure", cli_json_optional_string(observed.root(), "response_failure").as_str())?;
+            cli_put_i64(&document, document.root(), "schema", 1)?;
+            document.root().object_set("attempts", attempts)?;
+            return cli_state_mode_save(state, execution, "request_attempts", &document);
+        };
+        index = index + 1;
+    };
+    Result { is_ok: false, value: false, error: 12 }
 }

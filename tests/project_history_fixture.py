@@ -312,6 +312,22 @@ def main():
             assert sql(restored,"SELECT count(*) FROM sessions")[0][0]==0
             checks.append("explicit-import-rejects-"+label+"-atomically")
 
+        folder, directory, catalog, session = new_case("large-independent-modes")
+        modes = json.loads(sql(archive(directory), "SELECT mode_json FROM ph_shared_modes")[0][0])
+        modes["independent_a"] = {"values": list(range(2200))}
+        modes["independent_b"] = {"values": list(range(2200))}
+        modes["cli_target"] = {"schema": 1, "connection": "fixture", "model": "remembered-large-state", "effort": "medium"}
+        sql(archive(directory), "UPDATE ph_shared_modes SET mode_json=?", (json.dumps(modes),))
+        retire(catalog)
+        restored = folder / "restored.sqlite3"
+        run(restored, directory, "import")
+        imported = json.loads(sql(restored, "SELECT mode_json FROM shared_modes WHERE session_id=?", (session,))[0][0])
+        assert imported["cli_target"] == modes["cli_target"]
+        assert imported["goal"]["status"] == 2 and imported["goal"]["requests_used"] == 7
+        assert "independent_a" not in imported and "independent_b" not in imported
+        assert "permissions" not in imported
+        checks.append("explicit-import-projects-allowed-metadata-without-aggregate-json-arena-or-permission-grants")
+
         _, directory, catalog, _ = new_case("gitignore", seed=False)
         root_rules = b"# user root rules\r\ncustom.bin\r\n"
         local_rules = "# 自定义 local rules\r\nprivate-data/".encode("utf-8")

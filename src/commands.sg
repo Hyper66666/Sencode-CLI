@@ -19,7 +19,7 @@ def commands_registry() -> Vec<UiCommand> {
     commands_add(&items, "/model", "/models", "选择后续请求使用的模型", "[MODEL]", "Models", true);
     commands_add(&items, "/connections", "/connection", "切换 API 连接", "[ID]", "Models", true);
     commands_add(&items, "/resume", "/continue", "搜索并恢复会话", "[SESSION]", "Sessions", true);
-    commands_add(&items, "/plan", "", "规划任务，批准后执行", "[TASK|approve]", "Agents", true);
+    commands_add(&items, "/plan", "", "仅下一轮规划只读，结束或中断后退出", "[TASK|approve]", "Agents", true);
     commands_add(&items, "/goal", "", "持续目标、预算与恢复", "[TASK|pause|resume]", "Agents", true);
     commands_add(&items, "/agents", "/tasks", "查看子代理与任务", "", "Agents", true);
     commands_add(&items, "/consult", "", "多个模型并行会诊", "QUESTION", "Agents", true);
@@ -29,7 +29,7 @@ def commands_registry() -> Vec<UiCommand> {
     commands_add(&items, "/compact", "", "压缩上下文并保留任务", "", "Sessions", true);
     commands_add(&items, "/usage", "/cost", "按 API 查看用量", "", "Models", true);
     commands_add(&items, "/copy", "", "复制最新回答或选择代码块", "[code]", "Interface", true);
-    commands_add(&items, "/history", "", "搜索本项目的历史提示词", "[SEARCH]", "Interface", false);
+    commands_add(&items, "/history", "", "搜索本会话最近十条输入", "[SEARCH]", "Interface", false);
     commands_add(&items, "/stash", "", "暂存、恢复或交换输入草稿", "", "Interface", false);
     commands_add(&items, "/queue", "", "查看、编辑或取消待发任务", "[pause|resume|clear]", "Interface", false);
     commands_add(&items, "/keys", "", "编辑键位与 Vim 输入模式", "[default|vim|show|reset]", "Interface", false);

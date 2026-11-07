@@ -169,7 +169,9 @@ def worker(args):
                     if active and "╰" in value:
                         break
                     if active:
-                        lines.append(value.strip().removeprefix("│").removesuffix("│").strip().removeprefix("> "))
+                        # With no placeholder, an empty composer is just ">"
+                        # after trimming. It is a prompt marker, not a draft.
+                        lines.append(value.strip().removeprefix("│").removesuffix("│").strip().removeprefix(">").lstrip())
                 result = "".join(lines)
                 if result.startswith("Ask anything,") or result.startswith("Keep typing while Sencode"):
                     return ""

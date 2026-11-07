@@ -1,0 +1,82 @@
+import request_attempts;
+import command_line;
+import session_permissions;
+import session_target;
+
+def request_state_expect(value: bool, message: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(message); return state_bool_error(99); }; Result { is_ok: true, value: true, error: 0 }
+}
+
+def request_state_tests(database: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?; let cwd = path_parent_string(database)?;
+    let session = cli_state_create_session(&state, cwd.as_str())?;
+    let mut execution = cli_state_begin(&state, session.as_str(), "fixture", "fixture")?;
+    let mut index = 0;
+    while index < 134 {
+        let id = cli_text("attempt-"); id.push_i64(index)?;
+        request_attempt_save(&state, &execution, id.as_str(), "fixture", "fixture", "native-agent", 1, "accepted", 0, 1, 1, true)?;
+        index = index + 1;
+    };
+    let preserved = json_parse("{\"values\":[]}")?; let values = preserved.root().object_get("values")?;
+    index = 0; while index < 356 { values.array_push(preserved.new_i64(index)?)?; index = index + 1; };
+    cli_state_mode_save(&state, &execution, "preserved", &preserved)?;
+    let saved_before = cli_state_mode_load(&state, session.as_str(), "preserved")?.serialize_string()?;
+    let finished = request_attempt_finish(&state, &execution, "attempt-133", "fixture", "fixture", "native-agent", 1, 0, 17, 3, true);
+    if not finished.is_ok() { cli_diagnostic("Request completion failed while replacing a branch in a valid mode document"); println(finished.error); return state_bool_error(finished.error); };
+    request_state_expect(cli_state_mode_load(&state, session.as_str(), "preserved")?.serialize_string()?.as_str() == saved_before.as_str(), "Replacing request evidence retains all unrelated mode state")?;
+    index = 134;
+    while index < 270 {
+        let id = cli_text("attempt-"); id.push_i64(index)?;
+        request_attempt_save(&state, &execution, id.as_str(), "fixture", "fixture", "native-agent", 1, "failed", 10, 1, 1, true)?;
+        let observed = json_parse("{\"status\":200,\"response_stage\":\"http_finish\",\"response_failure\":\"HTTP response body ended before completion\"}")?;
+        request_attempt_diagnostic(&state, &execution, id.as_str(), &observed)?;
+        index = index + 1;
+    };
+    let attempts = cli_state_mode_load(&state, session.as_str(), "request_attempts")?;
+    request_state_expect(attempts.root().object_get("value")?.object_get("attempts")?.array_len()? == 256, "Attempt evidence remains bounded and rotates completed entries after 256")?;
+    request_state_expect(cli_state_mode_load(&state, session.as_str(), "preserved")?.serialize_string()?.as_str() == saved_before.as_str(), "Long-session updates do not discard unrelated state")?;
+    let large = json_parse("{\"values\":[]}")?; index = 0;
+    while index < 2200 { large.root().object_get("values")?.array_push(large.new_i64(index)?)?; index = index + 1; };
+    cli_state_mode_save(&state,&execution,"independent_a",&large)?; cli_state_mode_save(&state,&execution,"independent_b",&large)?;
+    request_attempt_finish(&state,&execution,"attempt-269","fixture","fixture","native-agent",1,0,23,11,true)?;
+    let full = cli_state_mode_load(&state,session.as_str(),"request_attempts")?;
+    request_state_expect(full.root().object_get("value")?.object_get("attempts")?.array_len()? == 256,"Finishing an existing full-ring record never evicts an unrelated record")?;
+    let ring = json_parse_limits("{\"schema\":1,\"attempts\":[]}",1048576,8192)?;
+    ring.root().object_set("attempts",ring.copy(full.root().object_get("value")?.object_get("attempts")?)?)?;
+    let first = ring.root().object_get("attempts")?.array_get(0)?; let protected_id = cli_json_string(first,"id")?;
+    cli_put_string(&ring,first,"status","running")?;
+    cli_state_mode_save(&state,&execution,"request_attempts",&ring)?;
+    request_attempt_finish(&state,&execution,"attempt-269","fixture","fixture","native-agent",1,0,23,11,true)?;
+    request_attempt_save(&state,&execution,"attempt-new","fixture","fixture","native-agent",1,"accepted",0,1,1,true)?;
+    let rotated = cli_state_mode_load(&state,session.as_str(),"request_attempts")?;
+    let kept = rotated.root().object_get("value")?.object_get("attempts")?;
+    request_state_expect(kept.array_len()? == 256 and cli_json_string(kept.array_get(0)?,"id")?.as_str() == protected_id.as_str() and cli_json_string(kept.array_get(0)?,"status")?.as_str() == "running","Replacement and rotation protect live records while retaining full capacity")?;
+    let live = json_parse_limits("{\"schema\":1,\"attempts\":[]}",1048576,8192)?;
+    live.root().object_set("attempts",live.copy(kept)?)?;
+    index = 0; while index < 256 { cli_put_string(&live,live.root().object_get("attempts")?.array_get(index)?,"status","running")?; index = index + 1; };
+    cli_state_mode_save(&state,&execution,"request_attempts",&live)?;
+    let refused = request_attempt_save(&state,&execution,"no-capacity","fixture","fixture","native-agent",1,"running",0,0,0,false);
+    request_state_expect(not refused.is_ok() and refused.error == 13 and cli_state_mode_load(&state,session.as_str(),"request_attempts")?.root().object_get("value")?.object_get("attempts")?.array_len()? == 256,"A journal containing only live requests rejects admission without discarding evidence")?;
+    request_state_expect(cli_state_mode_load(&state,session.as_str(),"independent_a")?.root().object_get("value")?.object_get("values")?.array_len()? == 2200 and cli_state_mode_load(&state,session.as_str(),"independent_b")?.root().object_get("value")?.object_get("values")?.array_len()? == 2200,"Independent fields load and update above the aggregate JSON node bound")?;
+    let primitive = json_parse("true")?; cli_state_mode_save(&state,&execution,"primitive",&primitive)?;
+    request_state_expect(cli_state_mode_load(&state,session.as_str(),"primitive")?.root().object_get("value")?.bool_value()?,"Per-mode projection preserves primitive JSON types")?;
+    request_state_expect(not cli_state_mode_save(&state,&execution,"nested.path",&primitive).is_ok(),"Mode keys cannot become arbitrary JSON paths")?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    let mut policy = policy_default(); permission_apply(&mut policy,"full");
+    session_permissions_save(&state,session.as_str(),&policy,true,"strict")?;
+    session_target_save(&state,session.as_str(),"fixture","model-memory","medium")?;
+    request_state_expect(cli_json_string(session_permissions_load(&state,session.as_str())?.root(),"mode")?.as_str() == "full" and cli_json_string(session_target_load(&state,session.as_str())?.root(),"model")?.as_str() == "model-memory","Large independent modes cannot break remembered permission/model loading")?;
+    let branch = session_branch(&state,session.as_str(),"long state branch")?;
+    request_state_expect(cli_json_string(session_permissions_load(&state,branch.as_str())?.root(),"mode")?.as_str() == "full" and cli_state_mode_load(&state,branch.as_str(),"independent_b")?.root().object_get("value")?.object_get("values")?.array_len()? == 2200,"Branch preserves independent large fields without aggregate parsing")?;
+    let stale = cli_state_mode_save(&state, &execution, "preserved", &preserved);
+    request_state_expect(not stale.is_ok(), "Rebuilding mode state does not bypass execution fencing")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", "").unwrap_or(string_new());
+    if database.len() == 0 { return 2; };
+    let result = request_state_tests(database.as_str()); if not result.is_ok() { return 1; };
+    println("Request-state replacement, long-session rotation, unrelated state and fencing passed"); 0
+}

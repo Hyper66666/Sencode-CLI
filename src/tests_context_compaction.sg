@@ -1,8 +1,23 @@
 import context_compaction;
+import provider;
 
 def context_check(ok: bool) -> Result<bool, i64> { Result { is_ok: ok, value: ok, error: if ok { 0 } else { 99 } } }
 
 def context_tests() -> Result<bool, i64> {
+    let request_history = json_parse("{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"context_window_tokens\":4096}")?;
+    let empty_tools = json_parse("{\"tools\":[]}")?;
+    let mut protocol = 0;
+    while protocol < 3 {
+        let request = json_parse(provider_build_request(protocol, "model", &request_history, &empty_tools)?.as_str())?;
+        let key = if protocol == 0 { "max_completion_tokens" } else { if protocol == 1 { "max_output_tokens" } else { "max_tokens" } };
+        let cap = request.root().object_get(key)?.number_i64()?;
+        context_check(cap > 0 and cap < 4096)?;
+        protocol = protocol + 1;
+    };
+    let defaults = context_defaults();
+    context_check(defaults.window_tokens == 262144 and defaults.max_output_tokens == 131072 and defaults.threshold_percent == 80)?;
+    let output_settings = json_parse("{\"schema\":1,\"max_output_tokens\":8192,\"models\":[{\"connection\":\"one\",\"model\":\"small\",\"max_output_tokens\":4096}]}")?;
+    context_check(context_limits_document(&output_settings, "one", "small")?.max_output_tokens == 4096 and context_limits_document(&output_settings, "two", "small")?.max_output_tokens == 8192)?;
     let settings = json_parse("{\"schema\":1,\"context_window_tokens\":262144,\"models\":[{\"connection\":\"one\",\"model\":\"small\",\"context_window_tokens\":4096,\"threshold_percent\":80}]}")?;
     let selected = context_limits_document(&settings, "one", "small")?;
     let other = context_limits_document(&settings, "two", "small")?;
@@ -43,6 +58,33 @@ def context_tests() -> Result<bool, i64> {
     context_check(not context_compacted(&history, "   ", &plan).is_ok())?;
     let bad = json_parse("{\"messages\":[{\"role\":\"system\",\"content\":\"safe\"},{\"role\":\"tool\",\"tool_call_id\":\"orphan\",\"content\":\"must not be discarded\"}]}")?;
     context_check(not context_units(&bad).is_ok())?;
+    // A valid summary which cannot reduce a huge newest unit is refused.
+    // Its allocated candidate must drop rather than hide in Result's Err value.
+    let stubborn = context_empty_history()?;
+    let stubborn_rows = stubborn.root().object_get("messages")?;
+    let system_row = stubborn.new_object()?; cli_put_string(&stubborn, system_row, "role", "system")?; cli_put_string(&stubborn, system_row, "content", "safe")?; stubborn_rows.array_push(system_row)?;
+    let old_row = stubborn.new_object()?; cli_put_string(&stubborn, old_row, "role", "user")?; cli_put_string(&stubborn, old_row, "content", "old")?; stubborn_rows.array_push(old_row)?;
+    let newest_row = stubborn.new_object()?; cli_put_string(&stubborn, newest_row, "role", "user")?;
+    let newest_text = string_new(); let mut repeat = 0; while repeat < 1000 { newest_text.push_str("keep")?; repeat = repeat + 1; };
+    cli_put_string(&stubborn, newest_row, "content", newest_text.as_str())?; stubborn_rows.array_push(newest_row)?;
+    let mut stubborn_limits = context_defaults(); stubborn_limits.min_summary_chars = 32;
+    let stubborn_plan = context_plan(&stubborn, &tools, &stubborn_limits, true)?;
+    let live_before = sengoo_json_bounded_live_documents();
+    let refused = context_compacted(&stubborn, "Preserve the older task and every exact verification result.", &stubborn_plan);
+    context_check(not refused.is_ok() and refused.error == 13 and sengoo_json_bounded_live_documents() == live_before)?;
+    let threshold = context_empty_history()?;
+    let rows = threshold.root().object_get("messages")?;
+    let system = threshold.new_object()?; cli_put_string(&threshold, system, "role", "system")?; cli_put_string(&threshold, system, "content", "safe")?; rows.array_push(system)?;
+    let text = string_new(); let mut size = 0;
+    while size < 31000 { text.push_str("abcdefghij")?; size = size + 10; };
+    let mut row = 0;
+    while row < 20 {
+        let message = threshold.new_object()?; cli_put_string(&threshold, message, "role", "user")?; cli_put_string(&threshold, message, "content", text.as_str())?; rows.array_push(message)?; row = row + 1;
+    };
+    context_check(not context_plan(&threshold, &tools, &defaults, false)?.root().object_get("needed")?.bool_value()?)?;
+    let more = threshold.new_object()?; cli_put_string(&threshold, more, "role", "assistant")?; cli_put_string(&threshold, more, "content", text.as_str())?; rows.array_push(more)?;
+    let crossing = context_plan(&threshold, &tools, &defaults, false)?;
+    context_check(crossing.root().object_get("needed")?.bool_value()? and cli_json_string(crossing.root(), "trigger")?.as_str() == "estimated-token-threshold")?;
     Result { is_ok: true, value: true, error: 0 }
 }
 

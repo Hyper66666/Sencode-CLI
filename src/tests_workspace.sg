@@ -2,6 +2,9 @@ import workspace;
 
 def workspace_tests() -> Result<i64, i64> {
     let mut failures = 0;
+    let batch = workspace_output_text("Launch.BAT", "﻿@echo off\nchcp 65001 >nul\r\necho 中文\n")?;
+    if batch.as_str() != "@echo off\r\nchcp 65001 >nul\r\necho 中文\r\n" or workspace_output_text("Launch.BAT", batch.as_str())?.as_str() != batch.as_str() { failures = failures + 1; };
+    if workspace_output_text("exact.py", "a\nb\r\nc")?.as_str() != "a\nb\r\nc" { failures = failures + 1; };
     let changed = workspace_patch_text("first 世界 last", "世界", "Sengoo")?;
     if changed.as_str() != "first Sengoo last" { failures = failures + 1; };
     if workspace_patch_text("same same", "same", "other").is_ok() { failures = failures + 1; };

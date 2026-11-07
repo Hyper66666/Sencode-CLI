@@ -89,7 +89,7 @@ def controller_batch_stop_local(job: &mut ControllerBatchJob, scheduler: &Schedu
 
 // A step may fail at any persistence/event/UI boundary; its caller still owns
 // the complete live-job vector and must drain it before propagating failure.
-def controller_batch_step(state: &CliState, execution: &CliExecution, options: &AgentOptions, history: &JsonDoc, calls: JsonValue, batch: &mut ControllerReadBatch, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<bool, i64> {
+def controller_batch_step(state: &CliState, execution: &CliExecution, options: &AgentOptions, current: &ProviderConnection, history: &JsonDoc, calls: JsonValue, batch: &mut ControllerReadBatch, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<bool, i64> {
     if ui_poll_busy(terminal, &options.input)? or scheduler_is_cancelled(scheduler, task_id) { return controller_batch_error(19); };
     state_exec_valid(state, execution)?;
     let mut admitted = 0;
@@ -127,7 +127,7 @@ def controller_batch_step(state: &CliState, execution: &CliExecution, options: &
                 ();
             };
         } else {
-            let result = controller_tool(state, execution, options, call, scheduler, task_id, goal, terminal, &options.input, children, child_states);
+            let result = controller_tool(state, execution, options, current, call, scheduler, task_id, goal, terminal, &options.input, children, child_states);
             tool_schedule_complete(&batch.schedule, ordinal, result.is_ok(), true)?;
             if not result.is_ok() { return controller_batch_error(result.error); };
             batch.results.set(ordinal, result.value);
@@ -195,7 +195,7 @@ def controller_batch_drain(state: &CliState, execution: &CliExecution, options: 
     ();
 }
 
-def controller_execute_batch(state: &CliState, execution: &CliExecution, options: &AgentOptions, history: &JsonDoc, calls: JsonValue, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<bool, i64> {
+def controller_execute_batch(state: &CliState, execution: &CliExecution, options: &AgentOptions, current: &ProviderConnection, history: &JsonDoc, calls: JsonValue, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<bool, i64> {
     let count = calls.array_len()?;
     if count > 128 { controller_interrupted_tools(state, execution, history, calls, 0)?; return controller_batch_error(13); };
     // Reject the entire duplicate batch before hooks, permissions or claims.
@@ -217,7 +217,7 @@ def controller_execute_batch(state: &CliState, execution: &CliExecution, options
     while index < count {
         let call = calls.array_get(index)?;
         if not controller_batch_read_eligible(state, options, call) {
-            let result = controller_tool(state, execution, options, call, scheduler, task_id, goal, terminal, &options.input, children, child_states);
+            let result = controller_tool(state, execution, options, current, call, scheduler, task_id, goal, terminal, &options.input, children, child_states);
             if not result.is_ok() { controller_interrupted_tools(state, execution, history, calls, index)?; return controller_batch_error(result.error); };
             controller_append_message(state, execution, history, "tool", result.value.as_str(), cli_json_string(call, "id")?.as_str())?;
             index = index + 1;
@@ -236,7 +236,7 @@ def controller_execute_batch(state: &CliState, execution: &CliExecution, options
             tool_schedule_seal(&schedule);
             let mut batch = ControllerReadBatch { schedule: schedule, jobs: jobs, results: results, first: index, published: 0 };
             loop {
-                let step = controller_batch_step(state, execution, options, history, calls, &mut batch, scheduler, task_id, goal, terminal, children, child_states);
+                let step = controller_batch_step(state, execution, options, current, history, calls, &mut batch, scheduler, task_id, goal, terminal, children, child_states);
                 if not step.is_ok() {
                     controller_batch_drain(state, execution, options, &mut batch, scheduler, task_id, terminal);
                     controller_interrupted_tools(state, execution, history, calls, index + batch.published)?;

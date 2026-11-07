@@ -88,6 +88,13 @@ def verify_children(base: &str) -> Result<i64, i64> {
     failures = failures + expect_child(cli_json_string(read_report.root(), "content")?.as_str() == "observed fixture text" and tools_goal.requests == 4 and tools_goal.tokens == 100, "Read-only child reads real files and continues with tool-result context");
     failures = failures + expect_child(cli_json_string(denied_report.root(), "content")?.as_str() == "denials observed" and not file_exists("forbidden.txt"), "Child cannot write, spawn, or alter the parent plan even when a provider requests it");
 
+    let recovering = children_new();
+    let retried = children_start(&recovering, &scheduler, parent, &policy, child_fixture(base, "a", "retry-child", "explore", "."))?;
+    let mut retry_goal = goal_new(50, 0);
+    child_await(&recovering, &scheduler, parent, &mut retry_goal)?;
+    let recovered = children_result(&recovering, retried)?;
+    failures = failures + expect_child(cli_json_optional_i64(recovered.root(), "error", -1) == 0 and retry_goal.requests == 3, "Child retries HTTP 400 twice, releases slots and shares the request budget");
+
     let writers = children_new();
     println("children: writers");
     let writer_one = children_start(&writers, &scheduler, parent, &policy, child_fixture(base, "a", "write-one", "general", "."))?;

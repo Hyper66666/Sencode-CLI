@@ -8,6 +8,7 @@ import tui_pending;
 import tui_images;
 import tui_groups;
 import tui_activity;
+import tui_selection;
 
 // All application and input state is Sengoo-owned. The terminal is only an
 // event/byte surface; no native singleton contains a draft, menu or transcript.
@@ -23,9 +24,9 @@ struct UiReadAnchor { message_id: i64, row: i64, last_row: bool }
 struct UiQuestionOption { label: String, description: String }
 struct UiApp {
     width: i64, height: i64, cwd: String, connection: String, model: String, session: String,
-    status: String, history_window: String, mode: String, permission: String, active_permission: String, active_model: String, native_engine: bool, busy: bool, home: bool, phase: String, animation_tick: i64, animate_tools: bool, received_text: bool, turn_started: i64, activity_id: i64, visible_activity: bool,
-    keymap: UiKeymap, vim: UiVim, reading: UiReading,
-    draft: String, cursor: i64, stash_draft: String, history: Vec<InputHistory>, history_index: i64, history_draft: String,
+    status: String, history_window: String, mode: String, permission: String, active_permission: String, active_model: String, native_engine: bool, busy: bool, home: bool, phase: String, reconnect: String, animation_tick: i64, animate_tools: bool, received_text: bool, turn_started: i64, activity_id: i64, visible_activity: bool,
+    keymap: UiKeymap, vim: UiVim, reading: UiReading, selection: UiSelection,
+    draft: String, cursor: i64, stash_draft: String, history: Vec<InputHistory>, history_index: i64, history_draft: String, history_dirty: bool, history_retry_at: i64,
     queue: Vec<InputHistory>, registry: Vec<UiCommand>, matches: Vec<UiCommandMatch>,
     menu_open: bool, menu_closed: bool, selected: i64,
     completion_kind: String, completion_start: i64, completion_end: i64, completions: Vec<UiCandidate>, references: Vec<UiCandidate>,
@@ -55,9 +56,9 @@ def tui_new(cwd: &str, connection: &str, model: &str, session: &str) -> UiApp {
     let registry = commands_registry(); commands_enable(&registry, "/queue", true, "").unwrap_or(false);
     commands_enable(&registry, "/keys", true, "").unwrap_or(false); commands_enable(&registry, "/read", true, "").unwrap_or(false);
     let keymap = keys_load(); let status = keymap.warning.clone().unwrap_or(string_new());
-    UiApp { width: 100, height: 30, cwd: cli_text(cwd), connection: cli_text(connection), model: cli_text(model), session: cli_text(session), status: status, history_window: string_new(), mode: cli_text("BUILD"), permission: cli_text("手动审批"), active_permission: string_new(), active_model: string_new(), native_engine: true, busy: false, home: true, phase: string_new(), animation_tick: 0, animate_tools: not env_has_var("SENCODE_REDUCED_MOTION"), received_text: false, turn_started: 0, activity_id: 0, visible_activity: false,
-        keymap: keymap, vim: keys_vim_new(), reading: reading_new(),
-        draft: string_new(), cursor: 0, stash_draft: string_new(), history: history, history_index: 0, history_draft: string_new(), queue: queue, registry: registry, matches: matches,
+    UiApp { width: 100, height: 30, cwd: cli_text(cwd), connection: cli_text(connection), model: cli_text(model), session: cli_text(session), status: status, history_window: string_new(), mode: cli_text("BUILD"), permission: cli_text("手动审批"), active_permission: string_new(), active_model: string_new(), native_engine: true, busy: false, home: true, phase: string_new(), reconnect: string_new(), animation_tick: 0, animate_tools: not env_has_var("SENCODE_REDUCED_MOTION"), received_text: false, turn_started: 0, activity_id: 0, visible_activity: false,
+        keymap: keymap, vim: keys_vim_new(), reading: reading_new(), selection: selection_new(),
+        draft: string_new(), cursor: 0, stash_draft: string_new(), history: history, history_index: 0, history_draft: string_new(), history_dirty: false, history_retry_at: 0, queue: queue, registry: registry, matches: matches,
         menu_open: false, menu_closed: false, selected: 0, picker: string_new(), picker_title: string_new(), candidates: candidates, picker_query: string_new(), picker_selected: 0,
         completion_kind: string_new(), completion_start: 0, completion_end: 0, completions: completions, references: references,
         queue_paused: false, queue_selected: -1, queue_edit_index: -1, queue_saved_draft: string_new(), queue_saved_cursor: 0,
@@ -135,7 +136,9 @@ def tui_assistant_rows(rows: &Vec<UiLine>, text: &str, width: i64, id: i64, head
 
 def tui_stream_count(app: &UiApp) -> i64 { if app.streaming.len() > 0 { app.stream_lines.len() + app.tail_rows.len() + tui_stream_prefix(app) } else { 0 } }
 
-def tui_live_rows(app: &UiApp) -> i64 { tui_stream_count(app) + if app.busy { 1 } else { 0 } }
+def tui_activity_rows(app: &UiApp) -> i64 { if app.busy { if app.reconnect.len() > 0 { 2 } else { 1 } } else { 0 } }
+
+def tui_live_rows(app: &UiApp) -> i64 { tui_stream_count(app) + tui_activity_rows(app) }
 
 // The lower visible row is an entry anchor, rather than a distance from a tail
 // whose wrapped height can change. No text search or model state is involved.
@@ -143,7 +146,7 @@ def tui_read_anchor(app: &UiApp) -> UiReadAnchor {
     let total = app.transcript.len() + tui_live_rows(app);
     if app.scroll <= 0 or total <= app.scroll { return UiReadAnchor { message_id: 0, row: 0, last_row: false }; };
     let index = total - app.scroll - 1;
-    if index >= app.transcript.len() { return UiReadAnchor { message_id: if index - app.transcript.len() >= tui_stream_count(app) { app.activity_id } else { app.stream_id }, row: index - app.transcript.len(), last_row: index + 1 == total }; };
+    if index >= app.transcript.len() { return UiReadAnchor { message_id: if index - app.transcript.len() >= tui_stream_count(app) { app.activity_id } else { app.stream_id }, row: index - app.transcript.len() - if index - app.transcript.len() >= tui_stream_count(app) { tui_stream_count(app) } else { 0 }, last_row: index + 1 == total }; };
     let id = app.transcript.get(index).message_id; let mut first = index;
     while first > 0 and app.transcript.get(first - 1).message_id == id { first = first - 1; };
     let last = index + 1 == app.transcript.len() or app.transcript.get(index + 1).message_id != id;
@@ -159,7 +162,7 @@ def tui_restore_read_anchor(app: &mut UiApp, anchor: UiReadAnchor) {
         index = index + 1;
     };
     if start < 0 and anchor.message_id == app.stream_id and app.stream_id > 0 { start = app.transcript.len(); count = tui_stream_count(app); };
-    if start < 0 and app.busy and anchor.message_id == app.activity_id { start = app.transcript.len() + tui_stream_count(app); count = 1; };
+    if start < 0 and app.busy and anchor.message_id == app.activity_id { start = app.transcript.len() + tui_stream_count(app); count = tui_activity_rows(app); };
     if anchor.message_id > 0 and start >= 0 and count > 0 {
         let row = if anchor.last_row or anchor.row >= count { count - 1 } else { anchor.row };
         app.scroll = total - start - row - 1;
@@ -183,7 +186,7 @@ def tui_reflow(app: &mut UiApp) -> Result<bool, i64> {
 
 def tui_resize(app: &mut UiApp, width: i64, height: i64) -> Result<bool, i64> {
     let w = if width < 12 { 12 } else { if width > 500 { 500 } else { width } }; let h = if height < 6 { 6 } else { if height > 300 { 300 } else { height } };
-    if app.width != w or app.height != h { app.width = w; app.height = h; tui_reflow(app)?; app.previous_frame.clear(); (); }; tui_true()
+    if app.width != w or app.height != h { selection_clear(&mut app.selection); app.width = w; app.height = h; tui_reflow(app)?; app.previous_frame.clear(); (); }; tui_true()
 }
 
 def tui_target(app: &mut UiApp, connection: &str, model: &str, session: &str) -> Result<bool, i64> {
@@ -253,7 +256,7 @@ def tui_stored_rows_expanded(rows: &Vec<UiLine>, message: &UiMessage, width: i64
 
 def tui_tool(app: &mut UiApp, key: &str, name: &str, status: &str, detail: &str, error: &str) -> Result<bool, i64> {
     if key.len() == 0 or key.len() > 1024 or name.len() == 0 { return tui_message(app, "tool", name); };
-    if status != "running" and status != "completed" and status != "failed" and status != "interrupted" { return tui_true(); };
+    if status != "running" and status != "completed" and status != "failed" and status != "interrupted" and status != "paused" { return tui_true(); };
     let slot = tui_tool_slot(app, key);
     // Terminal results are absorbing. A delayed start or duplicated completion
     // must not restart animation, erase its path or create another card.
@@ -367,7 +370,7 @@ def tui_begin(app: &mut UiApp) -> Result<bool, i64> {
     app.active_model = app.model.clone()?;
     app.stream_id = app.next_message_id; app.next_message_id = app.next_message_id + 1;
     app.activity_id = app.next_message_id; app.next_message_id = app.next_message_id + 1; app.turn_started = time_monotonic_ms();
-    app.busy = true; app.received_text = false; app.phase = cli_text("working"); app.home = false; app.streaming.clear(); app.stream_lines.clear(); app.stream_tail.clear(); app.stream_markdown = md_new(); tui_refresh_tail(app)?;
+    app.reconnect.clear(); app.busy = true; app.received_text = false; app.phase = cli_text("working"); app.home = false; app.streaming.clear(); app.stream_lines.clear(); app.stream_tail.clear(); app.stream_markdown = md_new(); tui_refresh_tail(app)?;
     if app.scroll > 0 { app.scroll = app.scroll + tui_live_rows(app) - previous_live; };
     app.status = cli_text("Responding"); tui_true()
 }
@@ -394,6 +397,15 @@ def tui_delta(app: &mut UiApp, text: &str) -> Result<bool, i64> {
     tui_true()
 }
 
+def tui_discard_retry_stream(app: &mut UiApp) -> Result<bool, i64> {
+    let before = tui_live_rows(app);
+    app.streaming.clear(); app.stream_lines.clear(); app.stream_tail.clear(); app.tail_rows.clear();
+    app.stream_markdown = md_new(); app.tail_plain = false; app.stream_id = 0; app.received_text = false;
+    tui_refresh_tail(app)?;
+    if app.scroll > 0 { let next = app.scroll + tui_live_rows(app) - before; app.scroll = if next > 0 { next } else { 0 }; };
+    tui_true()
+}
+
 // Finishing never dispatches queued work. The owner calls take_submission only
 // after it has processed the terminal event and committed host turn completion.
 def tui_finish(app: &mut UiApp, success: bool) -> Result<bool, i64> { tui_finish_elapsed(app, success, -1) }
@@ -408,13 +420,14 @@ def tui_finish_body(app: &mut UiApp, success: bool) -> Result<bool, i64> {
             tui_tool(app, key.as_str(), name.as_str(), "interrupted", "", "No terminal tool outcome was received; inspect before retrying.")?; ();
         }; index = index + 1;
     };
-    app.busy = false; app.active_permission.clear(); app.active_model.clear(); app.phase.clear(); app.approval.clear(); app.approval_text.clear(); app.approval_draft.clear(); app.approval_options.clear(); app.approval_custom = false; if not success { app.queue_paused = true; }; app.status = cli_text(if success { "Ready" } else { "Paused / cancelled" }); tui_true()
+    app.busy = false; app.active_permission.clear(); app.active_model.clear(); app.phase.clear(); app.approval.clear(); app.approval_text.clear(); app.approval_draft.clear(); app.approval_options.clear(); app.approval_custom = false; if not success { app.queue_paused = true; }; app.status = cli_text(if success { "Ready" } else { "Paused" }); tui_true()
 }
 
 def tui_clear(app: &mut UiApp) -> Result<bool, i64> {
+    selection_clear(&mut app.selection);
     app.vim = keys_vim_new(); app.reading = reading_new();
     app.wheel_remainder = 0; app.wheel_focus.clear(); app.previous_rows.clear(); app.previous_view_safe = false;
-    app.open_groups.clear(); app.visible_group_ids.clear(); app.group_focus = 0; app.history_window.clear(); app.active_permission.clear(); app.active_model.clear(); app.messages.clear(); app.transcript.clear(); app.streaming.clear(); app.stream_lines.clear(); app.stream_tail.clear(); app.tail_rows.clear(); app.stream_markdown = md_new(); app.stream_id = 0; app.transcript_bytes = 0; app.scroll = 0; app.home = true; app.previous_frame.clear(); app.previous_styles.clear(); app.previous_spans.clear(); tui_true()
+    app.open_groups.clear(); app.visible_group_ids.clear(); app.group_focus = 0; app.reconnect.clear(); app.history_window.clear(); app.active_permission.clear(); app.active_model.clear(); app.messages.clear(); app.transcript.clear(); app.streaming.clear(); app.stream_lines.clear(); app.stream_tail.clear(); app.tail_rows.clear(); app.stream_markdown = md_new(); app.stream_id = 0; app.transcript_bytes = 0; app.scroll = 0; app.home = true; app.previous_frame.clear(); app.previous_styles.clear(); app.previous_spans.clear(); tui_true()
 }
 
 def tui_current_token(app: &UiApp) -> Result<UiToken, i64> {
@@ -491,6 +504,7 @@ def tui_refresh_menu(app: &mut UiApp) -> Result<bool, i64> {
 }
 
 def tui_set_draft(app: &mut UiApp, text: &str) -> Result<bool, i64> {
+    app.history_index = app.history.len(); app.history_draft.clear();
     app.vim = keys_vim_new(); app.draft = tui_limit(text, 65536)?; app.cursor = app.draft.len(); app.menu_closed = false; app.selected = 0; tui_refresh_menu(app)
 }
 
@@ -514,6 +528,7 @@ def tui_image_insert(app: &mut UiApp, paths: JsonValue) -> Result<bool, i64> {
 }
 
 def tui_set_candidates(app: &mut UiApp, kind: &str, title: &str, items: Vec<UiCandidate>) -> Result<bool, i64> {
+    selection_clear(&mut app.selection);
     app.picker = tui_limit(kind, 128)?; app.picker_title = tui_limit(title, 1024)?; app.candidates = items; app.picker_query.clear(); app.picker_selected = 0; app.menu_open = false; tui_true()
 }
 
@@ -522,6 +537,7 @@ def tui_close_picker(app: &mut UiApp) -> Result<bool, i64> { app.picker.clear();
 // The owner discards terminal input before displaying this fresh nonce. A
 // permission starts on No; typing/pasting "yes" cannot change its selection.
 def tui_set_approval(app: &mut UiApp, id: &str, description: &str, question: bool) -> Result<bool, i64> {
+    selection_clear(&mut app.selection);
     app.approval = tui_limit(id, 256)?; app.approval_text = tui_limit(description, 131072)?; app.approval_scroll = 0; app.approval_question = question; app.approval_yes = false; app.approval_draft.clear(); app.approval_options.clear(); app.approval_selected = 0; app.approval_custom = false; app.menu_open = false; tui_true()
 }
 
@@ -679,8 +695,9 @@ def tui_filtered_candidates(app: &UiApp) -> Result<Vec<UiCommandMatch>, i64> {
 }
 
 def tui_remember(app: &mut UiApp, text: &str) -> Result<bool, i64> {
-    if app.history.len() == 0 or app.history.get(app.history.len() - 1).text.as_str() != text { app.history.push(InputHistory { text: cli_text(text) }); (); };
-    if app.history.len() > 128 { app.history.remove(0); (); }; app.history_index = app.history.len(); app.history_draft.clear(); tui_true()
+    ui_history_add(&app.history, text)?;
+    app.history_dirty = true; app.history_retry_at = 0;
+    app.history_index = app.history.len(); app.history_draft.clear(); tui_true()
 }
 
 def tui_take_submission(app: &mut UiApp) -> Result<UiAction, i64> {
@@ -770,6 +787,7 @@ def tui_read(app: &mut UiApp) -> Result<bool, i64> {
 
 def tui_edit_result(app: &mut UiApp, edit: UiEdit) -> Result<bool, i64> {
     let atomic = images_atomic_edit(app.draft.as_str(), app.cursor, edit.text.as_str(), edit.cursor)?;
+    if app.draft.as_str() != atomic.text.as_str() { app.history_index = app.history.len(); app.history_draft.clear(); (); };
     app.draft = atomic.text; app.cursor = ui_cursor_boundary(app.draft.as_str(), atomic.cursor)?; app.menu_closed = false; app.selected = 0;
     tui_refresh_menu(app)
 }
@@ -799,6 +817,13 @@ def tui_editor_event(app: &mut UiApp, event: &TerminalEvent) -> Result<bool, i64
 
 def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
     if event.kind == 3 { tui_resize(app, event.width, event.height)?; return tui_none(); };
+    if app.approval.len() == 0 and app.picker.len() == 0 and selection_has(&app.selection) {
+        if event.kind == 4 or event.kind == 1 and event.code == 3 {
+            return Result { is_ok: true, value: UiAction { kind: 6, text: selection_text(&app.selection)?, context: cli_text("clipboard-selection") }, error: 0 };
+        };
+        if event.kind == 1 and event.code == 27 { selection_clear(&mut app.selection); return tui_none(); };
+    };
+    if event.kind == 1 or event.kind == 2 or event.kind == 4 { selection_clear(&mut app.selection); };
     let local_shortcut = event.kind == 1 and (event.code == 19 or event.code == 22 or event.modifiers == 2 and (event.code == 118 or event.code == 86));
     if local_shortcut and (app.approval.len() > 0 or app.picker.len() > 0 or app.menu_open or app.queue_edit_index >= 0 or app.reading.active) { return tui_none(); };
     if event.kind == 1 and event.code == 9 and event.modifiers == 1 and (app.approval.len() > 0 or app.picker.len() > 0 or app.menu_open or app.queue_edit_index >= 0 or app.reading.active) { return tui_none(); };
@@ -834,7 +859,7 @@ def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
     if not (event.kind == 1 and event.code == 27 and app.menu_open) and tui_editor_event(app, event)? { return tui_none(); };
     if event.kind == 2 {
         let safe = tui_sanitize(event.data.as_str())?; if app.draft.len() + safe.len() > 65536 { app.status = cli_text("Draft limit reached (64 KiB)."); return tui_none(); };
-        app.draft = ui_replace_range(app.draft.as_str(), app.cursor, app.cursor, safe.as_str())?; app.cursor = ui_cursor_boundary(app.draft.as_str(), app.cursor + safe.len())?; app.menu_closed = false; app.selected = 0; tui_refresh_menu(app)?; return tui_none();
+        app.draft = ui_replace_range(app.draft.as_str(), app.cursor, app.cursor, safe.as_str())?; app.cursor = ui_cursor_boundary(app.draft.as_str(), app.cursor + safe.len())?; app.menu_closed = false; app.selected = 0; app.history_index = app.history.len(); app.history_draft.clear(); tui_refresh_menu(app)?; return tui_none();
     };
     if event.kind != 1 { return tui_none(); };
     if event.code == 17 and app.queue_edit_index < 0 { tui_queue_open(app)?; return tui_none(); };
@@ -875,6 +900,11 @@ def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
         return Result { is_ok: true, value: UiAction { kind: 1, text: submitted, context: string_new() }, error: 0 };
     };
     if event.code == 4 and app.draft.len() == 0 { return Result { is_ok: true, value: tui_action(if app.busy { 2 } else { 3 }, "", ""), error: 0 }; };
+    if app.queue_edit_index < 0 and app.history_index < app.history.len() and (event.code == 1001 or event.code == 1002) {
+        if event.code == 1001 { if app.history_index > 0 { app.history_index = app.history_index - 1; }; } else { app.history_index = app.history_index + 1; };
+        app.draft = if app.history_index == app.history.len() { app.history_draft.clone()? } else { app.history.get(app.history_index).recalled()? };
+        app.cursor = app.draft.len(); app.vim = keys_vim_new(); app.menu_closed = true; return tui_none();
+    };
     let previous_text = app.draft.clone()?; let previous_cursor = app.cursor;
     if event.code == 8 or event.code == 127 { let previous = ui_previous_boundary(app.draft.as_str(), app.cursor); app.draft = ui_replace_range(app.draft.as_str(), previous, app.cursor, "")?; app.cursor = previous; app.menu_closed = false; } else {
         if event.code == 21 { app.draft = ui_replace_range(app.draft.as_str(), 0, app.cursor, "")?; app.cursor = 0; app.menu_closed = false; };
@@ -898,6 +928,7 @@ def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
         };
     };
     let atomic = images_atomic_edit(previous_text.as_str(), previous_cursor, app.draft.as_str(), app.cursor)?; app.draft = atomic.text; app.cursor = ui_cursor_boundary(app.draft.as_str(), atomic.cursor)?;
+    if previous_text.as_str() != app.draft.as_str() { app.history_index = app.history.len(); app.history_draft.clear(); (); };
     tui_refresh_menu(app)?; tui_none()
 }
 
@@ -1001,18 +1032,23 @@ def tui_approval_rows(rows: &Vec<UiLine>, app: &UiApp, maximum: i64) -> Result<b
 }
 
 def tui_footer(app: &UiApp) -> &str {
-    if app.approval.len() > 0 { if app.approval_question { if app.approval_options.len() > 0 { return if app.approval_custom { "Enter answer  ·  Tab choices  ·  Esc cancel" } else { "↑↓ choose  ·  Enter select  ·  Esc cancel" }; }; return "Enter answer  ·  Esc cancel  ·  draft is kept separately"; }; return "↑↓ choose  ·  PgUp/PgDn preview  ·  Enter confirm  ·  Esc deny"; };
-    if app.picker.len() > 0 { return "↑↓ choose  ·  Enter select  ·  Esc close  ·  type to filter"; };
-    if app.reading.active { return "READING  ·  j k / PgUp PgDn / gg G  ·  q Esc return  ·  Ctrl+C cancel"; };
-    if app.queue_edit_index >= 0 { return "Enter save queued edit  ·  Shift+Enter newline  ·  Esc discard  ·  no submit"; };
-    if app.menu_open { return "↑↓ choose  ·  Enter / Tab complete  ·  Esc close"; };
-    if app.queue.len() > 0 { return "Enter queue  ·  Esc recall last  ·  Ctrl+Q queue  ·  Ctrl+C cancel"; };
+    if app.approval.len() > 0 { if app.approval_question { if app.approval_options.len() > 0 { return if app.approval_custom { "Enter answer · Tab choices · Esc cancel" } else { "↑↓ choose · Enter select · Esc cancel" }; }; return "Enter answer · Esc cancel"; }; return "↑↓ choose · Enter confirm · Esc deny"; };
+    if app.picker.len() > 0 { return "↑↓ choose · Enter select · Esc close"; };
+    if selection_has(&app.selection) { return "Ctrl+C copy · Esc clear"; };
+    if app.reading.active { return "j/k scroll · Esc return"; };
+    if app.queue_edit_index >= 0 { return "Enter save · Esc discard"; };
+    if app.menu_open { return "↑↓ choose · Enter complete · Esc close"; };
+    if app.queue.len() > 0 { return "Esc recall · Ctrl+Q queue"; };
     if app.keymap.mode.as_str() == "vim" {
-        if app.vim.insert { return if app.busy { "VIM INSERT  ·  Esc normal  ·  Enter queue  ·  Ctrl+C cancel  ·  Ctrl+R read" } else { "VIM INSERT  ·  Esc normal  ·  Enter send  ·  /keys  ·  Ctrl+R read" }; };
-        return if app.busy { "VIM NORMAL  ·  i insert  ·  h j k l / w b / x / u  ·  Ctrl+C cancel" } else { "VIM NORMAL  ·  i insert  ·  h j k l / w b / x / u  ·  Enter send" };
+        if app.vim.insert { return if app.busy { "Esc normal · Ctrl+C stop" } else { "Esc normal · /help" }; };
+        return if app.busy { "i insert · Ctrl+C stop" } else { "i insert · /help" };
     };
-    if app.busy { return "Enter queue  ·  Ctrl+Q manage queue  ·  Esc cancel  ·  Ctrl+R read"; };
-    "Enter send  ·  Shift+Enter newline  ·  / commands  ·  Ctrl+R read"
+    if app.busy { return "Enter queue · Esc stop"; };
+    "/help"
+}
+
+def tui_routine_status(status: &str) -> bool {
+    status == "Ready" or status == "Responding" or status == "Ready / type a task or /" or status == "Working / Esc to cancel" or status == "Responding / Ctrl+C cancels"
 }
 
 def tui_permission_style(label: &str) -> i64 {
@@ -1041,7 +1077,7 @@ def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
         let live = tui_live_rows(app); let total = app.transcript.len() + live;
         let maximum = if total > view_height { total - view_height } else { 0 }; let scroll = if app.scroll > maximum { maximum } else { app.scroll };
         let end = if total > scroll { total - scroll } else { 0 }; let start = if end > view_height { end - view_height } else { 0 }; let mut index = start;
-        while index < end {
+        while index < end and not app.selection.active {
             if index < app.transcript.len() {
                 let row: &UiLine = app.transcript.get(index);
                 if row.style == 15 { let slot = tui_tool_message(app, row.message_id); let phase = if slot >= 0 { app.messages.get(slot).tool_phase.as_str() } else { "working" }; md_row(&body, tui_activity_text(app, phase)?.as_str(), 15, row.message_id)?; (); } else { if row.style == 9 { let text = tui_tool_header(app, row)?; let slot = tui_tool_message(app, row.message_id);
@@ -1056,7 +1092,8 @@ def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
             } else {
                 let current = index - app.transcript.len();
                 let prefix = tui_stream_prefix(app);
-                if current >= tui_stream_count(app) { md_row(&body, tui_activity_text(app, app.phase.as_str())?.as_str(), 14, app.activity_id)?; (); } else { if current < prefix { md_row(&body, if current == 0 { "" } else { "SENCODE" }, if current == 0 { 0 } else { 1 }, app.stream_id)?; (); } else {
+                if current >= tui_stream_count(app) { let retry_row = app.reconnect.len() > 0 and current == tui_stream_count(app);
+                    md_row(&body, if retry_row { app.reconnect.as_str() } else { tui_activity_text(app, app.phase.as_str())?.as_str() }, 14, app.activity_id)?; (); } else { if current < prefix { md_row(&body, if current == 0 { "" } else { "SENCODE" }, if current == 0 { 0 } else { 1 }, app.stream_id)?; (); } else {
                     if current - prefix < app.stream_lines.len() { tui_copy_line(&body, app.stream_lines.get(current - prefix))?; (); } else { tui_copy_line(&body, app.tail_rows.get(current - prefix - app.stream_lines.len()))?; (); };
                 }; };
             };
@@ -1064,9 +1101,9 @@ def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
         };
     };
     let mut index = 0;
-    while index < view_height { if index < body.len() { let row: &UiLine = body.get(index);
+    while index < view_height { if app.selection.active and index < app.selection.rows.len() { selection_painted_row(&rows, &app.selection, index)?; (); } else { if index < body.len() { let row: &UiLine = body.get(index);
             if row.cells <= width { tui_copy_line(&rows, row)?; (); } else { let text = ui_fit(row.text.as_str(), width)?; rows.push(UiLine { cells: ui_cells(text.as_str())?, text: text, style: row.style, message_id: row.message_id , spans: ui_spans_copy(&row.spans, 0, row.text.len()) }); (); };
-        } else { tui_row(&rows, "")?; (); }; index = index + 1; };
+        } else { tui_row(&rows, "")?; (); }; }; index = index + 1; };
     tui_copy_rows(&rows, &menu)?;
     tui_copy_rows(&rows, &pending)?;
     tui_row(&rows, "")?;
@@ -1082,19 +1119,24 @@ def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
     // activity indicator used to be painted directly below the input box,
     // which also made the native cursor appear to twitch on every frame.
     // Detailed progress is carried by tool/message cards above it.
-    let status = if app.busy and app.active_permission.len() > 0 { app.active_permission.clone()? } else { app.permission.clone()? };
+    // Normalize permission text before recording byte spans: fitting may replace
+    // Unicode separators, so offsets measured on the original label are stale.
+    let status = ui_fit(if app.busy and app.active_permission.len() > 0 { app.active_permission.as_str() } else { app.permission.as_str() }, width)?;
     let permission_spans: Vec<UiSpan> = vec_new();
     ui_span(&permission_spans, 0, status.len(), tui_permission_style(status.as_str()));
-    if app.busy and app.active_permission.len() > 0 and app.active_permission.as_str() != app.permission.as_str() { status.push_str("  → 下轮 ")?; let next_start = status.len(); status.push_str(app.permission.as_str())?; ui_span(&permission_spans, next_start, status.len(), tui_permission_style(app.permission.as_str())); (); };
-    status.push_str("  · Shift+Tab")?;
+    if app.busy and app.active_permission.len() > 0 and app.active_permission.as_str() != app.permission.as_str() { status.push_str("  → 下轮 ")?; let next_start = status.len(); status.push_str(ui_fit(app.permission.as_str(), width)?.as_str())?; ui_span(&permission_spans, next_start, status.len(), tui_permission_style(app.permission.as_str())); (); };
+    if app.approval.len() == 0 and app.picker.len() == 0 and not app.menu_open { status.push_str(" | Shift+Tab")?; (); };
     if app.history_window.len() > 0 { status.push_str("  /  ")?; status.push_str(app.history_window.as_str())?; (); };
     if app.queue.len() > 0 { status.push_str("  /  ")?; status.push_i64(app.queue.len())?; status.push_str(" queued")?; (); };
-    if app.queue_paused { status.push_str("  /  queue paused")?; (); };
+    if app.queue_paused and app.queue.len() > 0 { status.push_str(" | queue paused")?; (); };
     if app.keymap.warning.len() > 0 { status.push_str("  /  keymap rejected: /keys show")?; (); };
-    if app.scroll > 0 { status.push_str("  /  reading history · Ctrl+End follows output")?; (); } else { if app.status.len() > 0 { status.push_str("  /  ")?; status.push_str(app.status.as_str())?; (); }; };
+    let hint = tui_footer(app); let hint_gap = width - ui_cells(status.as_str())? - ui_cells(hint)?;
+    let separate_hint = hint_gap < 2;
+    if not separate_hint { status.push_str(ui_repeat(" ", hint_gap)?.as_str())?; status.push_str(hint)?; (); };
     let status_text = ui_fit(status.as_str(), width)?;
-    rows.push(UiLine { cells: ui_cells(status_text.as_str())?, text: status_text, style: 0, message_id: 0, spans: permission_spans });
-    tui_row(&rows, ui_fit(tui_footer(app), width)?.as_str())?;
+    rows.push(UiLine { cells: ui_cells(status_text.as_str())?, text: status_text, style: 2, message_id: 0, spans: permission_spans });
+    let notice = if separate_hint { cli_text(hint) } else { if app.status.len() > 0 and not tui_routine_status(app.status.as_str()) and app.approval.len() == 0 and app.picker.len() == 0 and not app.menu_open { app.status.clone()? } else { string_new() } };
+    md_row(&rows, ui_fit(notice.as_str(), width)?.as_str(), 2, 0)?;
     let fitted: Vec<UiLine> = vec_new(); index = 0;
     while index < app.height { let line = ui_repeat(" ", margin)?; let mut style = 0; let mut message_id = 0; let mut cells = margin; let mut spans: Vec<UiSpan> = vec_new();
         if index < rows.len() { let row: &UiLine = rows.get(index);
@@ -1114,6 +1156,7 @@ def tui_frame(app: &UiApp) -> Result<String, i64> {
 // Paint only rows that changed. The frame cache is owned by this UiApp and
 // invalidated on resize/redraw; streaming never clears the whole screen.
 def tui_style_sequence(style: i64, emphasis: bool, selected: bool, colored: bool) -> String {
+    if style == 17 { return cli_text("\x1b[30;47m"); };
     if not colored { return string_new(); };
     if selected { return cli_text("\x1b[7m"); };
     if style == 1 { return cli_text("\x1b[1;38;5;183m"); };
@@ -1130,15 +1173,15 @@ def tui_style_sequence(style: i64, emphasis: bool, selected: bool, colored: bool
 }
 
 def tui_colored_line(row: &UiLine, emphasis: bool, selected: bool, colored: bool) -> Result<String, i64> {
-    if not colored or selected or row.spans.len() == 0 { return row.text.clone(); };
+    if selected or row.spans.len() == 0 { return row.text.clone(); };
     let out = string_new(); let mut offset = 0; let mut index = 0;
     while index < row.spans.len() {
         let span: &UiSpan = row.spans.get(index); let end = if span.end < row.text.len() { span.end } else { row.text.len() };
         if span.start >= offset and span.start < end {
             if span.start > offset { out.push_str(cli_byte_slice(row.text.as_str(), offset, span.start)?.as_str())?; (); };
-            out.push_str("\x1b[0m")?; out.push_str(tui_style_sequence(span.style, false, false, true).as_str())?;
+            if colored or span.style == 17 { out.push_str("\x1b[0m")?; out.push_str(tui_style_sequence(span.style, false, false, colored).as_str())?; (); };
             out.push_str(cli_byte_slice(row.text.as_str(), span.start, end)?.as_str())?;
-            out.push_str("\x1b[0m")?; out.push_str(tui_style_sequence(row.style, emphasis, false, true).as_str())?; offset = end;
+            if colored or span.style == 17 { out.push_str("\x1b[0m")?; out.push_str(tui_style_sequence(row.style, emphasis, false, colored).as_str())?; (); }; offset = end;
         }; index = index + 1;
     };
     out.push_str(cli_byte_slice(row.text.as_str(), offset, row.text.len())?.as_str())?;
@@ -1179,7 +1222,7 @@ def tui_paint_update(app: &mut UiApp, colored: bool) -> Result<String, i64> {
     let cursor_visible = app.picker.len() == 0 and app.approval.len() == 0 and not app.reading.active;
     let view_height = tui_view_height(app)?; let total = app.transcript.len() + tui_live_rows(app);
     let view_start = if total - app.scroll > view_height { total - app.scroll - view_height } else { 0 };
-    let view_safe = not app.home and not app.menu_open and app.picker.len() == 0 and app.approval.len() == 0 and app.queue.len() == 0 and app.queue_edit_index < 0 and total >= view_height and view_height > 1;
+    let view_safe = not app.selection.active and not app.home and not app.menu_open and app.picker.len() == 0 and app.approval.len() == 0 and app.queue.len() == 0 and app.queue_edit_index < 0 and total >= view_height and view_height > 1;
     // Do not send a hide/show or cursor-move sequence when neither the frame
     // nor the cursor target changed. Windows Terminal restarts its native
     // blink timer when it receives those sequences, producing a solid cursor
@@ -1269,16 +1312,30 @@ def tui_paint(terminal: &Terminal, app: &mut UiApp) -> Result<bool, i64> {
 def tui_mouse(app: &mut UiApp, mouse: &TerminalMouseEvent) -> Result<UiAction, i64> {
     app.mouse_changed = false;
     if app.approval.len() > 0 { app.wheel_remainder = 0; app.wheel_focus = cli_text("approval"); return tui_none(); };
+    if mouse.action == 1 and mouse.button == 3 and app.picker.len() == 0 and selection_has(&app.selection) {
+        return Result { is_ok: true, value: UiAction { kind: 6, text: selection_text(&app.selection)?, context: cli_text("clipboard-selection") }, error: 0 };
+    };
+    if app.selection.dragging and (mouse.action == 3 or mouse.action == 2) {
+        // Button-up at another cell is sufficient; some hosts coalesce moves.
+        if mouse.button == 1 or mouse.button == 0 { app.mouse_changed = selection_move(app, mouse.row, mouse.column)?; };
+        if mouse.action == 2 { app.selection.dragging = false; if not app.selection.focused { selection_clear(&mut app.selection); }; app.mouse_changed = true; };
+        return tui_none();
+    };
     if mouse.action == 1 and mouse.button == 1 and app.picker.len() == 0 and not app.menu_open and mouse.row >= 0 and mouse.row < app.visible_group_ids.len() {
-        let id = app.visible_group_ids.get(mouse.row).unwrap_or(0); if id > 0 { tui_detail_toggle(app, id)?; app.mouse_changed = true; return tui_none(); };
+        let id = app.visible_group_ids.get(mouse.row).unwrap_or(0); if id > 0 { selection_clear(&mut app.selection); tui_detail_toggle(app, id)?; app.mouse_changed = true; return tui_none(); };
     };
     if mouse.action == 1 and mouse.button == 1 and app.picker.len() == 0 and not app.menu_open and not app.reading.active {
+        selection_clear(&mut app.selection); app.mouse_changed = true;
         let layout = images_layout(app.draft.as_str(), app.cursor, tui_composer_width(app))?; let visible = tui_visible_composer(app, &layout); let first = if layout.cursor_row >= visible { layout.cursor_row - visible + 1 } else { 0 }; let top = app.height - visible - 3; let margin = (app.width - tui_content_width(app)) / 2;
         if mouse.row >= top and mouse.row < top + visible and mouse.column >= margin + 4 and mouse.column < margin + tui_content_width(app) - 2 {
-            let previous = app.cursor; app.cursor = images_hit(app.draft.as_str(), tui_composer_width(app), first + mouse.row - top, mouse.column - margin - 4)?; app.mouse_changed = previous != app.cursor; return tui_none();
+            let previous = app.cursor; app.cursor = images_hit(app.draft.as_str(), tui_composer_width(app), first + mouse.row - top, mouse.column - margin - 4)?; app.mouse_changed = true; return tui_none();
         };
     };
+    if mouse.action == 1 and mouse.button == 1 and app.picker.len() == 0 and not app.menu_open {
+        if selection_begin(app, mouse.row, mouse.column)? { app.mouse_changed = true; return tui_none(); };
+    };
     if mouse.action == 4 and mouse.scroll_y != 0 {
+        selection_clear(&mut app.selection);
         let focus = if app.picker.len() > 0 { app.picker.clone()? } else { cli_text(if app.menu_open { "commands" } else { "transcript" }) };
         let lines = if app.picker.len() > 0 or app.menu_open { 1 } else { 3 };
         let steps = tui_wheel_steps(app, mouse.scroll_y, focus.as_str(), lines)?;

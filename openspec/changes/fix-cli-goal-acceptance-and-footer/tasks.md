@@ -1,0 +1,4 @@
+- [x] Controller owner: model-proposed checks, configured-check precedence, actual verification and persistence (`goal_acceptance_host`).
+- [x] Diagnostics owner: distinguish verification pause, permission denial and cancellation (`execution_diagnostics`, `goal_acceptance_host`).
+- [x] TUI owner: compact contextual footer, preserved permission colors and clear status (`goal_footer`, owned-console acceptance).
+- [x] Integration owner: fixed candidate regressions, package, installation and rollback evidence (`production-final-evidence.json`, candidate-2 installation evidence; see verification.md).

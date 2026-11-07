@@ -88,7 +88,8 @@ def tui_history_messages(app: &mut UiApp, history: &JsonDoc) -> Result<bool, i64
                 let failed = outcome == 2; let unknown = outcome == 0;
                 let error = if unknown { cli_text("Tool outcome is unavailable or uncertain; inspect before retrying.") } else { if failed and result.is_ok() { tui_tool_error_text(result.value.root())? } else { string_new() } };
                 let name = app.messages.get(slot).tool_name.clone()?;
-                tui_tool(app, key.as_str(), name.as_str(), if unknown { "interrupted" } else { if failed { "failed" } else { "completed" } }, "", error.as_str())?; ();
+                let paused = result.is_ok() and tui_tool_flag(result.value.root(), "goal_paused");
+                tui_tool(app, key.as_str(), name.as_str(), if unknown { "interrupted" } else { if paused { "paused" } else { if failed { "failed" } else { "completed" } } }, "", error.as_str())?; ();
             }; ();
         }; }; };
         if message.object_has("cli_turn_elapsed_ms") { let elapsed = cli_json_optional_i64(message, "cli_turn_elapsed_ms", -1); let outcome = cli_json_optional_string(message, "cli_turn_outcome"); if elapsed >= 0 { tui_elapsed_note(app, elapsed, outcome.as_str())?; (); }; };

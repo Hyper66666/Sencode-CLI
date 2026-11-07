@@ -32,14 +32,20 @@ def tui_activity_text(app: &UiApp, phase: &str) -> Result<String, i64> {
 
 def tui_elapsed_note(app: &mut UiApp, elapsed_ms: i64, outcome: &str) -> Result<bool, i64> {
     if elapsed_ms < 0 { return tui_true(); };
-    let text = cli_text(if outcome == "completed" or outcome == "idle" or outcome == "success" { "Worked for " } else { if outcome == "cancelled" or outcome == "interrupted" { "Cancelled after " } else { "Stopped after " } });
+    let text = cli_text(if outcome == "completed" or outcome == "idle" or outcome == "success" { "Worked for " } else { if outcome == "cancelled" or outcome == "interrupted" { "Cancelled after " } else { if outcome == "paused" { "Paused after " } else { "Stopped after " } } });
     text.push_str(tui_duration(elapsed_ms)?.as_str())?;
     tui_message(app, "elapsed", text.as_str())
 }
 
+def tui_reconnect(app: &mut UiApp, text: &str) -> Result<bool, i64> {
+    let anchor = tui_read_anchor(app); app.reconnect = cli_text(text); tui_restore_read_anchor(app, anchor); tui_true()
+}
+
 def tui_finish_outcome(app: &mut UiApp, success: bool, elapsed_ms: i64, outcome: &str) -> Result<bool, i64> {
     let anchor = tui_read_anchor(app); let active = app.busy; let duration = if elapsed_ms >= 0 { elapsed_ms } else { time_monotonic_ms() - app.turn_started };
+    app.reconnect.clear();
     tui_finish_body(app, success)?;
+    if not success { app.status = cli_text(if outcome == "cancelled" or outcome == "interrupted" { "Cancelled" } else { if outcome == "paused" { "Goal paused" } else { "Paused" } }); };
     if active { tui_elapsed_note(app, duration, outcome)?; (); };
     tui_restore_read_anchor(app, anchor); tui_true()
 }

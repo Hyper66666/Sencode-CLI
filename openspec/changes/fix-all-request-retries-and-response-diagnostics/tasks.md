@@ -1,0 +1,6 @@
+- [x] Implement all-error native retries, cancelable waits and shared budgets (integration owner).
+- [x] Replace provisional attempt text without tool replay or duplicate persisted answers (integration owner).
+- [x] Preserve sanitized HTTP 2xx failure phases, terminal categories and bounded attempt evidence (integration owner).
+- [x] Normalize batch output and validate Unicode/space path command execution (integration owner).
+- [x] Run focused native and loopback tests, exact executable recovery/console checks and OpenSpec strict validation (integration owner).
+- [x] Package, verify rollback and update local sen/sencode with an evidence record (integration owner).

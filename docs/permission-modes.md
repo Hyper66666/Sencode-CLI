@@ -27,6 +27,11 @@ mode; it does not run a model-based risk classifier. Full access authorizes
 arbitrary noninteractive commands and approved configured MCP execution. The
 command process has the current user's operating-system access.
 
+Plan applies to one selected turn and exits after its reply completes, is
+cancelled or fails. Resuming a session does not restore Plan. The selected
+manual/auto/full mode continues to apply after Plan ends, without automatically
+executing the saved plan or approving tools.
+
 Plan remains read-only in every mode, with the designated plan file as its
 existing exception. Explore and plan children receive a read-only policy;
 general children inherit only their parent's permissions and existing one-level

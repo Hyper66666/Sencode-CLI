@@ -62,6 +62,13 @@ def verify_consult(base: &str) -> Result<i64, i64> {
     failures = failures + expect_consult(typed_result.root().object_get("reports")?.array_len()? == 1 and typed_goal.requests == 1, "Pending-aware consultation completes with the shared budget");
     failures = failures + expect_consult(pending.len() == 2 and pending.get(0).data.as_str() == "yes\n中文😀" and pending.get(1).code == 13, "Consultation preserves queued Unicode paste and Enter for the next prompt");
 
+    let retry_targets: Vec<ConsultTarget> = vec_new();
+    retry_targets.push(fixture_target(base, "a", "retry-consult", 0));
+    let recovering = consult_batch(".", "Recover rejected consultant", retry_targets)?;
+    let mut retry_goal = goal_new(50, 0);
+    let recovered = await_consult(&recovering, &mut retry_goal)?;
+    failures = failures + expect_consult(cli_json_optional_i64(recovered.root().object_get("reports")?.array_get(0)?, "error", -1) == 0 and retry_goal.requests == 3, "Consultation retries HTTP 403 twice with shared accounting");
+
     let partial: Vec<ConsultTarget> = vec_new();
     println("consult: partial failure");
     partial.push(fixture_target(base, "a", "failure", 0));
@@ -79,7 +86,7 @@ def verify_consult(base: &str) -> Result<i64, i64> {
         if code == 500 { failures_500 = failures_500 + 1; };
         index = index + 1;
     };
-    failures = failures + expect_consult(successes == 1 and failures_500 == 1, "Failure is isolated and attributed per consultant");
+    failures = failures + expect_consult(successes == 1 and failures_500 == 1 and partial_goal.requests == 7, "Failure is isolated and attributed per consultant");
 
     let tools: Vec<ConsultTarget> = vec_new();
     println("consult: read-only tools");

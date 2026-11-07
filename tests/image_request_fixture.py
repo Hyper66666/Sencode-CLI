@@ -32,6 +32,11 @@ def main():
                 anthropic = self.path.endswith("/messages")
                 assert self.headers.get("x-api-key") == "fixture-key" if anthropic else self.headers.get("Authorization") == "Bearer fixture-key"
                 rows = body["input"] if self.path.endswith("/responses") else body["messages"]
+                if anthropic:
+                    assert "Sencode host request target" in body["system"]
+                else:
+                    assert rows[0]["role"] == "system" and "Sencode host request target" in rows[0]["content"]
+                    rows = rows[1:]
                 assert len(rows) == 1
                 parts = rows[0]["content"]
                 assert len(parts) == 2 and parts[0]["text"] == "Inspect original 世界😀"

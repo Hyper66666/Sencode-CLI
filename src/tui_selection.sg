@@ -1,0 +1,115 @@
+import terminal;
+
+// Screen cells are not UTF-8 offsets. Keep a bounded viewport snapshot while
+// the host continues streaming; copy must match the text actually highlighted.
+struct UiSelection {
+    active: bool, dragging: bool, focused: bool,
+    anchor_row: i64, anchor_column: i64, focus_row: i64, focus_column: i64,
+    rows: Vec<UiLine>,
+}
+
+def selection_new() -> UiSelection {
+    let rows: Vec<UiLine> = vec_new();
+    UiSelection { active: false, dragging: false, focused: false, anchor_row: 0, anchor_column: 0, focus_row: 0, focus_column: 0, rows: rows }
+}
+
+def selection_clear(selection: &mut UiSelection) {
+    selection.active = false; selection.dragging = false; selection.focused = false; selection.rows.clear(); ();
+}
+
+def selection_has(selection: &UiSelection) -> bool { selection.active and selection.focused }
+
+def selection_before(left_row: i64, left_column: i64, right_row: i64, right_column: i64) -> bool {
+    left_row < right_row or left_row == right_row and left_column <= right_column
+}
+
+def selection_cell_byte(text: &str, column: i64, after: bool) -> Result<i64, i64> {
+    if column <= 0 { return cli_ok(0); };
+    let clusters = ui_clusters(text)?; let mut index = 0; let mut cells = 0;
+    while index < clusters.len() { let cluster: &UiCluster = clusters.get(index);
+        if column == cells { return cli_ok(cluster.offset); };
+        if column < cells + cluster.cells { return cli_ok(if after { cluster.end } else { cluster.offset }); };
+        cells = cells + cluster.cells; index = index + 1;
+    }; cli_ok(text.len())
+}
+
+def selection_range(selection: &UiSelection, row: i64, end: bool) -> Result<i64, i64> {
+    if row < 0 or row >= selection.rows.len() or not selection_has(selection) { return cli_ok(-1); };
+    let forward = selection_before(selection.anchor_row, selection.anchor_column, selection.focus_row, selection.focus_column);
+    let first = if forward { selection.anchor_row } else { selection.focus_row };
+    let last = if forward { selection.focus_row } else { selection.anchor_row };
+    if row < first or row > last { return cli_ok(-1); };
+    let text = selection.rows.get(row).text.as_str();
+    if end { if row < last { return cli_ok(text.len()); }; return selection_cell_byte(text, if forward { selection.focus_column + 1 } else { selection.anchor_column + 1 }, true); };
+    if row > first { return cli_ok(0); };
+    selection_cell_byte(text, if forward { selection.anchor_column } else { selection.focus_column }, false)
+}
+
+def selection_text(selection: &UiSelection) -> Result<String, i64> {
+    let out = string_new(); let mut row = 0; let mut added = false;
+    while row < selection.rows.len() {
+        let start = selection_range(selection, row, false)?; let end = selection_range(selection, row, true)?;
+        if start >= 0 and end >= start {
+            if added { out.push_str("\n")?; (); };
+            let text = cli_byte_slice(selection.rows.get(row).text.as_str(), start, end)?;
+            let mut limit = text.len();
+            while limit > 0 and str_ends_with(cli_byte_slice(text.as_str(), 0, limit)?.as_str(), " ") { limit = limit - 1; };
+            if out.len() + limit + 1 > 65536 { return string_result_err(13); };
+            out.push_str(cli_byte_slice(text.as_str(), 0, limit)?.as_str())?; added = true;
+        }; row = row + 1;
+    }; Result { is_ok: true, value: out, error: 0 }
+}
+
+def selection_begin(app: &mut UiApp, row: i64, column: i64) -> Result<bool, i64> {
+    let view = tui_view_height(app)?; let margin = (app.width - tui_content_width(app)) / 2;
+    if row < 2 or row >= view + 2 or app.home or column < margin { return keys_bool(false); };
+    selection_clear(&mut app.selection);
+    let frame = tui_frame_rows(app)?;
+    if frame.get(row).message_id <= 0 { return keys_bool(false); };
+    let mut index = 2;
+    while index < view + 2 and index < frame.len() {
+        let line: &UiLine = frame.get(index);
+        let text = cli_byte_slice(line.text.as_str(), margin, line.text.len())?;
+        app.selection.rows.push(UiLine { cells: ui_cells(text.as_str())?, text: text, style: line.style, message_id: line.message_id, spans: ui_spans_copy(&line.spans, 0 - margin, line.text.len() - margin) });
+        index = index + 1;
+    };
+    let col = if column - margin > tui_content_width(app) { tui_content_width(app) } else { column - margin };
+    app.selection.anchor_row = row - 2; app.selection.anchor_column = col;
+    app.selection.focus_row = row - 2; app.selection.focus_column = col;
+    app.selection.active = true; app.selection.dragging = true; app.selection.focused = false;
+    keys_bool(true)
+}
+
+def selection_move(app: &mut UiApp, row: i64, column: i64) -> Result<bool, i64> {
+    if not app.selection.dragging or app.selection.rows.len() == 0 { return keys_bool(false); };
+    let y = if row < 2 { 0 } else { if row - 2 >= app.selection.rows.len() { app.selection.rows.len() - 1 } else { row - 2 } };
+    let col = column - (app.width - tui_content_width(app)) / 2;
+    let x = if col < 0 { 0 } else { if col > tui_content_width(app) { tui_content_width(app) } else { col } };
+    if not app.selection.focused and app.selection.anchor_row == y and app.selection.anchor_column == x { return keys_bool(false); };
+    let changed = not app.selection.focused or app.selection.focus_row != y or app.selection.focus_column != x;
+    app.selection.focused = true; app.selection.focus_row = y; app.selection.focus_column = x;
+    keys_bool(changed)
+}
+
+def selection_painted_row(rows: &Vec<UiLine>, selection: &UiSelection, index: i64) -> Result<bool, i64> {
+    let row: &UiLine = selection.rows.get(index); let start = selection_range(selection, index, false)?; let end = selection_range(selection, index, true)?;
+    let spans: Vec<UiSpan> = vec_new(); let mut scan = 0;
+    while scan < row.spans.len() { let span: &UiSpan = row.spans.get(scan);
+        if start < 0 or span.end <= start or span.start >= end { ui_span(&spans, span.start, span.end, span.style); } else {
+            if span.start < start { ui_span(&spans, span.start, start, span.style); };
+        }; scan = scan + 1;
+    };
+    // Insert in source order, splitting semantic styles around the highlight.
+    if start >= 0 and end > start {
+        let before: Vec<UiSpan> = vec_new(); let after: Vec<UiSpan> = vec_new(); scan = 0;
+        while scan < row.spans.len() { let span: &UiSpan = row.spans.get(scan);
+            if span.start < start { ui_span(&before, span.start, if span.end < start { span.end } else { start }, span.style); };
+            if span.end > end { ui_span(&after, if span.start > end { span.start } else { end }, span.end, span.style); };
+            scan = scan + 1;
+        };
+        spans.clear(); scan = 0; while scan < before.len() { let span: &UiSpan = before.get(scan); ui_span(&spans, span.start, span.end, span.style); scan = scan + 1; };
+        ui_span(&spans, start, end, 17);
+        scan = 0; while scan < after.len() { let span: &UiSpan = after.get(scan); ui_span(&spans, span.start, span.end, span.style); scan = scan + 1; };
+    };
+    rows.push(UiLine { text: row.text.clone()?, cells: row.cells, style: row.style, message_id: row.message_id, spans: spans }); keys_bool(true)
+}

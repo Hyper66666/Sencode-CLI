@@ -115,7 +115,63 @@ def long_context_all(database: &str, base_url: &str, connection: &str) -> Result
     let state = cli_state_open(database)?;
     let cwd = path_parent_string(database)?;
     long_context_restore_tests(&state, cwd.as_str(), connection)?;
+    long_context_rich_test(&state, cwd.as_str(), connection, base_url)?;
     long_context_compact_test(&state, cwd.as_str(), connection, base_url)
+}
+
+def long_context_rich_test(state: &CliState, cwd: &str, connection: &str, base: &str) -> Result<bool, i64> {
+    let session = cli_state_create_session(state, cwd)?;
+    let mut execution = cli_state_begin(state, session.as_str(), connection, "history-fixture")?;
+    let options = long_context_options(cwd, session.as_str(), connection);
+    let opening = json_parse("{\"role\":\"user\",\"content\":\"Retain rich structured history\"}")?;
+    cli_state_append(state, &execution, &opening)?;
+    let mut index = 0;
+    while index < 140 {
+        let call = cli_text("rich-"); call.push_i64(index)?;
+        let assistant = json_parse("{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"\",\"name\":\"read_file\",\"arguments\":\"{}\"}],\"responses_output\":[{\"type\":\"reasoning\",\"id\":\"reasoning\",\"encrypted_content\":\"synthetic-encrypted-context\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"first\"},{\"type\":\"summary_text\",\"text\":\"second\"}]},{\"type\":\"function_call\",\"call_id\":\"\",\"name\":\"read_file\",\"arguments\":\"{}\",\"status\":\"completed\"}],\"responses_end_turn\":false,\"requires_continuation\":true}")?;
+        cli_put_string(&assistant, assistant.root().object_get("tool_calls")?.array_get(0)?, "id", call.as_str())?;
+        cli_put_string(&assistant, assistant.root().object_get("responses_output")?.array_get(1)?, "call_id", call.as_str())?;
+        cli_put_string(&assistant, assistant.root(), "responses_endpoint", base)?;
+        cli_put_string(&assistant, assistant.root(), "responses_model", "history-fixture")?;
+        cli_put_string(&assistant, assistant.root(), "responses_connection", connection)?;
+        cli_state_append(state, &execution, &assistant)?;
+        let tool = json_parse("{\"role\":\"tool\",\"content\":\"exact result 中文😀\"}")?;
+        cli_put_string(&tool, tool.root(), "tool_call_id", call.as_str())?;
+        cli_state_append(state, &execution, &tool)?; index = index + 1;
+    };
+    let mut history = controller_context_history(state, &options)?;
+    let encoded = history.serialize_string()?;
+    let legacy = json_parse(encoded.as_str());
+    long_context_expect(not legacy.is_ok() and legacy.error == 10 and history.root().object_get("messages")?.array_len()? == 282, "Rich 282-row history exceeds4096 nodes but loads completely")?;
+    let tools = json_parse("{\"tools\":[]}")?;
+    let target = ProviderConnection { id: cli_text(connection), base: cli_text(base), model: cli_text("history-fixture"), effort: string_new(), protocol: 0, images: false };
+    let identified = request_identity_history(&history, &target)?;
+    let scoped = provider_target_history_scoped(&identified, base, "history-fixture", connection)?;
+    let mut protocol = 0;
+    while protocol < 3 {
+        let request = provider_build_request(protocol, "history-fixture", &scoped, &tools)?;
+        let parsed = json_parse_limits(request.as_str(), 1048576, 65536)?;
+        let key = if protocol == 0 { "max_completion_tokens" } else { if protocol == 1 { "max_output_tokens" } else { "max_tokens" } };
+        long_context_expect(parsed.root().object_get(key)?.number_i64()? == 131072 and str_contains(request.as_str(), "rich-139"), "All protocols preserve the newest rich tool unit and default128K cap")?;
+        protocol = protocol + 1;
+    };
+    // Persist a rich checkpoint itself, including thousands of structured nodes.
+    let saved = context_document()?; cli_put_i64(&saved, saved.root(), "schema", 2)?; cli_put_i64(&saved, saved.root(), "messages_seen", 281)?;
+    let retained = saved.new_array()?; let source = history.root().object_get("messages")?; index = 1;
+    while index < source.array_len()? { retained.array_push(saved.copy(source.array_get(index)?)?)?; index = index + 1; };
+    saved.root().object_set("messages", retained)?; cli_state_mode_save(state, &execution, "context", &saved)?;
+    let checkpoint_restored = controller_context_history(state, &options)?;
+    long_context_expect(checkpoint_restored.serialize_string()?.as_str() == encoded.as_str(), "Rich checkpoint reads its full projected field beyond4096 nodes")?;
+    let scheduler = scheduler_new(); let task = scheduler_add(&scheduler, 0, connection, cwd, false)?;
+    let children = children_new(); let child_states: Vec<ControllerChild> = vec_new(); let terminal = terminal_open()?;
+    let mut goal = goal_new(60, 999999); goal.requests = 7; goal.tokens = 123;
+    controller_reduce_context(state, &execution, &options, &target, &mut history, &tools, &scheduler, task, &mut goal, &terminal, &children, &child_states, true)?;
+    let expected = history.serialize_string()?;
+    long_context_expect(goal.requests == 8 and goal.tokens == 224 and cli_state_history_count(state, session.as_str())? == 281, "Rich compaction preserves public rows and accumulated budget")?;
+    cli_state_finish(state, &mut execution, "idle")?;
+    let reopened_context = controller_context_history(state, &options)?;
+    long_context_expect(reopened_context.serialize_string()?.as_str() == expected.as_str(), "Rich context compaction survives reopening")?;
+    Result { is_ok: true, value: true, error: 0 }
 }
 
 def main() -> i64 {

@@ -82,7 +82,9 @@ def main():
                 assert "REPRODUCED:" in result.stderr
             else:
                 assert result.returncode == 0, result.returncode
-                assert len(SummaryFixture.requests) == (1 if "context" in executable.name else 0)
+                # Rich Responses history and the900-message checkpoint each
+                # exercise one real summarization request.
+                assert len(SummaryFixture.requests) == (2 if "context" in executable.name else 0)
             results.append({
                 "binary": executable.name, "exit_code": result.returncode,
                 "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),

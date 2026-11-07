@@ -255,7 +255,8 @@ def main():
         bootstrap.stop()
         config = {"version": 2, "baseUrl": f"http://127.0.0.1:{server.server_port}/v1",
                   "protocol": "chatCompletions", "successfulProtocol": "chatCompletions",
-                  "selectedModelId": "model-one", "credentialRef": target, "enabledModels": []}
+                  "selectedModelId": "model-one", "credentialRef": target,
+                  "enabledModels": [{"id": name} for name in ("model-one", "model-two", "child-model")]}
         with closing(sqlite3.connect(database)) as db:
             db.create_function("sengoo_context", 1, lambda key: "test-fixture" if key == "instance_id" else None)
             db.execute("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES(?,'customApi','managed','fixture',?,'model-one',1,1)",

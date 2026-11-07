@@ -1,0 +1,58 @@
+import terminal;
+import state;
+
+// Ten submitted composer values, oldest first. This is UI recall metadata,
+// never model context, execution authority or approval input.
+def input_history_value(history: &Vec<InputHistory>) -> Result<JsonDoc, i64> {
+    let value = json_doc_object_bounded(1048576)?;
+    cli_put_i64(&value, value.root(), "version", 1)?;
+    let entries = value.new_array()?; value.root().object_set("entries", entries)?;
+    let mut index = if history.len() > 10 { history.len() - 10 } else { 0 };
+    while index < history.len() { let text = history.get(index).text.as_str();
+        if text.len() > 0 and text.len() <= 65536 { entries.array_push(value.new_string(text)?)?; (); };
+        index = index + 1;
+    }; Result { is_ok: true, value: value, error: 0 }
+}
+
+def input_history_add(history: &Vec<InputHistory>, text: &str) -> Result<bool, i64> {
+    ui_history_add(history, text)
+}
+
+def input_history_load(state: &CliState, session: &str) -> Result<Vec<InputHistory>, i64> {
+    let history: Vec<InputHistory> = vec_new();
+    let saved = cli_state_mode_load(state, session, "cli_input_history")?;
+    if saved.root().object_has("value") {
+        let value = saved.root().object_get("value")?;
+        if cli_json_optional_i64(value, "version", 0) != 1 or not value.object_has("entries") { return Result { is_ok: true, value: history, error: 0 }; };
+        let entries = value.object_get("entries")?;
+        let count = entries.array_len();
+        if not count.is_ok() or count.value > 10 { return Result { is_ok: true, value: history, error: 0 }; };
+        let mut index = 0;
+        while index < count.value { let text = entries.array_get(index)?.string_value();
+            if text.is_ok() and text.value.len() > 0 and text.value.len() <= 65536 { input_history_add(&history, text.value.as_str())?; (); };
+            index = index + 1;
+        }; return Result { is_ok: true, value: history, error: 0 };
+    };
+    // Migrate old sessions using only their actual public user messages. This
+    // excludes subagents, coordinator continuations and other project sessions.
+    let mut rows = state.db.prepare("SELECT m.text FROM messages m LEFT JOIN shared_history h ON h.message_id=m.id AND h.session_id=m.session_id WHERE m.session_id=? AND m.role='user' AND m.cancelled=0 AND length(CAST(m.text AS BLOB)) BETWEEN 1 AND 65536 AND COALESCE(json_extract(CASE WHEN json_valid(h.message_json) THEN h.message_json ELSE '{}' END,'$.cli_internal'),0)<>1 ORDER BY m.created_at DESC,m.revision DESC,m.id DESC LIMIT 10")?;
+    rows.bind_text(1, session)?;
+    while rows.step()? { history.insert(0, InputHistory { text: rows.text(0)? }); (); };
+    Result { is_ok: true, value: history, error: 0 }
+}
+
+def input_history_save(state: &CliState, session: &str, history: &Vec<InputHistory>) -> Result<bool, i64> {
+    let value = input_history_value(history)?; let raw = value.serialize_string()?;
+    let lock_path = state_lock_path(state.path.as_str(), "session", session)?; let lease = file_lock(lock_path.as_str())?;
+    // A busy host owns this session. The frontend keeps the ring dirty until
+    // cleanup; normal exit stops/reaps the host before its final flush.
+    let mut tx = state.db.transaction()?;
+    let mut owner = tx.prepare("SELECT 1 FROM shared_executions WHERE session_id=? AND active=1")?;
+    owner.bind_text(1, session)?;
+    if owner.step()? { return state_bool_error(11); };
+    let mut exists = tx.prepare("SELECT 1 FROM sessions WHERE id=?")?; exists.bind_text(1, session)?;
+    if not exists.step()? { return state_bool_error(3); };
+    let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,json_object('cli_input_history',json(?)),?) ON CONFLICT(session_id) DO UPDATE SET mode_json=json_set(shared_modes.mode_json,'$.cli_input_history',json(?)),updated_at=excluded.updated_at")?;
+    save.bind_text(1, session)?; save.bind_text(2, raw.as_str())?; save.bind_i64(3, time_unix_ms())?; save.bind_text(4, raw.as_str())?; save.step()?;
+    tx.commit()?; Result { is_ok: true, value: true, error: 0 }
+}

@@ -1,7 +1,9 @@
+Defaults:256K context,128K maximum output,80% automatic compaction. See [request limits](network-context-recovery.md).
+
 # Native context compaction
 
 The native Sengoo implementation follows the existing Sencode runtime's
-continuation policy: trigger at 85% estimated occupancy, select a partial tail
+continuation policy: trigger at 80% estimated occupancy, select a partial tail
 against a 50% target, preserve complete assistant/tool runs, carry forward prior
 summary facts, and reject inadequate summaries. Its prompt and implementation
 were written in Sengoo for this CLI. No recovered Claude implementation was

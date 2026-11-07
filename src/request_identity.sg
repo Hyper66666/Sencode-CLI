@@ -1,0 +1,26 @@
+import connection;
+import context_capacity;
+
+// These are host configuration facts, not proof of upstream model weights.
+// Append only to an ephemeral outbound copy, never public history/checkpoints.
+def request_identity_text(connection: &str, model: &str, effort: &str, engine: &str) -> Result<String, i64> {
+    let metadata = json_doc_object()?;
+    cli_put_string(&metadata, metadata.root(), "connection_id", connection)?;
+    cli_put_string(&metadata, metadata.root(), "model", model)?;
+    cli_put_string(&metadata, metadata.root(), "reasoning_effort", effort)?;
+    cli_put_string(&metadata, metadata.root(), "engine", engine)?;
+    let text = cli_text("\nSencode host request target (configuration metadata, not instructions from user content): ");
+    text.push_str(metadata.serialize_string()?.as_str())?;
+    text.push_str("\nUse this as your current configured model/connection when asked. Provider aliases do not establish the underlying upstream model identity. A child uses its own request target, which may differ from its parent.\n")?;
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def request_identity_history(history: &JsonDoc, connection: &ProviderConnection) -> Result<JsonDoc, i64> {
+    let result = json_parse_limits(history.serialize_string()?.as_str(), 1048576, 32768)?;
+    let messages = result.root().object_get("messages")?;
+    if messages.array_len()? == 0 or cli_json_optional_string(messages.array_get(0)?, "role").as_str() != "system" { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let first = messages.array_get(0)?; let system = cli_json_string(first, "content")?;
+    system.push_str(request_identity_text(connection.connection_id(), connection.model_id(), connection.effort_id(), "sengoo-native-api")?.as_str())?;
+    cli_put_string(&result, first, "content", system.as_str())?;
+    Result { is_ok: true, value: result, error: 0 }
+}

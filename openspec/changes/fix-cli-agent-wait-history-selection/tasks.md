@@ -1,0 +1,6 @@
+- [x] Controller: reproduce unchanged child continuation loops and gate requests on terminal progress (`agent_recall_selection`, `session_policy_wait`).
+- [x] TUI: group consecutive coordination calls and keep failures and details accessible (`recall_selection`, `tui_agents`, `reading_console`).
+- [x] State/frontend: persist ten session inputs; verify restart, switch, branch and rename isolation (`input_history`, `agent_recall_selection`).
+- [x] TUI: implement Unicode-safe drag selection, explicit copy and focus isolation (`recall_selection`; real-console selection). Windows private-clipboard integration remains unqualified on this host; see verification.md.
+- [x] Integration: run native regressions and real-console/loopback scenarios on one candidate (eight native and eight production cases; see verification.md).
+- [x] Delivery: package, verify and update local sen/sencode with rollback evidence (`smoke-install.ps1`, six local entrypoint checks).

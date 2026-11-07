@@ -164,6 +164,12 @@ def engine_execute_selected_with_images(state: &CliState, options: &AgentOptions
 // Shared by the foreground host, redirected/headless output and scrolling
 // clients. A target is frozen before any request; no account/API failover.
 def engine_dispatch(state: &CliState, options: &mut AgentOptions, prompt: &str, operation: &str, maximum_requests: i64, token_budget: i64, terminal: &Terminal, permission_profile: &str) -> Result<String, i64> {
+    let result = engine_dispatch_turn(state, options, prompt, operation, maximum_requests, token_budget, terminal, permission_profile);
+    policy_finish_plan(&mut options.policy);
+    result
+}
+
+def engine_dispatch_turn(state: &CliState, options: &mut AgentOptions, prompt: &str, operation: &str, maximum_requests: i64, token_budget: i64, terminal: &Terminal, permission_profile: &str) -> Result<String, i64> {
     if operation.len() > 0 and operation != "turn" and operation != "compact" and operation != "consult" { return string_result_err(2); };
     let metadata = engine_select_target(state, options.connection.as_str(), options.model.as_str())?;
     let policy = engine_selected_policy(options, &metadata, operation, token_budget, permission_profile);
@@ -197,6 +203,9 @@ def engine_stdio(state: &CliState, options: &mut AgentOptions, maximum_requests:
         if not command.root().object_has("type") { time_sleep_ms(2); continue; };
         let id = cli_json_string(command.root(), "id")?;
         execution_diagnostic_reset(&options.input);
+        // A submit owns its Plan flag. Omission, rejection and every terminal
+        // outcome must never inherit Plan from a previous submission.
+        policy_finish_plan(&mut options.policy);
         let valid = engine_submit_valid(&command);
         if not valid.is_ok() { engine_result(options, id.as_str(), "Unsupported or invalid submit field; session changes require a new idle host", 2)?; continue; };
         if engine_request_seen(state, options, id.as_str())? { engine_result(options, id.as_str(), "Duplicate accepted submission was not replayed", 12)?; continue; };
@@ -220,9 +229,9 @@ def engine_stdio(state: &CliState, options: &mut AgentOptions, maximum_requests:
         let permissions = cli_json_optional_string(command.root(), "permission_profile");
         let operation = cli_json_optional_string(command.root(), "operation");
         let policy = engine_selected_policy(options, &target.value, operation.as_str(), tokens, permissions.as_str());
-        if not policy.is_ok() { engine_result(options, id.as_str(), "Managed account execution requires explicit /permissions backend consent. This backend cannot enforce strict Plan, Goal, exact budgets, compact or consult; native API token accounting also requires complete provider usage.", policy.error)?; continue; };
+        if not policy.is_ok() { policy_finish_plan(&mut options.policy); engine_result(options, id.as_str(), "Managed account execution requires explicit /permissions backend consent. This backend cannot enforce strict Plan, Goal, exact budgets, compact or consult; native API token accounting also requires complete provider usage.", policy.error)?; continue; };
         let remembered = session_permissions_save(state, options.session.as_str(), &options.policy, options.allow_commands, if permissions.len() == 0 { "strict" } else { permissions.as_str() });
-        if not remembered.is_ok() { engine_result(options, id.as_str(), "Session permissions could not be saved while the session is busy or unavailable; no request or tool was started. Retry after its owner finishes.", remembered.error)?; continue; };
+        if not remembered.is_ok() { policy_finish_plan(&mut options.policy); engine_result(options, id.as_str(), "Session permissions could not be saved while the session is busy or unavailable; no request or tool was started. Retry after its owner finishes.", remembered.error)?; continue; };
         engine_control_begin(&options.input, id.as_str())?;
         let session = engine_selected_document(options, &target.value)?;
         cli_put_string(&session, session.root(), "type", "session")?;
@@ -237,6 +246,7 @@ def engine_stdio(state: &CliState, options: &mut AgentOptions, maximum_requests:
         let images = if command.root().object_has("images") { command.root().object_get("images")? } else { empty_images.root().object_get("images")? };
         let started = time_monotonic_ms();
         let result = engine_execute_selected_with_images(state, options, &target.value, text.as_str(), operation.as_str(), max_requests, tokens, terminal, images);
+        policy_finish_plan(&mut options.policy);
         let finished = time_monotonic_ms();
         let elapsed = if started >= 0 and finished >= started { finished - started } else { -1 };
         let failure = if result.is_ok() { string_new() } else { execution_diagnostic_content(&execution_diagnostic_document(&options.input, result.error)?)? };

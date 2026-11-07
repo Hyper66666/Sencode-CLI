@@ -10,7 +10,8 @@ def hook_host_probe()->Result<i64,i64>{
     let input:Vec<TerminalEvent> = vec_new();
     if mode.as_str()!="headless"{engine_control_init(&input)?;engine_control_begin(&input,"fixture")?; ();};
     let terminal=terminal_open()?;
-    let options=AgentOptions{cwd:cwd.clone()?,session:session.clone()?,connection:cli_text("fixture"),model:cli_text("fixture"),format:cli_text("stream-json"),policy:AgentPolicy{plan:mode.as_str()=="plan",auto_edit:true,full_access:false,interactive:true,depth:if mode.as_str()=="child"{1}else{0},maximum_depth:1},allow_commands:true,plan_path:string_new(),goal_text:cli_text("fixture"),checks:json_parse("{\"checks\":[]}")?,input:input};
+    let options=AgentOptions{cwd:cwd.clone()?,session:session.clone()?,connection:cli_text("fixture"),model:cli_text("fixture"),effort:string_new(),format:cli_text("stream-json"),policy:AgentPolicy{plan:mode.as_str()=="plan",auto_edit:true,full_access:false,interactive:true,depth:if mode.as_str()=="child"{1}else{0},maximum_depth:1},allow_commands:true,plan_path:string_new(),goal_text:cli_text("fixture"),checks:json_parse("{\"checks\":[]}")?,input:input};
+    let current = ProviderConnection { id: options.connection.clone()?, base: cli_text("http://127.0.0.1:1"), model: options.model.clone()?, effort: string_new(), protocol: 0, images: false };
     let call=json_parse(workspace_read(call_path.as_str(),131072)?.as_str())?;let id=cli_json_string(call.root(),"id")?;
     if mode.as_str()=="complete" or mode.as_str()=="running"{
         cli_state_tool_claim(&state,&execution,id.as_str(),cli_json_string(call.root(),"name")?.as_str(),cli_json_string(call.root(),"arguments")?.as_str())?;
@@ -26,7 +27,7 @@ def hook_host_probe()->Result<i64,i64>{
     let ready=json_doc_object()?;cli_put_string(&ready,ready.root(),"type","fixture-ready")?;cli_put_string(&ready,ready.root(),"session",session.as_str())?;output_document(&ready)?;
     let scheduler=scheduler_new();let task=scheduler_add(&scheduler,0,"fixture",cwd.as_str(),true)?;let children=children_new();let child_states:Vec<ControllerChild> = vec_new();
     let mut goal=goal_new(50,0);goal.requests=7;goal.tokens=91;
-    let result=controller_tool(&state,&execution,&options,call.root(),&scheduler,task,&mut goal,&terminal,&options.input,&children,&child_states);
+    let result=controller_tool(&state,&execution,&options,&current,call.root(),&scheduler,task,&mut goal,&terminal,&options.input,&children,&child_states);
     let report=json_doc_object()?;cli_put_string(&report,report.root(),"type","fixture-result")?;cli_put_string(&report,report.root(),"session",session.as_str())?;
     cli_put_bool(&report,report.root(),"is_ok",result.is_ok())?;cli_put_i64(&report,report.root(),"error",result.error)?;
     cli_put_i64(&report,report.root(),"goal_status",goal.status)?;cli_put_i64(&report,report.root(),"requests",goal.requests)?;cli_put_i64(&report,report.root(),"tokens",goal.tokens)?;

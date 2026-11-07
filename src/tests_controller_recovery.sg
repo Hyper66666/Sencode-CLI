@@ -14,6 +14,51 @@ def recovery_call(id: &str, name: &str, arguments: &str) -> Result<JsonDoc, i64>
     Result { is_ok: true, value: result, error: 0 }
 }
 
+def recovery_context_tests(state: &CliState, cwd: &str) -> Result<bool, i64> {
+    let session = cli_state_create_session(state,cwd)?;
+    let mut execution = cli_state_begin(state,session.as_str(),"fixture","fixture")?;
+    let input: Vec<TerminalEvent> = vec_new(); engine_control_init(&input)?; engine_control_begin(&input,"recovery")?;
+    let options = AgentOptions { cwd: cli_text(cwd), session: session.clone()?, connection: cli_text("fixture"), model: cli_text("fixture"), effort: string_new(), format: cli_text("json"), policy: policy_default(), allow_commands: false, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let user = json_parse("{\"role\":\"user\",\"content\":\"interrupted fixture\"}")?; cli_state_append(state,&execution,&user)?;
+    let assistant = json_parse("{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"present\",\"name\":\"read_file\",\"arguments\":\"{}\"},{\"id\":\"committed\",\"name\":\"run_command\",\"arguments\":\"{}\"},{\"id\":\"unclaimed\",\"name\":\"write_file\",\"arguments\":\"{}\"}]}")?;
+    cli_state_append(state,&execution,&assistant)?;
+    cli_state_tool_claim(state,&execution,"present","read_file","{}")?; cli_state_tool_complete(state,&execution,"present","{\"content\":\"already visible\",\"is_error\":false}")?;
+    let visible = json_parse("{\"role\":\"tool\",\"tool_call_id\":\"present\",\"content\":\"{\\\"content\\\":\\\"already visible\\\",\\\"is_error\\\":false}\"}")?; cli_state_append(state,&execution,&visible)?;
+    let exact = "{\"content\":\"exact saved result 中文\",\"is_error\":false}";
+    cli_state_tool_claim(state,&execution,"committed","run_command","{}")?; cli_state_tool_complete(state,&execution,"committed",exact)?;
+    cli_state_finish(state,&mut execution,"interrupted")?;
+    execution = cli_state_begin(state,session.as_str(),"fixture","fixture")?;
+    let strict = controller_context_history(state,&options);
+    recovery_expect(not strict.is_ok() and strict.error == 12,"Reading incomplete history remains strict and read-only")?;
+    let restored = controller_context_recover(state,&execution,&options)?;
+    recovery_expect(context_units(&restored)?.root().object_get("pending")?.number_i64()? == 0,"Explicit owner recovery balances the trailing tool batch")?;
+    let messages = restored.root().object_get("messages")?;
+    recovery_expect(messages.array_len()? == 6 and cli_json_string(messages.array_get(4)?,"content")?.as_str() == exact,"Completed missing results are restored exactly without duplicating a visible result")?;
+    let skipped = json_parse(cli_json_string(messages.array_get(5)?,"content")?.as_str())?;
+    recovery_expect(skipped.root().object_get("not_executed")?.bool_value()? and skipped.root().object_get("is_error")?.bool_value()?,"Never-admitted calls receive truthful not-executed results")?;
+    recovery_expect(not cli_state_tool_claim(state,&execution,"unclaimed","write_file","{}")?,"Skipped old IDs are reserved against future replay")?;
+    let again = controller_context_recover(state,&execution,&options)?;
+    recovery_expect(again.root().object_get("messages")?.array_len()? == 6 and cli_state_history_count(state,session.as_str())? == 5,"Repeated recovery is idempotent")?;
+    cli_state_finish(state,&mut execution,"idle")?;
+    recovery_expect(not controller_context_recover(state,&execution,&options).is_ok(),"Recovery cannot write with stale execution authority")?;
+
+    let uncertain_session = cli_state_create_session(state,cwd)?;
+    let mut uncertain_execution = cli_state_begin(state,uncertain_session.as_str(),"fixture","fixture")?;
+    let input: Vec<TerminalEvent> = vec_new(); engine_control_init(&input)?; engine_control_begin(&input,"uncertain")?;
+    let uncertain_options = AgentOptions { cwd: cli_text(cwd), session: uncertain_session.clone()?, connection: cli_text("fixture"), model: cli_text("fixture"), effort: string_new(), format: cli_text("json"), policy: policy_default(), allow_commands: false, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    cli_state_append(state,&uncertain_execution,&user)?; cli_state_append(state,&uncertain_execution,&assistant)?;
+    cli_state_tool_claim(state,&uncertain_execution,"committed","run_command","{}")?;
+    let blocked = controller_context_recover(state,&uncertain_execution,&uncertain_options);
+    recovery_expect(not blocked.is_ok() and cli_state_history_count(state,uncertain_session.as_str())? == 2 and controller_tool_prior(state,&uncertain_execution,"present")? == 0,"An uncertain later call blocks all repair writes before partial reconciliation")?;
+    let diagnostic = execution_diagnostic_document(&uncertain_options.input,12)?;
+    recovery_expect(diagnostic.root().object_get("automatic_replay_forbidden")?.bool_value()?,"Uncertain results retain explicit no-replay diagnostics")?;
+    let unknown = executor_tool_failure("run_command",9,false)?;
+    cli_state_tool_complete(state,&uncertain_execution,"committed",unknown.serialize_string()?.as_str())?;
+    recovery_expect(not controller_context_recover(state,&uncertain_execution,&uncertain_options).is_ok(),"A completed uncertain result cannot be disguised as safe completion")?;
+    cli_state_finish(state,&mut uncertain_execution,"idle")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
 def recovery_tests(database: &str) -> Result<bool, i64> {
     recovery_expect(executor_read_error_recoverable("list_directory", 7) and executor_read_error_recoverable("read_file", 5) and executor_read_error_recoverable("git_status", 9), "Ordinary built-in read failures have a no-mutation boundary")?;
     recovery_expect(not executor_read_error_recoverable("run_command", 9) and not executor_read_error_recoverable("write_file", 7) and not executor_read_error_recoverable("read_file", 19) and not executor_read_error_recoverable("read_file", 12) and not executor_read_error_recoverable("read_file", 3) and not executor_read_error_recoverable("read_file", 14), "Effectful, cancellation, ownership, invalid-handle and OOM failures cannot be swallowed")?;
@@ -24,34 +69,35 @@ def recovery_tests(database: &str) -> Result<bool, i64> {
     let mut policy = policy_default(); policy.interactive = false; policy.auto_edit = true;
     let input: Vec<TerminalEvent> = vec_new();
     let options = AgentOptions { cwd: cwd, session: session, connection: cli_text("fixture"), model: cli_text("fixture-model"), effort: string_new(), format: cli_text("json"), policy: policy, allow_commands: false, plan_path: string_new(), goal_text: string_new(), checks: json_parse("{\"checks\":[]}")?, input: input };
+    let current = ProviderConnection { id: options.connection.clone()?, base: cli_text("http://127.0.0.1:1"), model: options.model.clone()?, effort: string_new(), protocol: 0, images: false };
     let terminal = terminal_open()?; let scheduler = scheduler_new();
     let task = scheduler_add(&scheduler, 0, "fixture", options.cwd.as_str(), true)?;
     let children = children_new(); let child_states: Vec<ControllerChild> = vec_new();
     let mut goal = goal_new(50, 0);
     let denied = recovery_call("absolute-directory", "list_directory", "{\"path\":\"D:/outside-fixture-only\"}")?;
-    let first = controller_tool(&state, &execution, &options, denied.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states);
+    let first = controller_tool(&state, &execution, &options, &current, denied.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states);
     if not first.is_ok() { println(first.error); cli_diagnostic("REPRODUCED: ordinary list_directory path rejection aborted the agent instead of returning a tool result"); return state_bool_error(99); };
     let error = json_parse(first.value.as_str())?;
     recovery_expect(error.root().object_get("is_error")?.bool_value()? and error.root().object_get("recoverable")?.bool_value()? and error.root().object_get("error_code")?.number_i64()? == 7 and str_contains(cli_json_string(error.root(), "content")?.as_str(), "'.'"), "Rejected directory path returns code and a workspace-root correction hint")?;
     let repeated = recovery_call("absolute-directory", "list_directory", "{\"path\":\".\"}")?;
-    let cached = controller_tool(&state, &execution, &options, repeated.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
+    let cached = controller_tool(&state, &execution, &options, &current, repeated.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
     recovery_expect(cached.as_str() == first.value.as_str(), "A changed argument cannot replay the original call ID")?;
     let corrected = recovery_call("corrected-directory", "list_directory", "{\"path\":\".\"}")?;
-    let corrected_result = controller_tool(&state, &execution, &options, corrected.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
+    let corrected_result = controller_tool(&state, &execution, &options, &current, corrected.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
     let corrected_json = json_parse(corrected_result.as_str())?;
     recovery_expect(not corrected_json.root().object_get("is_error")?.bool_value()?, "A corrected new call can read the workspace root")?;
     let missing = recovery_call("missing-file", "read_file", "{\"path\":\"missing-fixture.txt\"}")?;
-    let missing_result = controller_tool(&state, &execution, &options, missing.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
+    let missing_result = controller_tool(&state, &execution, &options, &current, missing.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
     let missing_json = json_parse(missing_result.as_str())?;
     recovery_expect(missing_json.root().object_get("recoverable")?.bool_value()?, "Missing file remains a model-visible tool error")?;
     let invalid = recovery_call("invalid-text", "read_file", "{\"path\":\"invalid.bin\"}")?;
-    let invalid_result = controller_tool(&state, &execution, &options, invalid.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
+    let invalid_result = controller_tool(&state, &execution, &options, &current, invalid.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
     let invalid_json = json_parse(invalid_result.as_str())?;
     recovery_expect(invalid_json.root().object_get("recoverable")?.bool_value()? and invalid_json.root().object_get("error_code")?.number_i64()? == 20, "Invalid UTF-8 read is a recoverable error with its original code")?;
     let note = workspace_path(options.cwd.as_str(), "unchanged.txt")?;
     file_write_str(note.as_str(), "original 世界")?;
     let patch = recovery_call("rejected-patch", "apply_patch", "{\"path\":\"unchanged.txt\",\"old\":\"absent pattern\",\"new\":\"must not write\"}")?;
-    let patch_result = controller_tool(&state, &execution, &options, patch.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
+    let patch_result = controller_tool(&state, &execution, &options, &current, patch.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states)?;
     let patch_json = json_parse(patch_result.as_str())?;
     recovery_expect(patch_json.root().object_get("recoverable")?.bool_value()? and patch_json.root().object_get("no_side_effects")?.bool_value()? and workspace_read(note.as_str(), 100)?.as_str() == "original 世界", "Rejected editor preview has no write and can be corrected")?;
     let checkpoints = checkpoint_load(&state, options.session.as_str())?;
@@ -59,12 +105,12 @@ def recovery_tests(database: &str) -> Result<bool, i64> {
 
     let history = agent_history("No real provider; recoverable mixed read batch")?;
     let calls = json_parse("[{\"id\":\"batch-read-rejected\",\"name\":\"list_directory\",\"arguments\":\"{\\\"path\\\":\\\"\\\"}\"},{\"id\":\"batch-read-valid\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"unchanged.txt\\\"}\"}]")?;
-    recovery_expect(controller_execute_batch(&state, &execution, &options, &history, calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "A rejected read does not cancel the next read in its batch")?;
+    recovery_expect(controller_execute_batch(&state, &execution, &options, &current, &history, calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "A rejected read does not cancel the next read in its batch")?;
     let messages = history.root().object_get("messages")?;
     recovery_expect(messages.array_len()? == 3 and cli_json_string(messages.array_get(1)?, "tool_call_id")?.as_str() == "batch-read-rejected" and cli_json_string(messages.array_get(2)?, "tool_call_id")?.as_str() == "batch-read-valid", "Failed and successful results retain original call ordering")?;
 
     let git_calls = json_parse("[{\"id\":\"git-error-status\",\"name\":\"git_status\",\"arguments\":\"{}\"},{\"id\":\"git-error-diff\",\"name\":\"git_diff\",\"arguments\":\"{}\"}]")?;
-    recovery_expect(controller_execute_batch(&state, &execution, &options, &history, git_calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "Settled Git failures outside a repository do not abort unrelated read results")?;
+    recovery_expect(controller_execute_batch(&state, &execution, &options, &current, &history, git_calls.root(), &scheduler, task, &mut goal, &terminal, &children, &child_states)?, "Settled Git failures outside a repository do not abort unrelated read results")?;
     recovery_expect(goal.status == 1, "Recoverable read leaves the agent active")?;
 
     // Seed a genuinely uncertain durable outcome; dispatching the same ID must
@@ -73,7 +119,7 @@ def recovery_tests(database: &str) -> Result<bool, i64> {
     let unknown = executor_tool_failure("write_file", 9, false)?;
     cli_state_tool_complete(&state, &execution, "uncertain-write", unknown.serialize_string()?.as_str())?;
     let uncertain = recovery_call("uncertain-write", "write_file", "{\"path\":\"must-not-replay.txt\",\"content\":\"forbidden\"}")?;
-    let halted = controller_tool(&state, &execution, &options, uncertain.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states);
+    let halted = controller_tool(&state, &execution, &options, &current, uncertain.root(), &scheduler, task, &mut goal, &terminal, &options.input, &children, &child_states);
     recovery_expect(not halted.is_ok() and halted.error == 12 and goal.status == 2 and not file_exists(workspace_path(options.cwd.as_str(), "must-not-replay.txt")?.as_str()), "Unknown side effects remain paused and cannot replay a completed call ID")?;
     let cancel = executor_tool_failure("list_directory", 19, false)?;
     recovery_expect(cancel.root().object_get("host_error")?.bool_value()? and not cancel.root().object_get("recoverable")?.bool_value()?, "Read cancellation is still a host stop")?;
@@ -81,9 +127,10 @@ def recovery_tests(database: &str) -> Result<bool, i64> {
     engine_control_init(&cancelled_input)?;
     cancelled_input.push(engine_control_record(92, 0, "fixture-cancel"));
     let cancelled_call = recovery_call("cancelled-read", "list_directory", "{\"path\":\".\"}")?;
-    let stopped = controller_tool(&state, &execution, &options, cancelled_call.root(), &scheduler, task, &mut goal, &terminal, &cancelled_input, &children, &child_states);
+    let stopped = controller_tool(&state, &execution, &options, &current, cancelled_call.root(), &scheduler, task, &mut goal, &terminal, &cancelled_input, &children, &child_states);
     recovery_expect(not stopped.is_ok() and stopped.error == 19 and controller_tool_prior(&state, &execution, "cancelled-read")? == 0, "A real pending cancellation prevents read admission and does not become a model retry")?;
     cli_state_finish(&state, &mut execution, "idle")?;
+    recovery_context_tests(&state,options.cwd.as_str())?;
     Result { is_ok: true, value: true, error: 0 }
 }
 

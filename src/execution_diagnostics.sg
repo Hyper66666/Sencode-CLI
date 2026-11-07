@@ -1,5 +1,50 @@
 import engine_control;
 
+// Never include response bodies, URLs, headers or credentials in diagnostics.
+def execution_network_label(status: i64, code: i64) -> Result<String, i64> {
+    if status >= 300 and status <= 599 {
+        let text = cli_text("HTTP "); text.push_i64(status)?;
+        text.push_str(if status == 429 { " Too Many Requests" } else { if status == 500 { " Internal Server Error" } else { if status == 502 { " Bad Gateway" } else { if status == 503 { " Service Unavailable" } else { if status == 504 { " Gateway Timeout" } else { if status == 401 { " Unauthorized" } else { if status == 403 { " Forbidden" } else { if status == 400 { " Bad Request" } else { "" } } } } } } } })?;
+        return Result { is_ok: true, value: text, error: 0 };
+    };
+    if status >= 200 and status <= 299 {
+        let text = execution_network_label(0, code)?;
+        text.push_str(" (HTTP ")?; text.push_i64(status)?; text.push_str(" received)")?;
+        return Result { is_ok: true, value: text, error: 0 };
+    };
+    if code == 9 { return string_from_str("Network connection / I/O failed"); };
+    if code == 11 { return string_from_str("Network timeout"); };
+    if code == 15 { return string_from_str("TLS certificate verification failed"); };
+    if code == 16 { return string_from_str("TLS hostname verification failed"); };
+    if code == 17 { return string_from_str("TLS handshake failed"); };
+    if code == 18 { return string_from_str("TLS unavailable"); };
+    if code == 19 { return string_from_str("Request cancelled"); };
+    if code == 10 { return string_from_str("Invalid or incomplete provider response"); };
+    let text = cli_text("Request error "); text.push_i64(code)?;
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def execution_diagnostic_response(input: &Vec<TerminalEvent>, stage: &str, detail: &str) -> Result<bool, i64> {
+    if not engine_control_enabled(input) { return Result { is_ok: true, value: false, error: 0 }; };
+    let document = execution_diagnostic_saved(input)?;
+    cli_put_string(&document, document.root(), "response_stage", stage)?;
+    cli_put_string(&document, document.root(), "response_failure", detail)?;
+    execution_diagnostic_store(input, &document)
+}
+
+def execution_diagnostic_network(input: &Vec<TerminalEvent>, status: i64, code: i64, attempts: i64, stopped: &str) -> Result<bool, i64> {
+    if not engine_control_enabled(input) { return Result { is_ok: true, value: false, error: 0 }; };
+    let document = execution_diagnostic_saved(input)?;
+    cli_put_i64(&document, document.root(), "http_status", status)?;
+    cli_put_i64(&document, document.root(), "transport_error", code)?;
+    cli_put_i64(&document, document.root(), "attempts", attempts)?;
+    cli_put_i64(&document, document.root(), "retries", if attempts > 0 { attempts - 1 } else { 0 })?;
+    cli_put_i64(&document, document.root(), "max_retries", 5)?;
+    cli_put_string(&document, document.root(), "network_error", execution_network_label(status, code)?.as_str())?;
+    cli_put_string(&document, document.root(), "retry_stopped", stopped)?;
+    execution_diagnostic_store(input, &document)
+}
+
 // Actor-local host metadata, never a key event. Raw-TTY callers are no-ops so
 // this private record cannot be replayed by the line editor as user input.
 // Numeric error codes retain their published meaning; stage/reason add context.
@@ -68,6 +113,22 @@ def execution_diagnostic_document(input: &Vec<TerminalEvent>, code: i64) -> Resu
 def execution_diagnostic_content(document: &JsonDoc) -> Result<String, i64> {
     let reason = cli_json_optional_string(document.root(), "reason");
     let unknown = document.root().object_has("outcome_unknown") and document.root().object_get("outcome_unknown")?.bool_value()?;
+    if not unknown and reason.as_str() == "request_state_failed" { return string_from_str("Execution paused: request evidence could not be saved. No new tool was executed after this failure. Saved results were retained; resume after state storage is available."); };
+    if not unknown and reason.as_str() == "provider_request" and document.root().object_has("network_error") {
+        let text = cli_json_string(document.root(), "network_error")?;
+        let detail = cli_json_optional_string(document.root(), "response_failure");
+        if detail.len() > 0 { text.push_str("; ")?; text.push_str(detail.as_str())?; (); };
+        text.push_str("; retries ")?; text.push_i64(cli_json_optional_i64(document.root(), "retries", 0))?; text.push_str("/5. ")?;
+        text.push_str(cli_json_optional_string(document.root(), "retry_stopped").as_str())?;
+        text.push_str(". Completed tool results were retained.")?;
+        return Result { is_ok: true, value: text, error: 0 };
+    };
+    if not unknown and str_starts_with(reason.as_str(), "goal_") {
+        return string_from_str(if reason.as_str() == "goal_permission_required" { "Goal paused: acceptance commands need permission. Use /goal resume to retry with approval." } else {
+            if reason.as_str() == "goal_checks_failed" { "Goal paused: acceptance checks failed twice without progress. Review their output, then use /goal resume after resolving the failure." } else {
+            if reason.as_str() == "goal_verification_timeout" { "Goal paused: acceptance verification timed out. Review the check and use /goal resume when ready." } else { "Goal paused: acceptance verification could not run. Fix the verification environment, then use /goal resume." } }
+        });
+    };
     let text = cli_text(if unknown { "Execution paused: a tool outcome or process cleanup is unverified. Inspect the recorded outcome before retrying; automatic replay is forbidden." } else {
         if reason.as_str() == "provider_request" { "Model request failed. Completed tool results were retained; check the request details before continuing." } else {
         if reason.as_str() == "budget" { "Execution paused because its request or token budget could not continue." } else {

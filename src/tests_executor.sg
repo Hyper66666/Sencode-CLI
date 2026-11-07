@@ -43,6 +43,17 @@ def executor_tests() -> Result<i64, i64> {
     if cli_json_optional_i64(missing_details.root(), "exit_code", 0) != 127 or not str_contains(cli_json_string(missing_details.root(), "stderr")?.as_str(), "sencode_fixture_command_that_does_not_exist") { failures = failures + 1; };
     let rejected = executor_command_shell_pending(cwd.as_str(), "unused", "not-a-shell", 10000, &terminal, &pending)?;
     if not rejected.root().object_get("launch_failed")?.bool_value()? or not rejected.root().object_get("no_side_effects")?.bool_value()? or rejected.root().object_get("outcome_unknown")?.bool_value()? { failures = failures + 1; };
+    let batch_root = path_join_string(cwd.as_str(), "target/executor batch 中文 space")?;
+    dir_create_all(batch_root.as_str())?;
+    let batch = json_parse("{\"path\": \"check.cmd\", \"content\": \"@echo off\\nchcp 65001 >nul\\nsetlocal\\nif \\\"1\\\"==\\\"1\\\" (\\n    echo batch-中文\\n)\\nexit /b 0\\n\"}")?;
+    workspace_file_tool(batch_root.as_str(), "write_file", &batch)?;
+    let checked = executor_command_shell_pending(batch_root.as_str(), "check.cmd", "cmd", 10000, &terminal, &pending)?;
+    let batch_details = json_parse(cli_json_string(checked.root(), "content")?.as_str())?;
+    if cli_json_optional_i64(batch_details.root(), "exit_code", -1) != 0 or not str_contains(cli_json_string(batch_details.root(), "stdout")?.as_str(), "batch-中文") { println("batch execution regression failed"); println(checked.serialize_string()?.as_str()); println(workspace_read(path_join_string(batch_root.as_str(), "check.cmd")?.as_str(), 1048576)?.as_str()); failures = failures + 1; };
+    let quoted = executor_command_shell_pending(batch_root.as_str(), "echo \"quoted value\" https://fixture/a/b", "cmd", 10000, &terminal, &pending)?;
+    let quoted_details = json_parse(cli_json_string(quoted.root(), "content")?.as_str())?;
+    if cli_json_string(quoted_details.root(), "stdout")?.as_str() != "\"quoted value\" https://fixture/a/b\r\n" { println(quoted.serialize_string()?.as_str()); failures = failures + 1; };
+    file_remove(path_join_string(batch_root.as_str(), "check.cmd")?.as_str());
     cli_ok(failures)
 }
 

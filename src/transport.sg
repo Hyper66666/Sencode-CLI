@@ -1,4 +1,5 @@
 import http;
+import context_capacity;
 import sse;
 import provider;
 import std::net;
@@ -15,6 +16,7 @@ struct ProviderJob {
     finished: bool,
     error: i64,
     stream_observed: bool,
+    failure_stage: i64,
 }
 
 // Opaque Responses items are scoped to the server and model which produced
@@ -24,7 +26,9 @@ def provider_target_history(history: &JsonDoc, base: &str, model: &str) -> Resul
 }
 
 def provider_target_history_scoped(history: &JsonDoc, base: &str, model: &str, connection: &str) -> Result<JsonDoc, i64> {
-    let output = json_doc_object_bounded(16777216)?;
+    let size = history.serialize_string()?.len();
+    let output = json_doc_object_limits(if size + 4096 < 16777216 { size + 4096 } else { 16777216 }, 32768)?;
+    context_copy_request_limits(history, &output)?;
     let items = output.new_array()?;
     output.root().object_set("messages", items)?;
     let source = history.root().object_get("messages")?;
@@ -57,7 +61,7 @@ def provider_job_start_with_effort_scoped(base: &str, protocol: i64, model: &str
     let body = provider_build_request_with_effort(protocol, model, effort, &targeted, tools)?;
     let request = http_request(&endpoint, protocol, key, body.as_str())?;
     let stream = net_stream_start(endpoint.host.as_str(), endpoint.port, endpoint.tls, request.as_str(), 30000, 90000, 262144)?;
-    Result { is_ok: true, value: ProviderJob { stream: stream, base: cli_text(base), model: cli_text(model), connection: cli_text(connection), protocol: protocol, http: http_decoder(), sse: sse_decoder(), turn: provider_turn(), finished: false, error: 0, stream_observed: false }, error: 0 }
+    Result { is_ok: true, value: ProviderJob { stream: stream, base: cli_text(base), model: cli_text(model), connection: cli_text(connection), protocol: protocol, http: http_decoder(), sse: sse_decoder(), turn: provider_turn(), finished: false, error: 0, stream_observed: false, failure_stage: 0 }, error: 0 }
 }
 
 // Callers must qualify the selected model and own validated image bytes.
@@ -76,26 +80,57 @@ def provider_job_start_with_media_effort_scoped(base: &str, protocol: i64, model
     let body = provider_build_request_with_media_effort(protocol, model, effort, &targeted, tools, images_allowed, body_limit)?;
     let request = http_request_bounded(&endpoint, protocol, key, body.as_str(), request_limit)?;
     let stream = net_stream_start_bounded(endpoint.host.as_str(), endpoint.port, endpoint.tls, request.as_str(), 30000, 90000, 262144, request_limit)?;
-    Result { is_ok: true, value: ProviderJob { stream: stream, base: cli_text(base), model: cli_text(model), connection: cli_text(connection), protocol: protocol, http: http_decoder(), sse: sse_decoder(), turn: provider_turn(), finished: false, error: 0, stream_observed: false }, error: 0 }
+    Result { is_ok: true, value: ProviderJob { stream: stream, base: cli_text(base), model: cli_text(model), connection: cli_text(connection), protocol: protocol, http: http_decoder(), sse: sse_decoder(), turn: provider_turn(), finished: false, error: 0, stream_observed: false, failure_stage: 0 }, error: 0 }
 }
 
 impl ProviderJob {
+    def failure_stage_label(&self) -> &str {
+        if self.http.headers_ready and (self.http.status < 200 or self.http.status >= 300) { return "http_status"; };
+        if self.failure_stage == 1 { return "network_read"; };
+        if self.failure_stage == 2 { return "http_decode"; };
+        if self.failure_stage == 3 { return "http_finish"; };
+        if self.failure_stage == 4 { return "sse_decode"; };
+        if self.failure_stage == 5 { return "sse_finish"; };
+        if self.failure_stage == 6 { return "provider_event"; };
+        if self.failure_stage == 7 { return "provider_terminal"; };
+        if self.failure_stage == 8 { return "provider_validation"; };
+        ""
+    }
+
+    def failure_label(&self) -> &str {
+        if self.http.headers_ready and (self.http.status < 200 or self.http.status >= 300) { return ""; };
+        if self.turn.failure_label().len() > 0 { return self.turn.failure_label(); };
+        if self.failure_stage == 2 { return "Invalid HTTP response framing"; };
+        if self.failure_stage == 3 { return "HTTP response body ended before completion"; };
+        if self.failure_stage == 4 { return "Invalid SSE data or UTF-8"; };
+        if self.failure_stage == 5 { return "SSE event ended before completion"; };
+        if self.failure_stage == 6 { return "Invalid provider event or tool arguments"; };
+        if self.failure_stage == 7 { return "Stream ended without a provider completion event"; };
+        if self.failure_stage == 8 { return "Provider completion or tool calls failed validation"; };
+        ""
+    }
+
     def poll(&mut self) -> Result<String, i64> {
         let output = string_new();
         if self.finished { return Result { is_ok: true, value: output, error: 0 }; };
         if self.error != 0 { return string_result_err(self.error); };
         let buffer = ffi_buffer_new(16384)?;
         let read = self.stream.read_into(buffer);
-        if read.error != 0 { self.error = read.error; return string_result_err(read.error); };
+        if read.error != 0 { self.failure_stage = 1; self.error = read.error; return string_result_err(read.error); };
         if not read.ready { return Result { is_ok: true, value: output, error: 0 }; };
         if read.eof {
+            self.failure_stage = 3;
             let checked = self.http.finish();
             if not checked.is_ok() { self.error = checked.error; return string_result_err(checked.error); };
+            self.failure_stage = 5;
             self.sse.finish()?;
+            self.failure_stage = 7;
             if not self.turn.done { return string_result_err(10); };
             self.finished = true;
+            self.failure_stage = 0;
             return Result { is_ok: true, value: output, error: 0 };
         };
+        self.failure_stage = 2;
         let bytes = self.http.feed_bytes(&buffer, 0, read.count)?;
         if self.http.headers_ready and (self.http.status < 200 or self.http.status >= 300) {
             self.stream.cancel();
@@ -103,10 +138,12 @@ impl ProviderJob {
             return string_result_err(self.http.status);
         };
         if bytes.used_len() > 0 { self.stream_observed = true; };
+        self.failure_stage = 4;
         let events = self.sse.feed_bytes(&bytes, 0, bytes.used_len())?;
         let mut index = 0;
         while index < events.len() {
             let event: &SseEvent = events.get(index);
+            self.failure_stage = 6;
             let delta = self.turn.event(self.protocol, event.data.as_str())?;
             output.push_str(delta.as_str())?;
             index = index + 1;
@@ -115,13 +152,17 @@ impl ProviderJob {
         // Do not wait for a server's keep-alive socket to close afterwards.
         // A partial SSE event or a missing provider terminal remains an error.
         if self.http.complete {
+            self.failure_stage = 3;
             let checked = self.http.finish();
             if not checked.is_ok() { self.error = checked.error; return string_result_err(checked.error); };
+            self.failure_stage = 5;
             self.sse.finish()?;
+            self.failure_stage = 7;
             if not self.turn.done { return string_result_err(10); };
             self.stream.cancel();
             self.finished = true;
         };
+        self.failure_stage = 0;
         Result { is_ok: true, value: output, error: 0 }
     }
 

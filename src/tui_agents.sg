@@ -98,7 +98,7 @@ def tui_agent_event_body(agents: &UiAgents, app: &mut UiApp, text: &str) -> Resu
     let session = cli_json_string(event, "session_id")?;
     let kind = cli_json_string(event, "kind")?;
     if id <= 0 or request < 1 or session.len() == 0 or session.len() > 1024 or session.as_str() == app.session.as_str() { return tui_true(); };
-    if kind.as_str() != "phase" and kind.as_str() != "request_started" and kind.as_str() != "text_delta" and kind.as_str() != "turn" and kind.as_str() != "usage" and kind.as_str() != "tool_denied" and kind.as_str() != "tool_completed" and kind.as_str() != "finished" { return tui_true(); };
+    if kind.as_str() != "phase" and kind.as_str() != "retry" and kind.as_str() != "request_started" and kind.as_str() != "text_delta" and kind.as_str() != "turn" and kind.as_str() != "usage" and kind.as_str() != "tool_denied" and kind.as_str() != "tool_completed" and kind.as_str() != "finished" { return tui_true(); };
     let value = event.object_get("value")?;
     if value.kind()? != JSON_KIND_OBJECT() { return tui_true(); };
     let existing = tui_agent_slot(agents, session.as_str());
@@ -112,6 +112,10 @@ def tui_agent_event_body(agents: &UiAgents, app: &mut UiApp, text: &str) -> Resu
     let role = cli_json_optional_string(event, "role");
     if role.as_str() == "explore" or role.as_str() == "plan" or role.as_str() == "general" { card.role.clear(); card.role.push_str(role.as_str())?; (); };
     if event.object_has("read_only") { if event.object_get("read_only")?.bool_value()? { card.counters.set(6, 1); (); }; } else { if role.as_str() == "explore" or role.as_str() == "plan" { card.counters.set(6, 1); (); }; };
+    if kind.as_str() == "retry" {
+        card.preview.clear(); card.phase.clear(); card.phase.push_str("working")?;
+        card.activity.clear(); card.activity.push_str("正在重连中... ")?; card.activity.push_i64(cli_json_optional_i64(value, "retry", 1))?; card.activity.push_str("/5")?; ();
+    };
     if kind.as_str() == "phase" { let phase = cli_json_optional_string(value, "phase"); if phase.as_str() == "thinking" or phase.as_str() == "working" or phase.as_str() == "waiting" { card.phase.clear(); card.phase.push_str(phase.as_str())?; (); }; };
     if kind.as_str() == "text_delta" { card.phase.clear(); card.phase.push_str("working")?;
         // The card holds only a bounded preview. A full preview stops growing;

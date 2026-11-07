@@ -1,0 +1,85 @@
+import model_routing;
+import request_identity;
+import agent;
+
+def routing_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { cli_diagnostic(label); return Result { is_ok: false, value: false, error: 99 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def routing_current() -> ProviderConnection {
+    ProviderConnection { id: cli_text("a"), base: cli_text("http://127.0.0.1:1"), model: cli_text("active-a"), effort: cli_text("xhigh"), protocol: 1, images: false }
+}
+
+def routing_fixture() -> Result<JsonDoc, i64> {
+    json_parse("{\"database\":\"private.sqlite\",\"secret\":\"not-public\",\"connections\":[{\"id\":\"a\",\"name\":\"甲\",\"kind\":\"customApi\",\"protocol\":\"responses\",\"model\":\"default-a\",\"enabled_models\":[{\"id\":\"default-a\"},{\"id\":\"active-a\"},{\"id\":\"shared\"}],\"discovered_model_ids\":[\"discovery-only\"]},{\"id\":\"b\",\"name\":\"乙\",\"kind\":\"customApi\",\"protocol\":\"chatCompletions\",\"model\":\"gpt-6.1-terra\",\"enabledModels\":[{\"id\":\"gpt-6.1-terra\",\"label\":\"大地😀\",\"secret\":\"not-public\"},{\"id\":\"shared\"},{\"id\":\"duplicate\"},{\"id\":\"fast-alpha\"}]},{\"id\":\"c\",\"name\":\"丙\",\"kind\":\"customApi\",\"protocol\":\"messages\",\"enabled_models\":[{\"id\":\"duplicate\"},{\"id\":\"fast-beta\"}]},{\"id\":\"managed\",\"kind\":\"codex\",\"enabled_models\":[{\"id\":\"official\"}]},{\"id\":\"blocked\",\"kind\":\"customApi\",\"protocol\":\"responses\",\"status\":\"blocked\",\"enabled_models\":[{\"id\":\"unavailable\"}]}]}")
+}
+
+def routing_target(snapshot: &JsonDoc, current: &ProviderConnection, provider: &str, query: &str, expected_provider: &str, expected_model: &str, inherited: bool) -> Result<bool, i64> {
+    let selected = model_routing_resolve(snapshot, current, provider, query)?;
+    routing_expect(cli_json_string(selected.root(), "status")?.as_str() == "resolved" and cli_json_string(selected.root(), "connection_id")?.as_str() == expected_provider and cli_json_string(selected.root(), "model")?.as_str() == expected_model and selected.root().object_get("inherited")?.bool_value()? == inherited, query)
+}
+
+def model_routing_tests() -> Result<bool, i64> {
+    let source = routing_fixture()?; let before = source.serialize_string()?; let current = routing_current();
+    routing_target(&source, &current, "", "", "a", "active-a", true)?;
+    routing_target(&source, &current, "a", "", "a", "active-a", true)?;
+    routing_target(&source, &current, "甲", "", "a", "active-a", true)?;
+    routing_target(&source, &current, "b", "", "b", "gpt-6.1-terra", false)?;
+    routing_target(&source, &current, "", "gpt-6.1-terra", "b", "gpt-6.1-terra", false)?;
+    routing_target(&source, &current, "", "terra", "b", "gpt-6.1-terra", false)?;
+    routing_target(&source, &current, "", "TERRA", "b", "gpt-6.1-terra", false)?;
+    routing_target(&source, &current, "乙", "大地", "b", "gpt-6.1-terra", false)?;
+    routing_target(&source, &current, "", "大地😀", "b", "gpt-6.1-terra", false)?;
+    routing_target(&source, &current, "", "shared", "a", "shared", false)?;
+    routing_target(&source, &current, "c", "duplicate", "c", "duplicate", false)?;
+    let ambiguous = model_routing_resolve(&source, &current, "", "duplicate")?;
+    routing_expect(cli_json_string(ambiguous.root(), "status")?.as_str() == "ambiguous_model" and ambiguous.root().object_get("candidates")?.array_len()? == 2, "duplicate model across non-current providers needs a choice")?;
+    let fuzzy_ambiguous = model_routing_resolve(&source, &current, "", "fast")?;
+    routing_expect(cli_json_string(fuzzy_ambiguous.root(), "status")?.as_str() == "ambiguous_model", "different fuzzy models never choose arbitrarily")?;
+    let missing = model_routing_resolve(&source, &current, "", "discovery-only")?;
+    routing_expect(cli_json_string(missing.root(), "status")?.as_str() == "model_not_found", "discovered-only models cannot be selected")?;
+    let wrong_provider = model_routing_resolve(&source, &current, "a", "terra")?;
+    routing_expect(cli_json_string(wrong_provider.root(), "status")?.as_str() == "model_not_found", "explicit provider restricts matching")?;
+    let unavailable = model_routing_resolve(&source, &current, "", "official")?;
+    routing_expect(cli_json_string(unavailable.root(), "status")?.as_str() == "unsupported", "managed targets are diagnosed without native fallback")?;
+    let blocked = model_routing_resolve(&source, &current, "", "unavailable")?;
+    routing_expect(cli_json_string(blocked.root(), "status")?.as_str() == "unsupported", "blocked targets cannot silently fall back")?;
+    let manual = ProviderConnection { id: cli_text("a"), base: cli_text("http://127.0.0.1:1"), model: cli_text("manual-model"), effort: string_new(), protocol: 0, images: false };
+    routing_target(&source, &manual, "", "", "a", "manual-model", true)?;
+    routing_target(&source, &manual, "", "manual-model", "a", "manual-model", true)?;
+    let catalog = model_routing_catalog(&source, "", 0, 2)?;
+    routing_expect(catalog.root().object_get("models")?.array_len()? == 2 and cli_json_optional_i64(catalog.root(), "next_offset", -1) == 2, "directory is paginated")?;
+    let searched = model_routing_catalog(&source, "TeRrA", 0, 32)?;
+    routing_expect(searched.root().object_get("models")?.array_len()? == 1 and not str_contains(searched.serialize_string()?.as_str(), "not-public") and not str_contains(searched.serialize_string()?.as_str(), "private.sqlite"), "directory matches fragments without exposing raw configuration")?;
+    routing_expect(source.serialize_string()?.as_str() == before.as_str(), "routing never mutates connection defaults")?;
+    let ranked = json_parse("{\"connections\":[{\"id\":\"b\",\"kind\":\"customApi\",\"protocol\":\"responses\",\"enabled_models\":[{\"id\":\"terra\"},{\"id\":\"gpt-6.1-terra\"},{\"id\":\"another\",\"label\":\"terra\"}]}]}")?;
+    routing_target(&ranked, &current, "", "terra", "b", "terra", false)?;
+    let automatic = json_parse("{\"connections\":[{\"id\":\"auto\",\"kind\":\"customApi\",\"protocol\":\"auto\",\"enabled_models\":[{\"id\":\"auto-target\"}]}]}")?;
+    routing_target(&automatic, &current, "", "auto-target", "auto", "auto-target", false)?;
+    let invalid_protocol = json_parse("{\"connections\":[{\"id\":\"invalid\",\"kind\":\"customApi\",\"protocol\":\"\",\"enabled_models\":[{\"id\":\"invalid-target\"}]}]}")?;
+    let invalid_route = model_routing_resolve(&invalid_protocol, &current, "", "invalid-target")?;
+    routing_expect(cli_json_string(invalid_route.root(), "status")?.as_str() == "unsupported" and str_contains(cli_json_string(invalid_route.root().object_get("candidates")?.array_get(0)?, "unavailable_reason")?.as_str(), "protocol"), "invalid native protocol must not be diagnosed as an account backend")?;
+    let history = agent_history("You summarize coding sessions; do not call tools.")?;
+    agent_message(&history, "user", "hello")?;
+    let original = history.serialize_string()?;
+    let outbound = request_identity_history(&history, &current)?;
+    let first = cli_json_string(outbound.root().object_get("messages")?.array_get(0)?, "content")?;
+    routing_expect(str_starts_with(first.as_str(), "You summarize coding sessions") and str_contains(first.as_str(), "active-a") and str_contains(first.as_str(), "xhigh"), "outbound system has actual request identity and preserves its original purpose")?;
+    let repeated = request_identity_history(&history, &current)?;
+    routing_expect(repeated.serialize_string()?.as_str() == outbound.serialize_string()?.as_str() and history.serialize_string()?.as_str() == original.as_str(), "identity does not accumulate or enter persistent history")?;
+    let changed = request_identity_history(&history, &manual)?;
+    routing_expect(not str_contains(changed.serialize_string()?.as_str(), "active-a"), "switch/resume cannot retain stale identity")?;
+    let tools = agent_tools()?; let list = tools.root().object_get("tools")?; let mut found = false; let mut i = 0;
+    while i < list.array_len()? { if cli_json_optional_string(list.array_get(i)?, "name").as_str() == "list_models" { found = true; }; i = i + 1; };
+    let mut plan = policy_default(); plan.plan = true;
+    routing_expect(found and policy_decision(&plan, "list_models", false) == 0 and tool_spec("list_models").read_only, "directory is discoverable and read-only in Plan")?;
+    routing_expect(tool_spec_valid("list_models", &json_parse("{\"query\":\"terra\",\"offset\":0,\"limit\":32}")?) and not tool_spec_valid("list_models", &json_parse("{\"limit\":65}")?), "directory arguments are bounded")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let result = model_routing_tests();
+    if not result.is_ok() { return result.error; };
+    print("Model routing, inheritance and request identity checks passed"); 0
+}

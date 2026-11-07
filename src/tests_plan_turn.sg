@@ -1,0 +1,23 @@
+import permissions;
+
+def plan_expect(value: bool, label: &str) -> i64 {
+    if not value { cli_diagnostic(label); return 1; }; 0
+}
+
+def main() -> i64 {
+    let mut errors = 0; let mut policy = policy_default();
+    permission_apply(&mut policy, "full"); policy.plan = true;
+    let child = policy_child(&policy, "general");
+    errors = errors + plan_expect(policy_decision(&policy, "write_file", false) == 2 and policy_decision(&policy, "run_command", false) == 2 and policy_decision(&policy, "mcp__call", false) == 2, "Plan blocks every effectful route even over full permission");
+    errors = errors + plan_expect(policy_decision(&policy, "write_plan", true) == 0, "Only the designated plan file is writable");
+    policy_finish_plan(&mut policy);
+    errors = errors + plan_expect(not policy.plan and policy.full_access and policy.auto_edit and policy_decision(&policy, "write_file", false) == 0, "End of Plan restores the underlying selected permissions");
+    errors = errors + plan_expect(child.plan and policy_decision(&child, "write_file", false) == 2 and policy_decision(&child, "run_command", false) == 2, "Captured children cannot gain privileges when foreground Plan ends");
+    permission_apply(&mut policy, "manual"); policy.plan = true; policy_finish_plan(&mut policy);
+    errors = errors + plan_expect(policy_decision(&policy, "write_file", false) == 1 and policy_decision(&policy, "run_command", false) == 1, "Automatic Plan exit grants no approvals");
+    policy.plan = true; permission_apply(&mut policy, "auto");
+    errors = errors + plan_expect(policy.plan and policy_decision(&policy, "write_file", false) == 2, "Permission selection alone cannot bypass an active Plan turn");
+    policy_finish_plan(&mut policy);
+    errors = errors + plan_expect(policy_decision(&policy, "write_file", false) == 0 and policy_decision(&policy, "run_command", false) == 1, "After Plan, automatic file edits do not implicitly grant commands");
+    if errors == 0 { println("Plan turn: captured children, read-only guards and underlying approval policies passed"); }; errors
+}

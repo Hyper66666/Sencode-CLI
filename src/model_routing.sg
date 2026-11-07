@@ -1,0 +1,148 @@
+import model_selection;
+
+// Agent-facing directory: enabled targets only, with an explicit allowlist.
+// Never forward the configuration document, URL, database path or credentials.
+def model_routing_row(document: &JsonDoc, connection: JsonValue, model: JsonValue) -> Result<JsonValue, i64> {
+    let row = document.new_object()?;
+    let id = cli_json_string(connection, "id")?;
+    cli_put_string(document, row, "connection_id", id.as_str())?;
+    cli_put_string(document, row, "provider", model_selection_connection_label(connection, id.as_str()).as_str())?;
+    cli_put_string(document, row, "model", cli_json_string(model, "id")?.as_str())?;
+    let label = cli_json_optional_string(model, "label");
+    cli_put_string(document, row, "label", if label.len() > 0 { label.as_str() } else { cli_json_optional_string(model, "id").as_str() })?;
+    let protocol = cli_json_optional_string(connection, "protocol");
+    // `auto` is resolved from successfulProtocol by connection_with_effort at
+    // admission. It is a native target too; malformed settings fail there.
+    let native = cli_json_optional_string(connection, "kind").as_str() == "customApi" and (provider_protocol(protocol.as_str()) >= 0 or protocol.as_str() == "auto");
+    let ready = model_selection_ready(model_selection_status(connection).as_str());
+    cli_put_bool(document, row, "subagent_available", native and ready)?;
+    cli_put_string(document, row, "unavailable_reason", if cli_json_optional_string(connection, "kind").as_str() != "customApi" { "This account requires its managed runtime; native subagents cannot use it" } else { if not native { "Native API protocol is unavailable; configure a supported or successfully detected protocol" } else { if not ready { "Connection is not ready" } else { "" } } })?;
+    Result { is_ok: true, value: row, error: 0 }
+}
+
+// Deterministic search, not a model-name guess or an upstream catalog fetch.
+// Exact IDs outrank labels, then case-insensitive exacts, then substrings.
+def model_routing_score(model: JsonValue, query: &str) -> Result<i64, i64> {
+    if query.len() == 0 { return cli_ok(0); };
+    let id = cli_json_optional_string(model, "id");
+    let label = cli_json_optional_string(model, "label");
+    if id.as_str() == query { return cli_ok(5); };
+    if label.as_str() == query { return cli_ok(4); };
+    let folded = str_to_ascii_lower(query)?;
+    let lower_id = str_to_ascii_lower(id.as_str())?;
+    let lower_label = str_to_ascii_lower(label.as_str())?;
+    if lower_id.as_str() == folded.as_str() { return cli_ok(3); };
+    if lower_label.as_str() == folded.as_str() { return cli_ok(2); };
+    cli_ok(if str_contains(lower_id.as_str(), folded.as_str()) or str_contains(lower_label.as_str(), folded.as_str()) { 1 } else { 0 })
+}
+
+def model_routing_catalog(snapshot: &JsonDoc, query: &str, offset: i64, limit: i64) -> Result<JsonDoc, i64> {
+    if query.len() > 256 or offset < 0 or offset > 131072 or limit < 1 or limit > 64 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let result = json_doc_object()?;
+    let rows = result.new_array()?; result.root().object_set("models", rows)?;
+    let connections = snapshot.root().object_get("connections")?; let mut ci = 0; let mut total = 0;
+    if connections.array_len()? > 512 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    while ci < connections.array_len()? {
+        let connection = connections.array_get(ci)?; let models = model_selection_models(connection)?; let mut mi = 0;
+        if models.doc_handle != 0 { while mi < models.array_len()? and mi < 256 {
+            let model = models.array_get(mi)?;
+            if cli_json_optional_string(model, "id").len() > 0 and (query.len() == 0 or model_routing_score(model, query)? > 0) {
+                if total >= offset and total - offset < limit { rows.array_push(model_routing_row(&result, connection, model)?)?; (); };
+                total = total + 1;
+            }; mi = mi + 1;
+        }; };
+        ci = ci + 1;
+    };
+    cli_put_i64(&result, result.root(), "total", total)?; cli_put_i64(&result, result.root(), "offset", offset)?;
+    cli_put_i64(&result, result.root(), "next_offset", if offset + rows.array_len()? < total { offset + rows.array_len()? } else { -1 })?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def model_routing_resolved(connection: &str, model: &str, inherited: bool) -> Result<JsonDoc, i64> {
+    let result = json_doc_object()?;
+    cli_put_string(&result, result.root(), "status", "resolved")?;
+    cli_put_string(&result, result.root(), "connection_id", connection)?; cli_put_string(&result, result.root(), "model", model)?;
+    cli_put_bool(&result, result.root(), "inherited", inherited)?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+// Failures are structured tool results so the parent can clarify/correct them.
+// They never start a child, mutate defaults, fall back or consume model budget.
+def model_routing_resolve(snapshot: &JsonDoc, current: &ProviderConnection, requested_connection: &str, requested_model: &str) -> Result<JsonDoc, i64> {
+    let result = json_doc_object()?;
+    let candidates = result.new_array()?; result.root().object_set("candidates", candidates)?;
+    let connections = snapshot.root().object_get("connections")?;
+    if connections.array_len()? > 512 or requested_model.len() > 256 or requested_connection.len() > 256 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    let mut provider = cli_text(requested_connection);
+    if provider.len() > 0 and provider.as_str() != current.connection_id() {
+        let mut ci = 0; let mut exact = false; let mut matches = 0; let mut found = string_new();
+        while ci < connections.array_len()? {
+            let connection = connections.array_get(ci)?; let id = cli_json_optional_string(connection, "id");
+            if id.as_str() == requested_connection { exact = true; break; };
+            ci = ci + 1;
+        };
+        if not exact {
+            ci = 0; let query = str_to_ascii_lower(requested_connection)?;
+            while ci < connections.array_len()? {
+                let connection = connections.array_get(ci)?; let id = cli_json_optional_string(connection, "id");
+                if str_to_ascii_lower(model_selection_connection_label(connection, id.as_str()).as_str())?.as_str() == query.as_str() {
+                    found = id.clone()?; matches = matches + 1;
+                }; ci = ci + 1;
+            };
+            if matches != 1 { cli_put_string(&result, result.root(), "status", if matches > 1 { "ambiguous_connection" } else { "connection_not_found" })?; return Result { is_ok: true, value: result, error: 0 }; };
+            provider = found;
+        };
+    };
+    if (provider.len() == 0 or provider.as_str() == current.connection_id()) and (requested_model.len() == 0 or requested_model == current.model_id()) {
+        return model_routing_resolved(current.connection_id(), current.model_id(), true);
+    };
+    let mut query = cli_text(requested_model);
+    if query.len() == 0 {
+        let mut ci = 0;
+        while ci < connections.array_len()? {
+            let connection = connections.array_get(ci)?;
+            if cli_json_optional_string(connection, "id").as_str() == provider.as_str() { query = cli_json_optional_string(connection, "model"); break; };
+            ci = ci + 1;
+        };
+    };
+    // Two passes avoid storing an unbounded number of lower-ranked matches.
+    let mut best = 0; let mut ci = 0;
+    while ci < connections.array_len()? {
+        let connection = connections.array_get(ci)?;
+        if provider.len() == 0 or cli_json_optional_string(connection, "id").as_str() == provider.as_str() {
+            let models = model_selection_models(connection)?; let mut mi = 0;
+            if models.doc_handle != 0 { while mi < models.array_len()? and mi < 256 {
+                let score = model_routing_score(models.array_get(mi)?, query.as_str())?; if score > best { best = score; }; mi = mi + 1;
+            }; };
+        }; ci = ci + 1;
+    };
+    let mut total = 0; let mut current_index = -1; let mut same_model = true; let mut first_model = string_new(); ci = 0;
+    while best > 0 and ci < connections.array_len()? {
+        let connection = connections.array_get(ci)?; let id = cli_json_optional_string(connection, "id");
+        if provider.len() == 0 or id.as_str() == provider.as_str() {
+            let models = model_selection_models(connection)?; let mut mi = 0;
+            if models.doc_handle != 0 { while mi < models.array_len()? and mi < 256 {
+                let model = models.array_get(mi)?;
+                if model_routing_score(model, query.as_str())? == best {
+                    let model_id = cli_json_optional_string(model, "id");
+                    if total == 0 { first_model = model_id.clone()?; } else { if model_id.as_str() != first_model.as_str() { same_model = false; }; };
+                    if id.as_str() == current.connection_id() and total < 64 { current_index = total; };
+                    if total < 64 { candidates.array_push(model_routing_row(&result, connection, model)?)?; (); };
+                    total = total + 1;
+                }; mi = mi + 1;
+            }; };
+        }; ci = ci + 1;
+    };
+    cli_put_i64(&result, result.root(), "total", total)?;
+    let chosen = if total == 1 { 0 } else { if same_model and total <= 64 { current_index } else { -1 } };
+    if chosen >= 0 {
+        let target = candidates.array_get(chosen)?;
+        if target.object_get("subagent_available")?.bool_value()? {
+            let id = cli_json_string(target, "connection_id")?; let model = cli_json_string(target, "model")?;
+            return model_routing_resolved(id.as_str(), model.as_str(), id.as_str() == current.connection_id() and model.as_str() == current.model_id());
+        };
+        cli_put_string(&result, result.root(), "status", "unsupported")?;
+    } else { cli_put_string(&result, result.root(), "status", if total == 0 { "model_not_found" } else { "ambiguous_model" })?; };
+    cli_put_string(&result, result.root(), "hint", "Use list_models with a name fragment; for ambiguous matches ask the user, then pass the exact model and connection_id. Only enabled configured models are searched.")?;
+    Result { is_ok: true, value: result, error: 0 }
+}

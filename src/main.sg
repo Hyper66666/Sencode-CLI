@@ -9,6 +9,7 @@ import extension_commands;
 import project_history;
 import session_target;
 import session_permissions;
+import input_history;
 
 def main_resume(state: &CliState, cwd: &str, requested: &str) -> Result<String, i64> {
     if requested.len() > 0 {
@@ -84,7 +85,7 @@ def main_welcome(state: &CliState, options: &AgentOptions, terminal: &Terminal) 
 def main_interactive(state: &CliState, options: &mut AgentOptions, maximum_requests: i64, token_budget: i64, terminal: &Terminal, plain: bool, permission_profile: &str) -> Result<i64, i64> {
     let mut profile = cli_text(permission_profile);
     session_permissions_save(state, options.session.as_str(), &options.policy, options.allow_commands, profile.as_str())?;
-    let history: Vec<InputHistory> = vec_new();
+    let mut history = input_history_load(state, options.session.as_str())?;
     let styled = terminal.is_tty() and options.format.as_str() == "text" and not plain;
     let remembered = session_target_save(state, options.session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str());
     if not remembered.is_ok() { ui_output("Model selection could not be saved while this session is active or unavailable.\n")?; (); };
@@ -101,10 +102,10 @@ def main_interactive(state: &CliState, options: &mut AgentOptions, maximum_reque
             };
         };
         let read = ui_read_prompt_mode(terminal, &history, &options.input, status.as_str(), styled);
-        if not read.is_ok() { if read.error == 19 { continue; }; if read.error == 5 { return cli_ok(0); }; return cli_fail(read.error); };
+        if not read.is_ok() { policy_finish_plan(&mut options.policy); if read.error == 19 { continue; }; if read.error == 5 { return cli_ok(0); }; return cli_fail(read.error); };
         let mut prompt = str_trim(read.value.as_str())?;
         if prompt.len() == 0 { continue; };
-        history.push(InputHistory { text: prompt.clone()? });
+        input_history_add(&history, prompt.as_str())?; input_history_save(state, options.session.as_str(), &history)?;
         if str_starts_with(prompt.as_str(), "/") {
             let parsed = slash_command(prompt.as_str())?;
             let command = cli_json_string(parsed.root(), "command")?;
@@ -140,6 +141,7 @@ def main_interactive(state: &CliState, options: &mut AgentOptions, maximum_reque
                 let resumed = main_resume(state, options.cwd.as_str(), value.as_str());
                 if not resumed.is_ok() { ui_output("No user conversation matches this project. Use sen -r to choose one.\n")?; continue; };
                 options.session = resumed.value;
+                history = input_history_load(state, options.session.as_str())?;
                 let target = session_target_restore(state, options.session.as_str(), "", "", "")?;
                 if target.root().object_get("restored")?.bool_value()? { options.connection = cli_json_string(target.root(), "connection")?; options.model = cli_json_string(target.root(), "model")?; options.effort = cli_json_string(target.root(), "effort")?; };
                 let permissions = session_permissions_restore(state, options.session.as_str(), &mut options.policy)?;
@@ -147,8 +149,7 @@ def main_interactive(state: &CliState, options: &mut AgentOptions, maximum_reque
                 profile = cli_json_string(permissions.root(), "profile")?;
                 options.plan_path = path_join_string(workspace_path(options.cwd.as_str(), ".sencode/plans")?.as_str(), options.session.as_str())?;
                 options.plan_path.push_str(".md")?;
-                let plan = cli_state_mode_load(state, options.session.as_str(), "plan")?;
-                options.policy.plan = plan.root().object_has("value") and plan.root().object_get("value")?.object_get("active")?.bool_value()?;
+                policy_finish_plan(&mut options.policy);
                 options.goal_text = string_new();
                 if styled { main_welcome(state, options, terminal)?; (); };
                 ui_output("Session selected. Saved Goals remain paused until /goal resume.\n")?;
@@ -174,7 +175,7 @@ def main_interactive(state: &CliState, options: &mut AgentOptions, maximum_reque
             if command.as_str() == "/plan" {
                 if value.as_str() == "approve" { options.policy.plan = false; ui_output("Plan approved; execution permissions still apply.\n")?; continue; };
                 options.policy.plan = true;
-                if value.len() == 0 { ui_output("Plan mode enabled. /plan approve permits execution.\n")?; continue; };
+                if value.len() == 0 { ui_output("Plan mode enabled for the next turn only; it exits when that turn finishes or stops.\n")?; continue; };
                 prompt = value.clone()?;
             } else { if command.as_str() == "/goal" {
                 if value.as_str() == "pause" { options.goal_text = string_new(); ui_output("Goal paused. Use /goal resume to continue explicitly.\n")?; continue; };
@@ -298,11 +299,8 @@ def main_run() -> Result<i64, i64> {
         if arguments.root().object_has("permissions") { if not permission_apply(&mut options.policy, cli_json_string(arguments.root(), "permissions")?.as_str()) { return cli_ok(2); }; options.allow_commands = options.policy.full_access; };
         if arguments.root().object_has("allow-commands") { options.allow_commands = true; };
     };
-    let plan_mode = cli_state_mode_load(&state, session.as_str(), "plan")?;
-    if plan_mode.root().object_has("value") {
-        let saved = plan_mode.root().object_get("value")?;
-        if saved.object_has("active") { options.policy.plan = options.policy.plan or saved.object_get("active")?.bool_value()?; };
-    };
+    // Plan is explicitly armed by --plan or /plan, never restored from session
+    // metadata (including legacy active=true written before turn scoping).
     let maximum_requests = cli_parse_unsigned(cli_option(&arguments, "max-requests", "50")?.as_str(), 10)?;
     let token_budget = cli_parse_unsigned(cli_option(&arguments, "token-budget", "0")?.as_str(), 10)?;
     if maximum_requests < 1 or maximum_requests > 10000 { return cli_ok(2); };

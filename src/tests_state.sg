@@ -55,6 +55,11 @@ def state_acceptance(database: &str,cwd: &str) -> Result<bool,i64> {
     let streaming_result = json_parse("{\"role\":\"assistant\",\"content\":\"partial中文 done\",\"tool_calls\":[]}")?;
     cli_state_stream_finish(&state,&first,streaming.as_str(),&streaming_result)?;
     state_expect(not cli_state_stream_delta(&state,&first,streaming.as_str(),"late").is_ok(),"completed stream refuses delayed delta")?;
+    state_expect(not cli_state_stream_discard(&state,&first,streaming.as_str()).is_ok(),"retry cannot remove a completed assistant")?;
+    let partial = cli_state_stream_start(&state,&first)?;
+    cli_state_stream_delta(&state,&first,partial.as_str(),"failed attempt partial")?;
+    cli_state_stream_discard(&state,&first,partial.as_str())?;
+    state_expect(not cli_state_stream_delta(&state,&first,partial.as_str(),"late").is_ok(),"retry retires only its provisional stream and refuses late deltas")?;
     state_expect(cli_state_tool_claim(&state,&first,"call-1","write_file","{}")?,"first tool claim")?;
     state_expect(not cli_state_tool_claim(&state,&first,"call-1","write_file","{}")?,"duplicate tool cannot rerun")?;
     cli_state_tool_complete(&state,&first,"call-1","done")?;

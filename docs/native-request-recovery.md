@@ -1,8 +1,10 @@
+Current defaults and diagnostics: [Network and context recovery](network-context-recovery.md).
+
 # Native request recovery and context limits
 
 The API coordinator retries HTTP 429/500/502/503/504 before stream output, or a
-terminal connect/timeout failure only when the transport proves it never
-attempted an application write. Maximum three attempts and 30 seconds aggregate
+terminal connect/timeout/TLS-handshake failure only when the transport proves it never
+attempted an application write. The initial attempt plus at most five retries and 30 seconds aggregate
 backoff apply. Valid bounded Retry-After seconds and HTTP dates are honored;
 over-bound or malformed delays stop. Cancellation stays available in backoff.
 Every attempt has its own ID and consumes the same request budget. Provider
@@ -32,8 +34,8 @@ quota. Optional `.sencode/context.json` is strict schema 1:
 ```
 
 The same numeric fields at the top level provide workspace defaults. Default
-window is 262144, threshold 85%, target occupancy 50%, and serialized input
-ceiling 524288 bytes. Exact connection/model overrides take precedence.
+window is 262144, threshold80%, target occupancy 50%, and serialized input
+ceiling655360 bytes. Exact connection/model overrides take precedence.
 Existing schema 1 documents remain readable; an explicit older 80% threshold is
 honored, while omitted fields use the current defaults. If an older trigger is
 50% or lower and no target was declared, the target adapts to half the trigger,

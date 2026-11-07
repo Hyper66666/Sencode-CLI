@@ -307,11 +307,11 @@ def state_history_json_error(code: i64) -> Result<i64, i64> {
     cli_ok(if message.as_str() == "json node limit exceeded" { 13 } else { code })
 }
 
-def state_history_window(state: &CliState, id: &str, start: i64, count: i64, total: i64, max_bytes: i64, max_rows: i64) -> Result<JsonDoc, i64> {
+def state_history_window_limits(state: &CliState, id: &str, start: i64, count: i64, total: i64, max_bytes: i64, max_rows: i64, max_nodes: i64) -> Result<JsonDoc, i64> {
     if start < 0 or count < 0 or start > total or count > total - start or max_bytes < 64 or max_bytes > 16777216 or max_rows < 0 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
-    // A bounded JSON document admits at most 4096 nodes/links. The row check
-    // avoids scanning arbitrarily large stores; structured rows may hit that
-    // node bound earlier, which also returns 13 without a partial document.
+    // Callers may opt into a larger explicit node budget for canonical context.
+    // Row/byte bounds still precede reads; node exhaustion returns13 without
+    // a successful partial document. Legacy public/UI callers retain4096.
     if count > max_rows or count > 4090 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
     let input_bytes = {
         let mut size = state.db.prepare("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (SELECT CASE WHEN h.message_json IS NULL THEN length(CAST(m.role AS BLOB))+length(CAST(m.text AS BLOB))+32 ELSE length(CAST(h.message_json AS BLOB)) END AS bytes FROM messages m LEFT JOIN shared_history h ON h.message_id=m.id WHERE m.session_id=? ORDER BY m.revision,m.created_at,m.id LIMIT ? OFFSET ?)")?;
@@ -324,7 +324,7 @@ def state_history_window(state: &CliState, id: &str, start: i64, count: i64, tot
     // snapshots must not exhaust aggregate admission merely by being small.
     let mut document_bytes = input_bytes * 6 + 512;
     if document_bytes > max_bytes { document_bytes = max_bytes; };
-    let document = json_doc_object_bounded(document_bytes)?;
+    let document = if max_nodes == 4096 { json_doc_object_bounded(document_bytes)? } else { json_doc_object_limits(document_bytes, max_nodes)? };
     let items = document.new_array()?;
     document.root().object_set("messages", items)?;
     cli_put_i64(&document, document.root(), "total_messages", total)?;
@@ -350,7 +350,7 @@ def state_history_window(state: &CliState, id: &str, start: i64, count: i64, tot
         } else {
             let raw = query.text(2)?;
             if raw.len() != raw.as_str().len() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
-            let parsed = json_parse_bounded(raw.as_str(), if raw.len() > 0 { raw.len() } else { 1 });
+            let parsed = if max_nodes == 4096 { json_parse_bounded(raw.as_str(), if raw.len() > 0 { raw.len() } else { 1 }) } else { json_parse_limits(raw.as_str(), if raw.len() > 0 { raw.len() } else { 1 }, max_nodes) };
             if not parsed.is_ok() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: state_history_json_error(parsed.error)? }; };
             let copied = document.copy(parsed.value.root());
             if not copied.is_ok() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: state_history_json_error(copied.error)? }; };
@@ -363,6 +363,10 @@ def state_history_window(state: &CliState, id: &str, start: i64, count: i64, tot
     // declared bound, including control-character expansion in desktop text.
     document.serialize_string()?;
     Result { is_ok: true, value: document, error: 0 }
+}
+
+def state_history_window(state: &CliState, id: &str, start: i64, count: i64, total: i64, max_bytes: i64, max_rows: i64) -> Result<JsonDoc, i64> {
+    state_history_window_limits(state, id, start, count, total, max_bytes, max_rows, 4096)
 }
 
 def cli_state_history_range(state: &CliState, id: &str, start: i64, count: i64) -> Result<JsonDoc, i64> {
@@ -524,6 +528,19 @@ def cli_state_tool_result(state: &CliState, session: &str, call_id: &str) -> Res
     query.text(0)
 }
 
+// Reserve an unadmitted interrupted call without creating a running operation.
+// A crash before its public result is appended can recover this exact record.
+def cli_state_tool_skip(state: &CliState, execution: &CliExecution, call_id: &str, name: &str, arguments: &str, result: &str) -> Result<bool, i64> {
+    let mut tx = state.db.transaction()?; state_tx_exec_valid(&tx, state, execution)?;
+    let mut insert = tx.prepare("INSERT INTO shared_tool_ledger(session_id,call_id,execution_id,fence,name,arguments,state,result,updated_at) VALUES(?,?,?,?,?,?,'complete',?,?) ON CONFLICT(session_id,call_id) DO NOTHING")?;
+    insert.bind_text(1,execution.session.as_str())?; insert.bind_text(2,call_id)?;
+    insert.bind_text(3,execution.id.as_str())?; insert.bind_i64(4,execution.fence)?;
+    insert.bind_text(5,name)?; insert.bind_text(6,arguments)?; insert.bind_text(7,result)?; insert.bind_i64(8,time_unix_ms())?; insert.step()?;
+    let mut count = tx.prepare("SELECT changes()")?; count.step()?;
+    if count.integer(0)? != 1 { return state_bool_error(12); };
+    tx.commit()?; Result { is_ok: true, value: true, error: 0 }
+}
+
 def cli_state_finish(state: &CliState, execution: &mut CliExecution, status: &str) -> Result<bool, i64> {
     state_exec_valid(state,execution)?;
     if status != "idle" and status != "error" and status != "interrupted" { return state_bool_error(2); };
@@ -583,6 +600,19 @@ def cli_state_stream_finish(state: &CliState,execution: &CliExecution,id: &str,m
     structured.bind_text(3,raw.as_str())?; structured.bind_text(4,execution.id.as_str())?; structured.bind_i64(5,execution.fence)?; structured.step()?;
     tx.commit()?;
     Result {is_ok:true,value:true,error:0}
+}
+
+// A retry replaces only this attempt's unaccepted streaming placeholder. A
+// completed assistant/tool record can never match; execution fencing applies.
+def cli_state_stream_discard(state: &CliState, execution: &CliExecution, id: &str) -> Result<bool, i64> {
+    if id.len() == 0 { return Result { is_ok: true, value: true, error: 0 }; };
+    let mut tx = state.db.transaction()?;
+    state_tx_exec_valid(&tx, state, execution)?;
+    let mut remove = tx.prepare("DELETE FROM messages WHERE id=? AND session_id=? AND shared_fence=? AND role='assistant' AND completed_at IS NULL AND NOT EXISTS(SELECT 1 FROM shared_history WHERE message_id=messages.id)")?;
+    remove.bind_text(1, id)?; remove.bind_text(2, execution.session.as_str())?; remove.bind_i64(3, execution.fence)?; remove.step()?;
+    let mut count = tx.prepare("SELECT changes()")?; count.step()?;
+    if count.integer(0)? != 1 { return state_bool_error(7); };
+    tx.commit()?; Result { is_ok: true, value: true, error: 0 }
 }
 
 def cli_state_workspace_lock(state: &CliState, cwd: &str) -> Result<FileLock, i64> {
@@ -685,16 +715,28 @@ def cli_state_connection_remove(state: &CliState,id: &str) -> Result<bool,i64> {
 }
 
 def cli_state_mode_save(state: &CliState,execution: &CliExecution,kind: &str,value: &JsonDoc) -> Result<bool,i64> {
-    state_exec_valid(state,execution)?;
-    let mut current = cli_state_modes(state,execution.session.as_str())?;
-    current.root().object_set(kind,current.copy(value.root())?)?;
-    let raw = current.serialize_string()?;
+    let path = state_mode_path(kind)?; let raw = value.serialize_string()?;
     let mut tx = state.db.transaction()?;
     state_tx_exec_valid(&tx,state,execution)?;
-    let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET mode_json=excluded.mode_json,updated_at=excluded.updated_at")?;
-    save.bind_text(1,execution.session.as_str())?; save.bind_text(2,raw.as_str())?; save.bind_i64(3,time_unix_ms())?; save.step()?;
+    // Patch only the selected branch in SQLite. Other independent modes must
+    // not consume this operation's JSON arena or be copied twice on replacement.
+    let mut size = tx.prepare("SELECT length(CAST(json_set(COALESCE((SELECT mode_json FROM shared_modes WHERE session_id=?),'{}'),?,json(?)) AS BLOB))")?;
+    size.bind_text(1,execution.session.as_str())?; size.bind_text(2,path.as_str())?; size.bind_text(3,raw.as_str())?; size.step()?;
+    if size.integer(0)? > 16777216 { return state_bool_error(13); };
+    let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,json_set('{}',?,json(?)),?) ON CONFLICT(session_id) DO UPDATE SET mode_json=json_set(shared_modes.mode_json,?,json(?)),updated_at=excluded.updated_at")?;
+    save.bind_text(1,execution.session.as_str())?; save.bind_text(2,path.as_str())?; save.bind_text(3,raw.as_str())?; save.bind_i64(4,time_unix_ms())?;
+    save.bind_text(5,path.as_str())?; save.bind_text(6,raw.as_str())?; save.step()?;
     tx.commit()?;
     Result { is_ok:true,value:true,error:0 }
+}
+
+def state_mode_path(kind: &str) -> Result<String,i64> {
+    if kind.len() < 1 or kind.len() > 128 { return string_result_err(2); };
+    let source = cli_text(kind); let chars = source.chars(); let mut valid = true;
+    loop { let next = chars.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?;
+        if not (cp >= 65 and cp <= 90 or cp >= 97 and cp <= 122 or cp >= 48 and cp <= 57 or cp == 95) { valid = false; }; ();
+    }; chars.free(); if not valid { return string_result_err(2); };
+    cli_join("$.",kind)
 }
 
 def cli_state_modes(state: &CliState,session: &str) -> Result<JsonDoc,i64> {
@@ -706,12 +748,11 @@ def cli_state_modes(state: &CliState,session: &str) -> Result<JsonDoc,i64> {
 }
 
 def cli_state_mode_load(state: &CliState,session: &str,kind: &str) -> Result<JsonDoc,i64> {
-    let modes = cli_state_modes(state,session)?;
-    if not modes.root().object_has(kind) { return json_doc_object(); };
-    let result = json_doc_object()?;
-    // Copy members using a wrapper to preserve arbitrary structured mode state.
-    result.root().object_set("value",result.copy(modes.root().object_get(kind)?)?)?;
-    Result { is_ok:true,value:result,error:0 }
+    let path = state_mode_path(kind)?;
+    let mut query = state.db.prepare("SELECT json_object('value',json(mode_json -> ?)) FROM shared_modes WHERE session_id=? AND json_type(mode_json,?) IS NOT NULL")?;
+    query.bind_text(1,path.as_str())?; query.bind_text(2,session)?; query.bind_text(3,path.as_str())?;
+    if not query.step()? { return json_doc_object(); };
+    let raw = query.text(0)?; if kind == "context" { json_parse_limits(raw.as_str(), 1048576, 32768) } else { if kind == "request_attempts" { json_parse_limits(raw.as_str(), 1048576, 8192) } else { json_parse(raw.as_str()) } }
 }
 
 def cli_state_usage(state: &CliState,execution: &CliExecution,request_id: &str,connection: &str,model: &str,input_tokens: i64,output_tokens: i64) -> Result<bool,i64> {

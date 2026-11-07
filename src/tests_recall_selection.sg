@@ -1,0 +1,83 @@
+import tui;
+
+def recall_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return Result { is_ok: false, value: false, error: 99 }; }; tui_true()
+}
+def recall_key(code: i64) -> TerminalEvent { TerminalEvent { kind: 1, code: code, modifiers: 0, width: 120, height: 40, data: string_new() } }
+def recall_mouse(row: i64, column: i64, action: i64, button: i64) -> TerminalMouseEvent {
+    TerminalMouseEvent { row: row, column: column, action: action, button: button, scroll_x: 0, scroll_y: 0, clicks: 1, modifiers: 0 }
+}
+
+def recall_tests() -> Result<bool, i64> {
+    let mut app = tui_new("fixture", "", "", "a"); tui_resize(&mut app, 120, 40)?;
+    let mut index = 0;
+    while index < 13 { let text = cli_text("input "); text.push_i64(index)?; tui_remember(&mut app, text.as_str())?; index = index + 1; };
+    recall_expect(app.history.len() == 10 and app.history.get(0).text.as_str() == "input 3", "recall holds exactly the latest ten")?;
+    tui_remember(&mut app, "input 12")?; recall_expect(app.history.len() == 10, "consecutive duplicate recall is coalesced")?;
+    tui_set_draft(&mut app, "unsent 中文")?;
+    let up = recall_key(1001); let down = recall_key(1002);
+    index = 0; while index < 12 { tui_event(&mut app, &up)?; index = index + 1; };
+    recall_expect(app.draft.as_str() == "input 3" and app.history_index == 0, "Up stops at the oldest retained input")?;
+    index = 0; while index < 10 { tui_event(&mut app, &down)?; index = index + 1; };
+    recall_expect(app.draft.as_str() == "unsent 中文", "Down restores the original unsent draft")?;
+    tui_remember(&mut app, "first line\nsecond 中文")?; tui_set_draft(&mut app, "")?;
+    tui_event(&mut app, &up)?; tui_event(&mut app, &up)?;
+    recall_expect(app.draft.as_str() == "input 12", "successive Up browses multiline history in one step")?;
+    tui_message(&mut app, "user", "start")?;
+    tui_message(&mut app, "assistant", "alpha 中文 e\u{301} 👨\u{200d}👩\u{200d}👧 end\nsecond selectable line")?;
+    tui_set_draft(&mut app, "keep draft")?;
+    let frame = tui_frame_rows(&app)?; let mut row = 2;
+    while row < frame.len() and not str_contains(frame.get(row).text.as_str(), "alpha 中文") { row = row + 1; };
+    recall_expect(row < frame.len(), "selection fixture output is visible")?;
+    let margin = (app.width - tui_content_width(&app)) / 2;
+    let press = recall_mouse(row, margin + 6, 1, 1); tui_mouse(&mut app, &press)?;
+    let release_same = recall_mouse(row, margin + 6, 2, 1); tui_mouse(&mut app, &release_same)?;
+    recall_expect(not selection_has(&app.selection) and selection_text(&app.selection)?.len() == 0, "click without a drag never selects or copies")?;
+    tui_mouse(&mut app, &press)?;
+    let drag = recall_mouse(row, margin + 8, 3, 1); tui_mouse(&mut app, &drag)?;
+    let release = recall_mouse(row, margin + 8, 2, 1); tui_mouse(&mut app, &release)?;
+    recall_expect(selection_text(&app.selection)?.as_str() == "中文", "cell selection expands both ends to whole CJK graphemes")?;
+    let selected = tui_paint_update(&mut app, true)?;
+    recall_expect(str_contains(selected.as_str(), "\x1b[30;47m") and app.draft.as_str() == "keep draft", "selection highlights output without editing the draft")?;
+    let copy = recall_key(3); let copied = tui_event(&mut app, &copy)?;
+    recall_expect(copied.kind == 6 and copied.text.as_str() == "中文", "Ctrl+C copies selection instead of cancelling")?;
+    let right = recall_mouse(row, margin + 8, 1, 3);
+    recall_expect(tui_mouse(&mut app, &right)?.kind == 6, "right click requests explicit clipboard copy")?;
+    tui_message(&mut app, "assistant", "stream arrived behind selection")?;
+    recall_expect(not str_contains(tui_frame(&app)?.as_str(), "stream arrived behind selection") and selection_text(&app.selection)?.as_str() == "中文", "new output does not move the selected snapshot")?;
+    let esc = recall_key(27); recall_expect(tui_event(&mut app, &esc)?.kind == 0 and not selection_has(&app.selection), "Esc clears selection without cancellation")?;
+    recall_expect(str_contains(tui_frame(&app)?.as_str(), "stream arrived behind selection"), "clearing selection returns to current output")?;
+    recall_expect(selection_cell_byte("e\u{301}👨\u{200d}👩\u{200d}👧", 2, false)? == 3, "emoji continuation cells snap to the start of a complete grapheme")?;
+    tui_mouse(&mut app, &release)?;
+    let reverse_start = recall_mouse(row, margin + 8, 1, 1); let reverse_end = recall_mouse(row, margin + 6, 2, 1);
+    tui_mouse(&mut app, &reverse_start)?; tui_mouse(&mut app, &reverse_end)?;
+    recall_expect(selection_text(&app.selection)?.as_str() == "中文", "reverse drag selects the same complete characters")?;
+    recall_expect(str_contains(tui_paint_update(&mut app, false)?.as_str(), "\x1b[30;47m"), "selection remains visible with semantic colors disabled")?;
+    tui_event(&mut app, &esc)?;
+    tui_mouse(&mut app, &press)?;
+    let next_line = recall_mouse(row + 1, margin + 5, 2, 1); tui_mouse(&mut app, &next_line)?;
+    let multiline = selection_text(&app.selection)?;
+    recall_expect(str_contains(multiline.as_str(), "中文") and str_contains(multiline.as_str(), "\nsecond"), "multiline selection follows rendered row order")?;
+    tui_set_approval(&mut app, "nonce", "fresh approval", false)?;
+    recall_expect(not app.selection.active and tui_event(&mut app, &copy)?.kind != 6, "an approval clears selection and owns subsequent keys")?;
+    app.approval.clear();
+    tui_tool(&mut app, "wait-1", "wait_agents", "completed", "", "")?;
+    tui_tool(&mut app, "wait-2", "wait_agents", "completed", "", "")?;
+    tui_tool(&mut app, "list-1", "list_agents", "completed", "", "")?;
+    let group_slot = tui_tool_slot(&app, "wait-1"); let group_id = app.messages.get(group_slot).id;
+    let mut groups = 0; index = 0;
+    while index < app.transcript.len() { if app.transcript.get(index).message_id == group_id and app.transcript.get(index).style == 13 { groups = groups + 1; }; index = index + 1; };
+    let grouped = tui_frame(&app)?;
+    recall_expect(groups == 1 and str_contains(grouped.as_str(), "Agent status") and str_contains(grouped.as_str(), "3 checks"), "consecutive wait/list calls project one collapsed group")?;
+    tui_group_toggle(&mut app, group_id)?;
+    recall_expect(str_contains(tui_frame(&app)?.as_str(), "wait_agents"), "coordination details remain expandable")?;
+    tui_tool(&mut app, "read-1", "read_file", "completed", "source.sg", "")?;
+    recall_expect(tui_group_start(&app, tui_tool_slot(&app, "read-1")) == tui_tool_slot(&app, "read-1"), "read groups do not merge into coordination groups")?;
+    tui_tool(&mut app, "wait-error", "wait_agents", "failed", "", "wait failure visible")?;
+    recall_expect(str_contains(tui_frame(&app)?.as_str(), "wait failure visible"), "failed waits remain visible while collapsed")?;
+    tui_resize(&mut app, 80, 30)?;
+    recall_expect(not app.selection.active, "resize clears stale selection hit targets")?;
+    tui_true()
+}
+
+def main() -> i64 { let result = recall_tests(); if not result.is_ok() { println(result.error); return 1; }; println("session recall, coordination grouping and output selection passed"); 0 }

@@ -158,10 +158,38 @@ def provider_build_request_checked_with_effort(protocol: i64, model: &str, effor
     if protocol < 0 or protocol > 2 or model.len() == 0 { return string_result_err(2); };
     if not provider_effort_valid(effort) { return string_result_err(2); };
     if body_limit < 1 or body_limit > 16777216 { return string_result_err(2); };
-    let document = if images_allowed { json_doc_object_bounded(body_limit)? } else { json_doc_object()? };
+    let size = history.serialize_string()?.len() + tools.serialize_string()?.len();
+    let document = json_doc_object_limits(if images_allowed { body_limit } else { if size * 2 + 65536 < body_limit { size * 2 + 65536 } else { body_limit } }, 65536)?;
     let root = document.root();
     cli_put_string(&document, root, "model", model)?;
     cli_put_bool(&document, root, "stream", true)?;
+    let window = cli_json_optional_i64(history.root(), "context_window_tokens", 262144);
+    let maximum = cli_json_optional_i64(history.root(), "max_output_tokens", 131072);
+    if window < 64 or window > 1048576 or maximum < 1 or maximum > 1048576 { return string_result_err(2); };
+    // Base64 is wire transport, not text context. Keep wire-byte admission
+    // independent; use an explicit conservative image estimate per input.
+    let mut text_bytes = size; let mut image_tokens = 0; let mut image_row = 0;
+    let history_rows = history.root().object_get("messages")?;
+    while image_row < history_rows.array_len()? {
+        let row = history_rows.array_get(image_row)?;
+        if row.object_has("content_parts") {
+            let parts = row.object_get("content_parts")?; let mut part_index = 0;
+            if parts.array_len()? > 64 { return string_result_err(13); };
+            while part_index < parts.array_len()? {
+                let part = parts.array_get(part_index)?;
+                if cli_json_optional_string(part, "type").as_str() == "image" and part.object_has("data") {
+                    let data = cli_json_string(part, "data")?;
+                    if data.len() > text_bytes { return string_result_err(10); };
+                    text_bytes = text_bytes - data.len(); image_tokens = image_tokens + 4096;
+                }; part_index = part_index + 1;
+            };
+        }; image_row = image_row + 1;
+    };
+    let estimated = (text_bytes + 2) / 3 + history_rows.array_len()? * 16 + image_tokens;
+    let remaining = window - estimated - 32;
+    if remaining < 1 or protocol == 1 and (maximum < 16 or remaining < 16) { return string_result_err(13); };
+    let output_limit = if maximum < remaining { maximum } else { remaining };
+    cli_put_i64(&document, root, if protocol == 0 { "max_completion_tokens" } else { if protocol == 1 { "max_output_tokens" } else { "max_tokens" } }, output_limit)?;
     if protocol == 1 {
         cli_put_bool(&document, root, "store", false)?;
         let include = document.new_array()?;
@@ -267,7 +295,7 @@ def provider_build_request_checked_with_effort(protocol: i64, model: &str, effor
         index = index + 1;
     };
     root.object_set(if protocol == 1 { "input" } else { "messages" }, messages)?;
-    if protocol == 2 { cli_put_i64(&document, root, "max_tokens", 8192)?; cli_put_string(&document, root, "system", system.as_str())?; (); };
+    if protocol == 2 { cli_put_string(&document, root, "system", system.as_str())?; (); };
     if protocol == 0 {
         let options = document.new_object()?;
         cli_put_bool(&document, options, "include_usage", true)?;
@@ -345,16 +373,43 @@ struct ProviderTurn {
     // -1 missing, 0 explicit false, 1 explicit true. Message phase never
     // substitutes for the provider's turn-completion signal.
     responses_end_turn: i64,
+    // Closed diagnostic category; never retain provider error messages.
+    failure_kind: i64,
 }
 
 def provider_turn() -> ProviderTurn {
     let calls: Vec<ProviderToolCall> = vec_new();
     let reasoning_items: Vec<String> = vec_new();
     let reasoning_indices: Vec<i64> = vec_new();
-    ProviderTurn { content: string_new(), calls: calls, reasoning_items: reasoning_items, reasoning_indices: reasoning_indices, done: false, input_tokens: 0, output_tokens: 0, finish_reason: string_new(), reasoning: false, activity: 0, usage_reported: false, responses_end_turn: -1 }
+    ProviderTurn { content: string_new(), calls: calls, reasoning_items: reasoning_items, reasoning_indices: reasoning_indices, done: false, input_tokens: 0, output_tokens: 0, finish_reason: string_new(), reasoning: false, activity: 0, usage_reported: false, responses_end_turn: -1, failure_kind: 0 }
 }
 
 impl ProviderTurn {
+    def failure_label(&self) -> &str {
+        if self.failure_kind == 1 { return "Provider reported a failed response"; };
+        if self.failure_kind == 2 { return "Provider reported an incomplete response"; };
+        if self.failure_kind == 3 { return "Provider reported a stream error"; };
+        if self.failure_kind == 4 or self.finish_reason.as_str() == "length" or self.finish_reason.as_str() == "max_tokens" { return "Provider output token limit reached"; };
+        if self.failure_kind == 5 or self.finish_reason.as_str() == "content_filter" { return "Provider content filter stopped the response"; };
+        if self.failure_kind == 6 or self.finish_reason.as_str() == "refusal" { return "Provider refused the response"; };
+        if self.failure_kind == 7 { return "Provider rate limit reported inside the stream"; };
+        if self.failure_kind == 8 { return "Invalid provider event JSON"; };
+        if self.failure_kind == 9 { return "Provider event exceeded the local JSON byte, node or memory limit"; };
+        if self.failure_kind == 10 { return "Invalid provider event fields, identity or tool arguments"; };
+        ""
+    }
+
+    def classify_failure(&mut self, value: JsonValue) -> Result<bool, i64> {
+        if value.kind()? != JSON_KIND_OBJECT() { return Result { is_ok: true, value: false, error: 0 }; };
+        let code = cli_json_optional_string(value, "code");
+        let kind = cli_json_optional_string(value, "type");
+        let reason = cli_json_optional_string(value, "reason");
+        if code.as_str() == "max_output_tokens" or reason.as_str() == "max_output_tokens" or reason.as_str() == "max_tokens" { self.failure_kind = 4; };
+        if code.as_str() == "content_filter" or reason.as_str() == "content_filter" { self.failure_kind = 5; };
+        if code.as_str() == "rate_limit_exceeded" or kind.as_str() == "rate_limit_error" { self.failure_kind = 7; };
+        Result { is_ok: true, value: true, error: 0 }
+    }
+
     def retain_reasoning(&mut self, output_index: i64, item: JsonValue) -> Result<bool, i64> {
         if output_index < 0 or output_index > 4096 { return Result { is_ok: false, value: false, error: 10 }; };
         let kind = cli_json_string(item, "type")?;
@@ -445,11 +500,27 @@ impl ProviderTurn {
     }
 
     def event(&mut self, protocol: i64, data: &str) -> Result<String, i64> {
+        let result = self.decode_event(protocol, data);
+        if not result.is_ok() and self.failure_kind == 0 { self.failure_kind = 10; };
+        result
+    }
+
+    def decode_event(&mut self, protocol: i64, data: &str) -> Result<String, i64> {
         if protocol == 0 and data == "[DONE]" { self.done = true; self.activity = 0; return Result { is_ok: true, value: string_new(), error: 0 }; };
         if self.done { return string_result_err(10); };
-        let document = json_parse(data)?;
+        // Completion metadata can contain cumulative per-message usage even
+        // when the actual answer is tiny. Match the SSE byte bound and opt in
+        // to a structural budget; the legacy JSON API's 4096 nodes are too
+        // small for long Responses conversations. Parse one event at a time;
+        // optional metadata never enters retained model history.
+        let parsed = json_parse_limits(data, 1048576, 65536);
+        if not parsed.is_ok() {
+            self.failure_kind = if parsed.error == 13 { 9 } else { 8 };
+            return string_result_err(parsed.error);
+        };
+        let document = parsed?;
         let root = document.root();
-        if root.object_has("error") { return string_result_err(9); };
+        if root.object_has("error") and not root.object_get("error")?.is_null() { self.failure_kind = 3; self.classify_failure(root.object_get("error")?)?; return string_result_err(9); };
         if protocol == 0 {
             if root.object_has("usage") {
                 let usage = root.object_get("usage")?;
@@ -470,7 +541,7 @@ impl ProviderTurn {
                             provider_owned_text_valid(&reasoning)?;
                             if reasoning.len() > 0 { self.activity = 1; };
                         };
-                        if delta.object_has("refusal") and not delta.object_get("refusal")?.is_null() { return string_result_err(7); };
+                        if delta.object_has("refusal") and not delta.object_get("refusal")?.is_null() { self.failure_kind = 6; return string_result_err(7); };
                         if delta.object_has("tool_calls") {
                             self.activity = 0;
                             let calls = delta.object_get("tool_calls")?;
@@ -499,7 +570,7 @@ impl ProviderTurn {
         if protocol == 1 {
             let kind = cli_json_optional_string(root, "type");
             provider_owned_text_valid(&kind)?;
-            if kind.as_str() == "response.refusal.delta" or kind.as_str() == "response.refusal.done" { return string_result_err(7); };
+            if kind.as_str() == "response.refusal.delta" or kind.as_str() == "response.refusal.done" { self.failure_kind = 6; return string_result_err(7); };
             if kind.as_str() == "response.output_text.delta" { self.activity = 0; let text = cli_json_string(root, "delta")?; return self.owned_text_delta(&text); };
             if kind.as_str() == "response.output_item.added" {
                 let item = root.object_get("item")?;
@@ -533,13 +604,21 @@ impl ProviderTurn {
                 };
             };
             if kind.as_str() == "response.function_call_arguments.delta" { let arguments = cli_json_string(root, "delta")?; provider_owned_text_valid(&arguments)?; self.tool_delta(cli_json_optional_i64(root, "output_index", 0), "", "", arguments.as_str())?; (); };
-            if kind.as_str() == "response.failed" or kind.as_str() == "response.incomplete" or kind.as_str() == "error" { return string_result_err(10); };
+            if kind.as_str() == "response.failed" or kind.as_str() == "response.incomplete" or kind.as_str() == "error" {
+                self.failure_kind = if kind.as_str() == "response.failed" { 1 } else { if kind.as_str() == "response.incomplete" { 2 } else { 3 } };
+                if root.object_has("response") {
+                    let response = root.object_get("response")?;
+                    if response.object_has("error") { self.classify_failure(response.object_get("error")?)?; (); };
+                    if response.object_has("incomplete_details") { self.classify_failure(response.object_get("incomplete_details")?)?; (); };
+                };
+                return string_result_err(10);
+            };
             if kind.as_str() == "response.completed" {
                 if root.object_has("response") {
                     let response = root.object_get("response")?;
-                    if response.object_has("status") and cli_json_string(response, "status")?.as_str() != "completed" { return string_result_err(10); };
-                    if response.object_has("error") and not response.object_get("error")?.is_null() { return string_result_err(9); };
-                    if response.object_has("incomplete_details") and not response.object_get("incomplete_details")?.is_null() { return string_result_err(10); };
+                    if response.object_has("error") and not response.object_get("error")?.is_null() { self.failure_kind = 1; self.classify_failure(response.object_get("error")?)?; return string_result_err(9); };
+                    if response.object_has("incomplete_details") and not response.object_get("incomplete_details")?.is_null() { self.failure_kind = 2; self.classify_failure(response.object_get("incomplete_details")?)?; return string_result_err(10); };
+                    if response.object_has("status") and cli_json_string(response, "status")?.as_str() != "completed" { self.failure_kind = 2; return string_result_err(10); };
                     if response.object_has("end_turn") {
                         let end_turn = response.object_get("end_turn")?.bool_value()?;
                         self.responses_end_turn = if end_turn { 1 } else { 0 };
@@ -558,7 +637,7 @@ impl ProviderTurn {
                                 let mut part_index = 0;
                                 while part_index < content.array_len()? {
                                     let part = content.array_get(part_index)?;
-                                    if cli_json_optional_string(part, "type").as_str() == "refusal" { return string_result_err(7); };
+                                    if cli_json_optional_string(part, "type").as_str() == "refusal" { self.failure_kind = 6; return string_result_err(7); };
                                     if cli_json_optional_string(part, "type").as_str() == "output_text" { final_text.push_str(cli_json_string(part, "text")?.as_str())?; (); };
                                     part_index = part_index + 1;
                                 };
@@ -612,7 +691,7 @@ impl ProviderTurn {
             };
             if kind.as_str() == "content_block_stop" { self.activity = 0; };
             if kind.as_str() == "message_stop" { self.done = true; self.activity = 0; };
-            if kind.as_str() == "error" { return string_result_err(9); };
+            if kind.as_str() == "error" { self.failure_kind = 3; return string_result_err(9); };
         };
         Result { is_ok: true, value: string_new(), error: 0 }
     }

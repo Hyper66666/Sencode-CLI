@@ -1,3 +1,4 @@
+import context_capacity;
 import provider;
 import std::path;
 import std::file_snapshot;
@@ -100,7 +101,8 @@ def image_request_has_media(history: &JsonDoc) -> Result<bool, i64> {
 // Result drops only its active arm: Err placeholders must never own a document.
 // Leave the local result owned here so every rejected conversion releases it.
 def image_request_history(history: &JsonDoc, allowed: bool, grants: &JsonDoc) -> Result<JsonDoc, i64> {
-    let result = json_doc_object_bounded(16777216)?;
+    let result = json_doc_object_limits(16777216, 32768)?;
+    context_copy_request_limits(history, &result)?;
     if not allowed { cli_diagnostic("This model has no explicit visionSupported capability; image history was not sent. Select a vision-enabled model."); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 7 }; };
     let target = result.new_array()?; result.root().object_set("messages", target)?;
     let source = history.root().object_get("messages")?; let mut index = 0; let mut total = 0; let mut count = 0;

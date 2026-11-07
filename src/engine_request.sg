@@ -1,6 +1,7 @@
 import transport;
 import connection;
 import image_request;
+import request_identity;
 
 // Pollable native transport owns its provider snapshot for the whole request.
 // Scheduling, persistence, permissions and all agent state stay in Sengoo.
@@ -18,11 +19,18 @@ def engine_request_start(id: &str, connection: &ProviderConnection, credential: 
 }
 
 def engine_request_start_with_grants(id: &str, connection: &ProviderConnection, credential: &str, history: &JsonDoc, tools: &JsonDoc, grants: &JsonDoc) -> Result<EngineRequest, i64> {
+    engine_request_start_with_limits(id, connection, credential, history, tools, grants, 262144, 131072)
+}
+
+def engine_request_start_with_limits(id: &str, connection: &ProviderConnection, credential: &str, history: &JsonDoc, tools: &JsonDoc, grants: &JsonDoc, window_tokens: i64, max_output_tokens: i64) -> Result<EngineRequest, i64> {
+    let identified = request_identity_history(history, connection)?;
+    cli_put_i64(&identified, identified.root(), "context_window_tokens", window_tokens)?;
+    cli_put_i64(&identified, identified.root(), "max_output_tokens", max_output_tokens)?;
     let media = image_request_has_media(history)?;
     let job = if media {
-        let hydrated = image_request_history(history, connection.images_allowed(), grants)?;
+        let hydrated = image_request_history(&identified, connection.images_allowed(), grants)?;
         provider_job_start_with_media_effort_scoped(connection.base_url(), connection.protocol_id(), connection.model_id(), connection.effort_id(), connection.connection_id(), credential, &hydrated, tools, connection.images_allowed(), 16777216, 16777216)?
-    } else { provider_job_start_with_effort_scoped(connection.base_url(), connection.protocol_id(), connection.model_id(), connection.effort_id(), connection.connection_id(), credential, history, tools)? };
+    } else { provider_job_start_with_effort_scoped(connection.base_url(), connection.protocol_id(), connection.model_id(), connection.effort_id(), connection.connection_id(), credential, &identified, tools)? };
     Result { is_ok: true, value: EngineRequest { id: cli_text(id), connection_id: cli_text(connection.connection_id()), model: cli_text(connection.model_id()), effort: cli_text(connection.effort_id()), job: job }, error: 0 }
 }
 
@@ -35,8 +43,14 @@ impl EngineRequest {
     def usage_reported(&self) -> bool { self.job.turn.usage_reported }
     def status(&self) -> i64 { self.job.http.status }
     def retry_after(&self) -> &str { self.job.http.retry_after.as_str() }
+    def failure_stage(&self) -> &str { self.job.failure_stage_label() }
+    def failure_detail(&self) -> &str { self.job.failure_label() }
     def stream_observed(&self) -> bool { self.job.stream_observed }
     def request_started(&self) -> bool { self.job.stream.request_started().unwrap_or(true) }
     def cancel(&mut self) { self.job.cancel(); }
-    def result(&self) -> Result<JsonDoc, i64> { self.job.result() }
+    def result(&mut self) -> Result<JsonDoc, i64> {
+        let result = self.job.result();
+        if not result.is_ok() { self.job.failure_stage = 8; };
+        result
+    }
 }

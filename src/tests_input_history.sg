@@ -1,0 +1,38 @@
+import input_history;
+import sessions;
+import command_line;
+
+def ring_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return state_bool_error(99); }; Result { is_ok: true, value: true, error: 0 }
+}
+
+def ring_tests(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let first = cli_state_create_session(&state, cwd)?; let second = cli_state_create_session(&state, cwd)?;
+    let history: Vec<InputHistory> = vec_new(); let mut index = 0;
+    while index < 13 { let text = cli_text("中文 input "); text.push_i64(index)?; input_history_add(&history, text.as_str())?; index = index + 1; };
+    input_history_save(&state, first.as_str(), &history)?;
+    let restored = input_history_load(&state, first.as_str())?;
+    ring_expect(restored.len() == 10 and restored.get(0).text.as_str() == "中文 input 3" and restored.get(9).text.as_str() == "中文 input 12", "saved history restores the latest ten in order")?;
+    ring_expect(input_history_load(&state, second.as_str())?.len() == 0, "a different session has independent empty recall")?;
+    let mut execution = cli_state_begin(&state, first.as_str(), "fixture", "model")?;
+    let goal = json_parse("{\"requests\":7,\"status\":2}")?; cli_state_mode_save(&state, &execution, "goal", &goal)?;
+    ring_expect(not input_history_save(&state, first.as_str(), &history).is_ok(), "recall metadata cannot bypass an active execution lock")?;
+    cli_state_finish(&state, &mut execution, "idle")?;
+    input_history_save(&state, first.as_str(), &history)?;
+    let after = cli_state_mode_load(&state, first.as_str(), "goal")?;
+    ring_expect(cli_json_optional_i64(after.root().object_get("value")?, "requests", 0) == 7, "recall writes preserve Goal budget metadata")?;
+    let branch = session_branch(&state, first.as_str(), "separate branch")?;
+    ring_expect(input_history_load(&state, branch.as_str())?.len() == 0, "branch history starts empty despite a copied transcript")?;
+    let reopened = cli_state_open(database)?;
+    ring_expect(input_history_load(&reopened, first.as_str())?.len() == 10, "history survives closing and reopening its database")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments(); if not args.is_ok() { return 2; };
+    let database = cli_option(&args.value, "database", "").unwrap_or(string_new());
+    let cwd = cli_current_directory().unwrap_or(string_new());
+    let result = ring_tests(database.as_str(), cwd.as_str());
+    if not result.is_ok() { println(result.error); return 1; }; println("persistent session input history passed"); 0
+}

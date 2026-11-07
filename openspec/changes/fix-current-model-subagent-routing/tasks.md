@@ -1,0 +1,5 @@
+- [x] Controller: inherit actual request snapshots and resolve named child targets before admission (`model_routing`, `model_routing_host`).
+- [x] Routing: enabled-model directory, ranking, fuzzy matching and recoverable ambiguity (`model_routing`, `model_routing_host`).
+- [x] Request boundary: configured identity for main, children, consult and managed context (`model_routing`, `model_routing_host`, existing engine/children/consult regressions).
+- [x] Integration: eight native gate cases, final focused routing gate, and eight production cases; see verification.md for candidate hashes and scope.
+- [x] Delivery: package and update local sen/sencode with verified rollback and install smoke (15 payloads and six local entrypoints).

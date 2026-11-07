@@ -1,10 +1,11 @@
 import policy;
+import context_capacity;
 import executor;
 import tool_spec;
 import engine_control;
 
 def agent_history(system: &str) -> Result<JsonDoc, i64> {
-    let history = json_doc_object()?;
+    let history = context_document()?;
     let messages = history.new_array()?;
     history.root().object_set("messages", messages)?;
     let message = history.new_object()?;
@@ -31,7 +32,7 @@ def agent_tool_result(history: &JsonDoc, id: &str, result: &str) -> Result<bool,
 
 def agent_tools() -> Result<JsonDoc, i64> {
     let document = workspace_tools()?;
-    let extra = json_parse("{\"tools\":[{\"name\":\"spawn_agent\",\"description\":\"Create a level-one child task with an independent context; explore and plan are read-only\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"},\"role\":{\"type\":\"string\",\"enum\":[\"explore\",\"plan\",\"general\"]},\"connection_id\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"}},\"required\":[\"prompt\",\"role\"]}},{\"name\":\"write_plan\",\"description\":\"Write the session's designated plan file; this does not approve execution\",\"parameters\":{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"}},\"required\":[\"content\"]}},{\"name\":\"finish_goal\",\"description\":\"Request goal verification; completion requires successful user-defined checks\",\"parameters\":{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"]}}]}")?;
+    let extra = json_parse("{\"tools\":[{\"name\":\"spawn_agent\",\"description\":\"Create a level-one child with independent context. Omit target to inherit the current request model, provider and effort. model accepts enabled IDs, labels or case-insensitive fragments across all providers (terra matches gpt-6.1-terra); connection_id optionally restricts lookup. Ambiguous matches return candidates; use list_models to discover targets. explore and plan are read-only\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"},\"role\":{\"type\":\"string\",\"enum\":[\"explore\",\"plan\",\"general\"]},\"connection_id\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"}},\"required\":[\"prompt\",\"role\"]}},{\"name\":\"write_plan\",\"description\":\"Write the session's designated plan file; this does not approve execution\",\"parameters\":{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"}},\"required\":[\"content\"]}},{\"name\":\"finish_goal\",\"description\":\"Request host verification for an active Goal. Existing acceptance commands are mandatory. If none were configured, supply checks with meaningful executable shell assertions for the requested outcome. The host runs them under current permissions; a summary alone cannot complete a Goal\",\"parameters\":{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"},\"shell\":{\"type\":\"string\",\"enum\":[\"bash\",\"powershell\",\"cmd\"]},\"checks\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":32,\"items\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":8192}}},\"required\":[\"summary\"]}}]}")?;
     let target = document.root().object_get("tools")?;
     let source = extra.root().object_get("tools")?;
     let mut index = 0;
@@ -44,6 +45,8 @@ def agent_tools() -> Result<JsonDoc, i64> {
     index = 0;
     while index < additional.array_len()? { target.array_push(document.copy(additional.array_get(index)?)?)?; index = index + 1; };
     let coordination = json_parse("{\"tools\":[{\"name\":\"list_agents\",\"description\":\"View this turn's child task status and provider attribution\",\"parameters\":{\"type\":\"object\",\"properties\":{}}},{\"name\":\"wait_agents\",\"description\":\"Wait up to 1000 milliseconds for children while releasing the parent model/write permits\",\"parameters\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1000}}}},{\"name\":\"cancel_agent\",\"description\":\"Cancel a level-one child and its active request\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"]}}]}")?;
+    let directory = json_parse("{\"name\":\"list_models\",\"description\":\"Search enabled models across all configured providers. query is an optional case-insensitive ID or label fragment; page using offset and limit. Returns public model/provider names and subagent availability, never credentials.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"maxLength\":256},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":131072},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64}}}}")?;
+    target.array_push(document.copy(directory.root())?)?;
     let controls = coordination.root().object_get("tools")?;
     index = 0;
     while index < controls.array_len()? { target.array_push(document.copy(controls.array_get(index)?)?)?; index = index + 1; };
@@ -142,9 +145,9 @@ def agent_compacted_history(system: &str, summary: &str) -> Result<JsonDoc, i64>
 }
 
 def agent_plan_instructions() -> &str {
-    "PLAN MODE: inspect and design only. You may read/search files and create read-only children. No command or MCP call is permitted. Save your plan using write_plan, then present it for user approval. Approval cannot be given by a model or child."
+    "PLAN MODE FOR THIS TURN ONLY: inspect and design only. You may read/search files and create read-only children. No command or MCP call is permitted. Save your plan using write_plan, then present it. The host exits Plan after this turn completes or stops; this does not start execution or approve any tool. A later user task uses its own current permission policy."
 }
 
 def agent_goal_instructions() -> &str {
-    "GOAL MODE: continue working toward the explicit goal within permissions and budgets. Use evidence to verify your work. Call finish_goal when ready for host-run acceptance checks. A statement that work is complete is not verification. If the environment blocks progress, explain the blocker."
+    "GOAL MODE: continue working toward the explicit goal within permissions and budgets. Use evidence to verify your work. Call finish_goal when ready for host-run acceptance checks. If no acceptance commands are configured, define suitable checks yourself and pass them in finish_goal.checks as shell commands (Bash by default; set finish_goal.shell for PowerShell or cmd). Check the actual requested behavior, not a no-op or unconditional success. Existing checks cannot be replaced, including after failure or resume. A statement that work is complete is not verification. If the environment blocks progress, explain the blocker."
 }

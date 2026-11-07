@@ -32,13 +32,8 @@ def session_branch(state: &CliState, source: &str, title: &str) -> Result<String
     let id = state_id("branch-")?;
     let prefix = cli_join(id.as_str(), ":")?;
     let now = time_unix_ms();
-    let modes = cli_state_modes(state, source)?;
-    if modes.root().object_has("image_grants") { let empty = modes.new_object()?; empty.object_set("image_grants", modes.new_array()?)?; modes.root().object_set("image_grants", empty)?; (); };
-    cli_put_string(&modes, modes.root(), "branch_source", source)?;
-    cli_put_i64(&modes, modes.root(), "branch_created_at", now)?;
+    let recall = json_parse("{\"version\":1,\"entries\":[]}")?;
     let origin=session_origin("branch","",source)?;
-    modes.root().object_set("session_origin",modes.copy(origin.root())?)?;
-    let mode_text = modes.serialize_string()?;
     let mut tx = state.db.transaction()?;
     let mut insert = tx.prepare("INSERT INTO sessions(id,project_id,title,title_source,created_at,updated_at,selected_connection_id,selected_model_id) SELECT ?,project_id,CASE WHEN ?='' THEN title || ' (branch)' ELSE ? END,'existing',?,?,selected_connection_id,selected_model_id FROM sessions WHERE id=?")?;
     insert.bind_text(1, id.as_str())?; insert.bind_text(2, title)?; insert.bind_text(3, title)?;
@@ -51,8 +46,8 @@ def session_branch(state: &CliState, source: &str, title: &str) -> Result<String
     // A repeated historical tool ID must not acquire a fresh side effect.
     let mut ledger = tx.prepare("INSERT INTO shared_tool_ledger(session_id,call_id,execution_id,fence,name,arguments,state,result,updated_at) SELECT ?,call_id,execution_id,fence,name,arguments,state,result,updated_at FROM shared_tool_ledger WHERE session_id=?")?;
     ledger.bind_text(1, id.as_str())?; ledger.bind_text(2, source)?; ledger.step()?;
-    let mut saved = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,?,?)")?;
-    saved.bind_text(1, id.as_str())?; saved.bind_text(2, mode_text.as_str())?; saved.bind_i64(3, now)?; saved.step()?;
+    let mut saved = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,json_set(COALESCE((SELECT CASE WHEN json_type(mode_json,'$.image_grants') IS NOT NULL THEN json_set(mode_json,'$.image_grants',json('{\"image_grants\":[]}')) ELSE mode_json END FROM shared_modes WHERE session_id=?),'{}'),'$.cli_input_history',json(?),'$.branch_source',?,'$.branch_created_at',?,'$.session_origin',json(?)),?)")?;
+    saved.bind_text(1,id.as_str())?; saved.bind_text(2,source)?; saved.bind_text(3,recall.serialize_string()?.as_str())?; saved.bind_text(4,source)?; saved.bind_i64(5,now)?; saved.bind_text(6,origin.serialize_string()?.as_str())?; saved.bind_i64(7,now)?; saved.step()?;
     tx.commit()?;
     Result { is_ok: true, value: id, error: 0 }
 }

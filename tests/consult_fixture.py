@@ -21,6 +21,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     initial_maximum = 0
     initial_connection_maximum = 0
     errors = []
+    retry_counts = collections.Counter()
     barrier = threading.Event()
 
     def log_message(self, *args):
@@ -47,6 +48,13 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             if self.active >= 4:
                 self.barrier.set()
         try:
+            if model == "retry-consult":
+                with self.lock:
+                    self.retry_counts[model] += 1
+                    attempt = self.retry_counts[model]
+                if attempt <= 2:
+                    self.send_error(403)
+                    return
             if model == "failure":
                 self.send_error(500)
                 return

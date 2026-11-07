@@ -70,7 +70,12 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events.append({"type": "response.output_item.done", "output_index": index, "item": item})
         events.append({"type": "response.completed", "response": {"id": "response-fixture",
                        "status": "completed", "output": items,
-                       "usage": {"input_tokens": 31, "output_tokens": 14}}})
+                       "usage": {"input_tokens": 31, "output_tokens": 14,
+                                 "attribution": {"items": {
+                                     f"historical-{i}": {"input_tokens": i, "output_tokens": 0,
+                                         "cached_tokens": 0, "cache_write_tokens": 0,
+                                         "content": [{"input_tokens": i, "output_tokens": 0}]}
+                                     for i in range(600)}}}}})
         data = "".join("data: " + json.dumps(e, ensure_ascii=False) + "\n\n" for e in events).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -212,9 +217,11 @@ def main():
 
         first = run("--allow-commands", "-p", "inspect reasoning")
         assert first["success"] and first["content"] == "tool continuation verified 世界", first
-        evidence["checks"].extend(["fragmented-reasoning-tool-round-trip", "provider-order-and-assistant-phase", "default-git-bash-stdout-stderr-cwd"])
+        assert len(Provider.requests) == 3, "rich valid metadata must not cause retries"
+        evidence["checks"].extend(["fragmented-reasoning-tool-round-trip", "provider-order-and-assistant-phase", "default-git-bash-stdout-stderr-cwd", "completion-usage-metadata-over-4096-nodes"])
         resumed = run("resume", first["session_id"], "-p", "resume reasoning")
         assert resumed["success"] and resumed["session_id"] == first["session_id"] and resumed["content"] == "resume verified 世界", resumed
+        assert len(Provider.requests) == 5, "resumed rich completion must not cause retries"
         evidence["checks"].append("restart-persists-encrypted-output-and-phase")
         bridged = run("resume", first["session_id"], "-p", "cross-connection reasoning", connection=identifier + "-other")
         assert bridged["success"] and bridged["content"] == "public history bridge verified", bridged

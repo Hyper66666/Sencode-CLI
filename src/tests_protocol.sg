@@ -25,6 +25,45 @@ def response_control_case(payload: &str, valid: bool, signal: i64, continuation:
 
 def protocol_tests() -> Result<i64, i64> {
     let mut failures = 0;
+    // A real gateway's cumulative usage attribution exceeded 4096 nodes,
+    // causing a valid HTTP 200 completion to be retried six times.
+    let metadata = json_doc_object_limits(1048576, 65536)?;
+    cli_put_string(&metadata, metadata.root(), "type", "response.completed")?;
+    let response = metadata.new_object()?; metadata.root().object_set("response", response)?;
+    cli_put_string(&metadata, response, "status", "completed")?;
+    let usage = metadata.new_object()?; response.object_set("usage", usage)?;
+    cli_put_i64(&metadata, usage, "input_tokens", 9000)?;
+    cli_put_i64(&metadata, usage, "output_tokens", 42)?;
+    let attribution = metadata.new_array()?; usage.object_set("attribution", attribution)?;
+    let mut metadata_index = 0;
+    while metadata_index < 600 {
+        let row = metadata.new_object()?; attribution.array_push(row)?;
+        cli_put_i64(&metadata, row, "input_tokens", metadata_index)?;
+        cli_put_i64(&metadata, row, "output_tokens", 1)?;
+        cli_put_i64(&metadata, row, "cached_tokens", 0)?;
+        cli_put_i64(&metadata, row, "cache_write_tokens", 0)?;
+        cli_put_i64(&metadata, row, "reasoning_tokens", 0)?;
+        cli_put_i64(&metadata, row, "total_tokens", metadata_index + 1)?;
+        metadata_index = metadata_index + 1;
+    };
+    let serialized = metadata.serialize_string()?;
+    failures = failures + expect_protocol(not json_parse(serialized.as_str()).is_ok(), "Regression fixture crosses the legacy JSON node budget");
+    let baseline = sengoo_json_bounded_live_documents();
+    let mut metadata_turn = provider_turn();
+    metadata_turn.event(1, "{\"type\":\"response.output_text.delta\",\"delta\":\"metadata verified 世界\"}")?;
+    metadata_turn.event(1, serialized.as_str())?;
+    let metadata_result = metadata_turn.finish()?;
+    failures = failures + expect_protocol(cli_json_string(metadata_result.root(), "content")?.as_str() == "metadata verified 世界" and cli_json_optional_i64(metadata_result.root(), "input_tokens", 0) == 9000 and cli_json_optional_i64(metadata_result.root(), "output_tokens", 0) == 42, "Rich completion metadata preserves answer and reported totals");
+    failures = failures + expect_protocol(not metadata_result.root().object_has("attribution") and sengoo_json_bounded_live_documents() == baseline, "Transient event metadata is released and never retained in history");
+    let mut invalid_json = provider_turn();
+    failures = failures + expect_protocol(not invalid_json.event(1, "{broken").is_ok() and invalid_json.failure_label() == "Invalid provider event JSON", "Malformed JSON has a separate diagnostic");
+    let oversized = cli_text("{\"type\":\"response.completed\",\"padding\":[");
+    let mut oversized_index = 0;
+    while oversized_index < 65536 { if oversized_index > 0 { oversized.push_str(",")?; (); }; oversized.push_str("0")?; oversized_index = oversized_index + 1; };
+    oversized.push_str("]}")?;
+    let mut limited_json = provider_turn();
+    let refused_json = limited_json.event(1, oversized.as_str());
+    failures = failures + expect_protocol(not refused_json.is_ok() and refused_json.error == 13 and not limited_json.done and limited_json.failure_label() == "Provider event exceeded the local JSON byte, node or memory limit", "JSON limit remains bounded and cannot authorize tools");
     let mut extra_http = http_decoder();
     let extra_data = extra_http.feed("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokextra");
     failures = failures + expect_protocol(not extra_data.is_ok() or not extra_http.finish().is_ok(), "HTTP terminal rejects bytes beyond framed body");
@@ -93,6 +132,10 @@ def protocol_tests() -> Result<i64, i64> {
     failures = failures + expect_protocol(messages_turn.finish().is_ok(), "Messages tool call completion");
     let incomplete = provider_turn();
     failures = failures + expect_protocol(not incomplete.finish().is_ok(), "Truncated turns cannot run tools");
+    let mut limited = provider_turn();
+    failures = failures + expect_protocol(not limited.event(1, "{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}").is_ok() and limited.failure_label() == "Provider output token limit reached", "Incomplete Responses output limit has a distinct safe diagnostic");
+    let mut failed_stream = provider_turn();
+    failures = failures + expect_protocol(not failed_stream.event(2, "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"SECRET-DO-NOT-LOG\"}}").is_ok() and failed_stream.failure_label() == "Provider rate limit reported inside the stream", "HTTP 200 stream errors retain only a closed diagnostic category");
     let sample = "data: {\"text\":\"世界😀\"}\r\n\r\nevent: ping\ndata: first\ndata: second\n\n";
     let sample_bytes = ffi_buffer_from_bytes(sample)?;
     let mut split = 0;

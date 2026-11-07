@@ -1,14 +1,16 @@
+import request_identity;
 import connection;
 import state;
 import transport;
 import scheduler;
+import request_retry;
 import terminal;
 import std::time;
 
 // Credentials are captured only in memory and never copied into reports.
 struct ConsultTarget { connection: ProviderConnection, credential: String }
-struct ConsultPending { task_id: i64, target_index: i64 }
-struct ConsultSlot { task_id: i64, target_index: i64, job: ProviderJob }
+struct ConsultPending { task_id: i64, target_index: i64, attempt: i64, ready_at: i64 }
+struct ConsultSlot { task_id: i64, target_index: i64, attempt: i64, job: ProviderJob }
 struct ConsultBatch {
     scheduler: Scheduler,
     targets: Vec<ConsultTarget>,
@@ -59,7 +61,7 @@ def consult_batch(cwd: &str, question: &str, targets: Vec<ConsultTarget>) -> Res
         // Verify endpoint policy before consuming any model budget.
         http_endpoint(target.connection.base_url(), provider_route(target.connection.protocol_id()))?;
         let id = scheduler_add(&batch.scheduler, 0, target.connection.connection_id(), cwd, false)?;
-        let pending = ConsultPending { task_id: id, target_index: index };
+        let pending = ConsultPending { task_id: id, target_index: index, attempt: 1, ready_at: 0 };
         if not batch.pending.push(pending) { return Result { is_ok: false, value: batch, error: 8 }; };
         index = index + 1;
     };
@@ -100,6 +102,18 @@ def consult_done(batch: &ConsultBatch) -> bool {
     batch.pending.len() == 0 and batch.active.len() == 0
 }
 
+def consult_retry(batch: &ConsultBatch, goal: &mut GoalState, task_id: i64, index: i64, attempt: i64, code: i64, status: i64, header: &str, input: i64, output: i64) -> Result<bool, i64> {
+    if goal.status != 1 { return Result { is_ok: true, value: false, error: 0 }; };
+    let evidence = RetryEvidence { attempt: attempt, status: status, error: code, request_started: true, stream_observed: true, side_effects: false };
+    let retry = request_retry(&evidence, header, time_unix_ms(), 0);
+    if not retry.retry { return Result { is_ok: true, value: false, error: 0 }; };
+    scheduler_report_usage(&batch.scheduler, task_id, goal, consult_usage(input, output));
+    scheduler_release_model(&batch.scheduler, task_id)?;
+    let pending = ConsultPending { task_id: task_id, target_index: index, attempt: attempt + 1, ready_at: time_monotonic_ms() + retry.delay_ms };
+    if not batch.pending.push(pending) { return Result { is_ok: false, value: false, error: 8 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
 // Progress every accepted stream once per tick. No network operation blocks
 // this coordinator; moving Vec entries transfers owned ProviderJob values.
 def consult_poll(batch: &ConsultBatch, goal: &mut GoalState) -> Result<bool, i64> {
@@ -108,6 +122,8 @@ def consult_poll(batch: &ConsultBatch, goal: &mut GoalState) -> Result<bool, i64
         let pending: &ConsultPending = batch.pending.get(pending_index);
         let task_id = pending.task_id;
         let target_index = pending.target_index;
+        let attempt = pending.attempt;
+        if not scheduler_is_cancelled(&batch.scheduler, task_id) and time_monotonic_ms() < pending.ready_at { pending_index = pending_index + 1; continue; };
         if scheduler_is_cancelled(&batch.scheduler, task_id) {
             consult_report(batch, target_index, task_id, "", 19, 0, 0, goal)?;
             batch.pending.remove(pending_index);
@@ -118,12 +134,13 @@ def consult_poll(batch: &ConsultBatch, goal: &mut GoalState) -> Result<bool, i64
                 let reserved = scheduler_take_request(&batch.scheduler, task_id, goal);
                 if reserved {
                     let target: &ConsultTarget = batch.targets.get(target_index);
-                    let start = provider_job_start_with_effort_scoped(target.connection.base_url(), target.connection.protocol_id(), target.connection.model_id(), target.connection.effort_id(), target.connection.connection_id(), target.credential.as_str(), &batch.history, &batch.tools);
+                    let identified = request_identity_history(&batch.history, &target.connection)?;
+                    let start = provider_job_start_with_effort_scoped(target.connection.base_url(), target.connection.protocol_id(), target.connection.model_id(), target.connection.effort_id(), target.connection.connection_id(), target.credential.as_str(), &identified, &batch.tools);
                     if start.is_ok() {
-                        let active = ConsultSlot { task_id: task_id, target_index: target_index, job: start.value };
+                        let active = ConsultSlot { task_id: task_id, target_index: target_index, attempt: attempt, job: start.value };
                         if not batch.active.push(active) { return Result { is_ok: false, value: false, error: 8 }; };
                     } else {
-                        consult_report(batch, target_index, task_id, "", start.error, 0, 0, goal)?;
+                        if not consult_retry(batch, goal, task_id, target_index, attempt, start.error, 0, "", 0, 0)? { consult_report(batch, target_index, task_id, "", start.error, 0, 0, goal)?; (); };
                         ();
                     };
                 } else {
@@ -156,8 +173,9 @@ def consult_poll(batch: &ConsultBatch, goal: &mut GoalState) -> Result<bool, i64
                     if completed.value.root().object_get("tool_calls")?.array_len()? != 0 { error = 7; };
                 };
             };
+            let retry = if error != 0 { consult_retry(batch, goal, slot.task_id, slot.target_index, slot.attempt, error, slot.job.http.status, slot.job.http.retry_after.as_str(), input, output)? } else { false };
             if error != 0 { slot.job.cancel(); };
-            consult_report(batch, slot.target_index, slot.task_id, slot.job.turn.content.as_str(), error, input, output, goal)?;
+            if not retry { consult_report(batch, slot.target_index, slot.task_id, slot.job.turn.content.as_str(), error, input, output, goal)?; (); };
             ();
         } else {
             if not batch.active.push(slot) { return Result { is_ok: false, value: false, error: 8 }; };
