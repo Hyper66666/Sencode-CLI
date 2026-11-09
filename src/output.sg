@@ -3,6 +3,7 @@ import contracts_app;
 
 def output_app_event(format: &str, event: &AppEvent) -> Result<bool, i64> {
     if format == "text" {
+        if event.kind.as_str() == "context_compacted" { return ui_output("\n上下文已压缩\n"); };
         if event.kind.as_str() == "text_delta" or event.kind.as_str() == "notice" { return ui_output(event.text.as_str()); };
         return Result { is_ok: true, value: true, error: 0 };
     };

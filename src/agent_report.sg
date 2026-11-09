@@ -32,6 +32,13 @@ def agent_report_fields(value: JsonValue, check: bool) -> Result<bool, i64> {
     if value.kind()? != JSON_KIND_OBJECT() { return agent_report_bool(false); };
     let count = value.object_len()?;
     if count != (if check { 2 } else { 7 }) { return agent_report_bool(false); };
+    // Membership and count alone do not prove completeness if a parser retains
+    // duplicate names. Guard every later object_get before reading any value.
+    if check {
+        if not value.object_has("command") or not value.object_has("status") { return agent_report_bool(false); };
+    } else {
+        if not value.object_has("schema") or not value.object_has("outcome") or not value.object_has("summary") or not value.object_has("changed_paths") or not value.object_has("checks") or not value.object_has("blocker") or not value.object_has("next_action") { return agent_report_bool(false); };
+    };
     let mut index = 0;
     while index < count {
         let key = value.object_key(index)?;

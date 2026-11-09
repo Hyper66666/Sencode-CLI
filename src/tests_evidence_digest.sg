@@ -1,0 +1,100 @@
+import controller;
+import command_line;
+
+def digest_expect(value: bool, label: &str) -> Result<bool, i64> {
+    if not value { println(label); return state_bool_error(99); }; Result { is_ok: true, value: true, error: 0 }
+}
+
+def digest_text(size: i64) -> Result<String, i64> {
+    let block = string_new(); while block.len() < 4096 { block.push_str("xxxxxxxxxxxxxxxx")?; (); };
+    let text = string_with_capacity(size)?;
+    while text.len() + block.len() <= size { text.push_str(block.as_str())?; (); };
+    while text.len() < size { text.push_str("x")?; (); };
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def digest_sample(size: i64, expected: &str) -> Result<bool, i64> {
+    let text = digest_text(size)?;
+    let reference = evidence_reference("tool_result", "fixture-session", "fixture-call", text.as_str())?;
+    digest_expect(cli_json_string(reference.root(), "sha256")?.as_str() == expected, "exact-source digest differs from independent SHA256")?;
+    if size > 65536 { let legacy = state_digest(text.as_str()); digest_expect(not legacy.is_ok and legacy.error == 2, "legacy small-identity admission must remain compatible")?; (); };
+    if size == 16777216 { text.push_str("x")?; let rejected = evidence_digest(text.as_str()); digest_expect(not rejected.is_ok and rejected.error == 13, "evidence source ceiling remains explicit")?; (); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def digest_bounds() -> Result<bool, i64> {
+    digest_sample(0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+    digest_sample(65536, "1f8745f0d2d1387ec1af2211a3cf417b2e9e885e853472649c1d979d0e9370e3")?;
+    digest_sample(65537, "1abe08ebecf1c18cab71f6fe28aaddf20268f85bad78bb9a72f88ca47c874662")?;
+    digest_sample(106138, "ddb8da5b02aba49c17c5d75507f3b1c1a1b80a15b354bc50802b8ed423e1e52a")?;
+    digest_sample(1048576, "8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b")?;
+    digest_sample(16777216, "a06c26cbac8b80704f420222dae5658b88ff2da96702d12ef7a4223e9361f7c1")
+}
+
+def digest_store(database: &str, cwd: &str) -> Result<bool, i64> {
+    let state = cli_state_open(database)?;
+    let parent = cli_state_create_session(&state, cwd)?;
+    let child = cli_state_create_child_session(&state, cwd, parent.as_str())?;
+    let outsider = cli_state_create_session(&state, cwd)?;
+    let mut pexec = cli_state_begin(&state, parent.as_str(), "fixture", "model")?;
+    let mut cexec = cli_state_begin(&state, child.as_str(), "fixture", "model")?;
+    let input: Vec<TerminalEvent> = vec_new(); engine_control_init(&input)?;
+    let content = string_new(); while content.len() < 106138 { content.push_str("证据 世界😀\n")?; (); };
+    let raw = json_doc_object_limits(1048576, 8192)?;
+    cli_put_string(&raw, raw.root(), "content", content.as_str())?;
+    cli_put_bool(&raw, raw.root(), "is_error", false)?;
+    cli_put_bool(&raw, raw.root(), "outcome_unknown", false)?;
+    let text = raw.serialize_string()?;
+    cli_state_tool_claim(&state, &cexec, "large", "run_command", "{}")?;
+    cli_state_tool_complete(&state, &cexec, "large", text.as_str())?;
+    let projected = controller_child_tool_projection(&state, &input, 2, child.as_str(), "run_command", "large", text.as_str())?;
+    digest_expect(projected.root().object_get("content_truncated")?.bool_value()? and not projected.root().object_get("is_error")?.bool_value()? and not projected.root().object_get("outcome_unknown")?.bool_value()?, "large projection preserves flags and preview")?;
+    let args = json_doc_object()?; let reference = projected.root().object_get("evidence_ref")?;
+    let fields = cli_text("kind,session_id,source_id,sha256"); let keys = fields.split(",");
+    loop { let key = keys.next(); if not key.is_some { break; }; args.root().object_set(key.value.as_str(), args.copy(reference.object_get(key.value.as_str())?)?)?; ( ); };
+    cli_put_i64(&args, args.root(), "limit", 4096)?;
+    let collected = string_new(); let mut cursor = 0;
+    while cursor < text.len() {
+        cli_put_i64(&args, args.root(), "offset", cursor)?;
+        let page = evidence_read(&state, &pexec, &args)?;
+        digest_expect(cli_json_string(page.root(), "status")?.as_str() == "available", "large authorized page unavailable")?;
+        let piece = cli_json_string(page.root(), "content")?; collected.push_str(piece.as_str())?;
+        let next = cli_json_optional_i64(page.root(), "next_offset", -1);
+        digest_expect(next > cursor and next <= text.len(), "Unicode page cursor must advance")?; cursor = next;
+    };
+    digest_expect(collected.as_str() == text.as_str(), "paged source must match retained Unicode bytes exactly")?;
+    let mut oexec = cli_state_begin(&state, outsider.as_str(), "fixture", "model")?;
+    let denied = evidence_read(&state, &oexec, &args)?;
+    digest_expect(cli_json_string(denied.root(), "status")?.as_str() == "unavailable", "unrelated session cannot read evidence")?;
+    cli_put_i64(&args, args.root(), "offset", 0)?;
+    cli_put_string(&args, args.root(), "sha256", "wrong-source-version")?;
+    digest_expect(cli_json_string(evidence_read(&state, &pexec, &args)?.root(), "status")?.as_str() == "source_changed", "digest mismatch must reject stale source")?;
+    // Inject malformed retained data only in this isolated DB to exercise the
+    // local projection boundary. Never execute or replay a source operation.
+    let broken = cli_text("{"); while broken.len() < 20000 { broken.push_str("x")?; (); };
+    cli_state_tool_claim(&state, &cexec, "malformed", "run_command", "{}")?;
+    cli_state_tool_complete(&state, &cexec, "malformed", broken.as_str())?;
+    let failed = controller_child_tool_projection(&state, &input, 2, child.as_str(), "run_command", "malformed", broken.as_str());
+    digest_expect(not failed.is_ok, "malformed retained data fails closed")?;
+    let diagnostic = execution_diagnostic_document(&input, failed.error)?;
+    digest_expect(cli_json_string(diagnostic.root(), "reason")?.as_str() == "child_coordination_failed" and cli_json_string(diagnostic.root(), "stage")?.as_str() == "child_tool_projection" and cli_json_optional_i64(diagnostic.root(), "child_task_id", 0) == 2, "projection failure has exact child stage")?;
+    let shown = execution_diagnostic_content(&diagnostic)?;
+    digest_expect(str_contains(shown.as_str(), "Agent #2") and str_contains(shown.as_str(), "child_tool_projection") and str_contains(shown.as_str(), "Completed tool results were retained"), "specific diagnostic replaces generic code-only stop")?;
+    request_attempt_save(&state, &pexec, "host-failure", "fixture", "model", "native-agent", 1, "failed", failed.error, 0, 0, false)?;
+    let observed = json_doc_object()?; cli_put_string(&observed, observed.root(), "host_stage", "child_tool_projection")?; cli_put_i64(&observed, observed.root(), "child_task_id", 2)?;
+    request_attempt_diagnostic(&state, &pexec, "host-failure", &observed)?;
+    let saved = cli_state_mode_load(&state, parent.as_str(), "request_attempts")?;
+    digest_expect(cli_json_string(saved.root().object_get("value")?.object_get("attempts")?.array_get(0)?, "host_stage")?.as_str() == "child_tool_projection", "host-stage evidence persists with the request")?;
+    digest_expect(cli_state_tool_result(&state, child.as_str(), "large")?.as_str() == text.as_str(), "failure leaves completed source intact")?;
+    cli_state_finish(&state, &mut oexec, "idle")?; cli_state_finish(&state, &mut cexec, "idle")?; cli_state_finish(&state, &mut pexec, "idle")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let args = cli_arguments().unwrap_or(JsonDoc { handle: 0 });
+    let db = cli_option(&args, "database", "").unwrap_or(string_new()); if db.len() == 0 { return 2; };
+    let cwd = path_parent_string(db.as_str()).unwrap_or(string_new());
+    let bounds = digest_bounds(); if not bounds.is_ok { println(bounds.error); return 1; };
+    let stored = digest_store(db.as_str(), cwd.as_str()); if not stored.is_ok { println(stored.error); return 1; };
+    println("Evidence exact digests 64 KiB..16 MiB, large child projection, Unicode paging, authorization, retained source and host-stage diagnostics passed"); 0
+}

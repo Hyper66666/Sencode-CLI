@@ -49,6 +49,22 @@ def engine_control_tests() -> Result<bool, i64> {
     engine_expect(runtime_validate_policy(&native, &policy, true, 0).is_ok(), "Native host can enforce Plan and request budgets")?;
     engine_expect(not runtime_validate_policy(&native, &policy, true, 100).is_ok(), "Missing exact usage cannot satisfy a token-budget guarantee")?;
     engine_expect(not runtime_validate_policy(&unknown, &policy, false, 0).is_ok(), "Unknown managed capabilities fail explicitly")?;
+    engine_control_begin(&input, "live")?;
+    engine_control_accept(&input, "{\"type\":\"steer\",\"id\":\"s0\",\"request_id\":\"live\",\"text\":\"retained\"}")?;
+    engine_expect(engine_control_slot(&input, 97) < 0, "unsupported hosts cannot emulate live steering")?;
+    input.push(engine_control_record(100, 0, ""));
+    engine_control_accept(&input, "{\"type\":\"steer\",\"id\":\"s1\",\"request_id\":\"old\",\"text\":\"stale\"}")?;
+    engine_control_accept(&input, "{\"type\":\"steer\",\"id\":\"s2\",\"request_id\":\"live\",\"text\":\"unsafe\",\"full_access\":true}")?;
+    engine_expect(engine_control_slot(&input, 97) < 0, "steering cannot target stale requests or expand permissions")?;
+    let steering = "{\"type\":\"steer\",\"id\":\"s3\",\"request_id\":\"live\",\"text\":\"新的条件 中文😀\"}";
+    engine_control_accept(&input, steering)?; engine_control_accept(&input, steering)?;
+    let mut pending = 0; let mut scan = 0;
+    while scan < input.len() { if input.get(scan).kind == 97 { pending = pending + 1; }; scan = scan + 1; };
+    engine_expect(pending == 1 and engine_control_slot(&input, 92) < 0 and engine_control_slot(&input, 96) < 0, "duplicate steering IDs queue once without cancellation or approval")?;
+    engine_control_accept(&input, "{\"type\":\"cancel\",\"id\":\"live\"}")?;
+    engine_control_reject_steering(&input)?;
+    engine_expect(engine_control_slot(&input, 97) < 0 and engine_control_slot(&input, 92) >= 0, "cancellation wins and rejects unapplied steering")?;
+    engine_control_end(&input);
     Result { is_ok: true, value: true, error: 0 }
 }
 

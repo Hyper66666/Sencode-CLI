@@ -78,6 +78,11 @@ def request_attempt_diagnostic(state: &CliState, execution: &CliExecution, id: &
             cli_put_i64(&document, item, "http_status", cli_json_optional_i64(observed.root(), "status", 0))?;
             cli_put_string(&document, item, "response_stage", cli_json_optional_string(observed.root(), "response_stage").as_str())?;
             cli_put_string(&document, item, "response_failure", cli_json_optional_string(observed.root(), "response_failure").as_str())?;
+            let host_stage = cli_json_optional_string(observed.root(), "host_stage");
+            if host_stage.as_str() == "child_scheduler" or host_stage.as_str() == "child_tool_projection" or host_stage.as_str() == "child_tool_context" {
+                cli_put_string(&document, item, "host_stage", host_stage.as_str())?;
+                cli_put_i64(&document, item, "child_task_id", cli_json_optional_i64(observed.root(), "child_task_id", 0))?; ();
+            };
             cli_put_i64(&document, document.root(), "schema", 1)?;
             document.root().object_set("attempts", attempts)?;
             return cli_state_mode_save(state, execution, "request_attempts", &document);

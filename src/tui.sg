@@ -27,7 +27,7 @@ struct UiApp {
     status: String, history_window: String, mode: String, permission: String, active_permission: String, active_model: String, native_engine: bool, busy: bool, home: bool, phase: String, reconnect: String, animation_tick: i64, animate_tools: bool, received_text: bool, turn_started: i64, activity_id: i64, visible_activity: bool,
     keymap: UiKeymap, vim: UiVim, reading: UiReading, selection: UiSelection,
     draft: String, cursor: i64, stash_draft: String, history: Vec<InputHistory>, history_index: i64, history_draft: String, history_dirty: bool, history_retry_at: i64,
-    queue: Vec<InputHistory>, registry: Vec<UiCommand>, matches: Vec<UiCommandMatch>,
+    queue: Vec<InputHistory>, inserting: String, registry: Vec<UiCommand>, matches: Vec<UiCommandMatch>,
     menu_open: bool, menu_closed: bool, selected: i64,
     completion_kind: String, completion_start: i64, completion_end: i64, completions: Vec<UiCandidate>, references: Vec<UiCandidate>,
     queue_paused: bool, queue_selected: i64, queue_edit_index: i64, queue_saved_draft: String, queue_saved_cursor: i64,
@@ -59,7 +59,7 @@ def tui_new(cwd: &str, connection: &str, model: &str, session: &str) -> UiApp {
     let keymap = keys_load(); let status = keymap.warning.clone().unwrap_or(string_new());
     UiApp { width: 100, height: 30, cwd: cli_text(cwd), connection: cli_text(connection), model: cli_text(model), session: cli_text(session), status: status, history_window: string_new(), mode: cli_text("BUILD"), permission: cli_text("手动审批"), active_permission: string_new(), active_model: string_new(), native_engine: true, busy: false, home: true, phase: string_new(), reconnect: string_new(), animation_tick: 0, animate_tools: not env_has_var("SENCODE_REDUCED_MOTION"), received_text: false, turn_started: 0, activity_id: 0, visible_activity: false,
         keymap: keymap, vim: keys_vim_new(), reading: reading_new(), selection: selection_new(),
-        draft: string_new(), cursor: 0, stash_draft: string_new(), history: history, history_index: 0, history_draft: string_new(), history_dirty: false, history_retry_at: 0, queue: queue, registry: registry, matches: matches,
+        draft: string_new(), cursor: 0, stash_draft: string_new(), history: history, history_index: 0, history_draft: string_new(), history_dirty: false, history_retry_at: 0, queue: queue, inserting: string_new(), registry: registry, matches: matches,
         menu_open: false, menu_closed: false, selected: 0, picker: string_new(), picker_title: string_new(), candidates: candidates, picker_query: string_new(), picker_selected: 0,
         completion_kind: string_new(), completion_start: 0, completion_end: 0, completions: completions, references: references,
         queue_paused: false, queue_selected: -1, queue_edit_index: -1, queue_saved_draft: string_new(), queue_saved_cursor: 0,
@@ -105,13 +105,13 @@ def tui_message_rows(rows: &Vec<UiLine>, role: &str, text: &str, width: i64) -> 
 }
 
 def tui_message_rows_id(rows: &Vec<UiLine>, role: &str, text: &str, width: i64, id: i64) -> Result<bool, i64> {
-    if role == "elapsed" { return md_row(rows, text, 2, id); };
+    if role == "elapsed" or role == "status" { return md_row(rows, text, 2, id); };
     md_row(rows, "", 0, id)?;
     let label = cli_text(if role == "user" { "YOU" } else { if role == "assistant" { "SENCODE" } else { if role == "tool" { "TOOL" } else { if role == "diff" { "EDIT" } else { "NOTICE" } } } });
-    md_row(rows, label.as_str(), if role == "tool" { 8 } else { if role == "notice" { 2 } else { 1 } }, id)?;
+    md_row(rows, label.as_str(), if role == "tool" { 8 } else { if role == "notice" { 6 } else { 1 } }, id)?;
     if role == "assistant" { return md_render(rows, text, width, id); };
     if role == "diff" { return md_edit_render(rows, text, width, id); };
-    md_wrapped(rows, text, width, if role == "tool" { "│ " } else { "" }, if role == "tool" { 8 } else { if role == "notice" { 2 } else { 0 } }, id)
+    md_wrapped(rows, text, width, if role == "tool" { "│ " } else { "" }, if role == "tool" { 8 } else { if role == "notice" { 6 } else { 0 } }, id)
 }
 
 // Speaker grouping belongs to a user turn, not to a provider request or a tool
@@ -895,7 +895,11 @@ def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
         };
         if app.queue_edit_index >= 0 { tui_queue_save(app, true)?; return tui_none(); };
         if app.menu_open { return tui_menu_accept(app); };
-        let submitted = str_trim(app.draft.as_str())?; if submitted.len() == 0 { return tui_none(); };
+        let submitted = str_trim(app.draft.as_str())?;
+        if submitted.len() == 0 {
+            if app.busy and app.queue.len() > 0 and app.inserting.len() == 0 { return Result { is_ok: true, value: tui_action(10, app.queue.get(0).text.as_str(), "steer"), error: 0 }; };
+            return tui_none();
+        };
         let folded = str_to_ascii_lower(submitted.as_str())?;
         if folded.as_str() == "/queue" or str_starts_with(folded.as_str(), "/queue ") {
             tui_remember(app, submitted.as_str())?; app.draft.clear(); app.cursor = 0; app.vim = keys_vim_new(); app.menu_open = false; app.menu_closed = false;
@@ -910,7 +914,7 @@ def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
         let immediate = commands_immediate(&app.registry, submitted.as_str())?;
         if app.busy and not immediate and app.queue.len() >= 8 { app.status = cli_text("Queue is full. Your draft has been kept."); return tui_none(); };
         tui_remember(app, submitted.as_str())?; app.draft.clear(); app.cursor = 0; app.vim = keys_vim_new(); app.menu_open = false; app.menu_closed = false; app.scroll = 0;
-        if app.busy and not immediate { app.queue.push(InputHistory { text: submitted }); app.status = cli_text("Queued for the next turn. Continue typing to edit a new draft."); return tui_none(); };
+        if app.busy and not immediate { app.queue.push(InputHistory { text: submitted }); app.status = cli_text("已排队 · 再按 Enter 插入当前任务 · Esc 撤回"); return tui_none(); };
         return Result { is_ok: true, value: UiAction { kind: 1, text: submitted, context: string_new() }, error: 0 };
     };
     if event.code == 4 and app.draft.len() == 0 { return Result { is_ok: true, value: tui_action(if app.busy { 2 } else { 3 }, "", ""), error: 0 }; };
@@ -1052,7 +1056,7 @@ def tui_footer(app: &UiApp) -> &str {
     if app.reading.active { return "j/k scroll · Esc return"; };
     if app.queue_edit_index >= 0 { return "Enter save · Esc discard"; };
     if app.menu_open { return "↑↓ choose · Enter complete · Esc close"; };
-    if app.queue.len() > 0 { return "Esc recall · Ctrl+Q queue"; };
+    if app.queue.len() > 0 { return if app.busy and app.inserting.len() == 0 { "Enter insert · Esc recall" } else { "Esc recall · Ctrl+Q queue" }; };
     if app.keymap.mode.as_str() == "vim" {
         if app.vim.insert { return if app.busy { "Esc normal · Ctrl+C stop" } else { "Esc normal · /help" }; };
         return if app.busy { "i insert · Ctrl+C stop" } else { "i insert · /help" };
@@ -1089,7 +1093,12 @@ def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
     let menu: Vec<UiLine> = vec_new();
     if app.approval_question and app.approval.len() > 0 and app.approval_options.len() > 0 { tui_question_rows(&menu, app, body_height)?; (); } else { if app.approval.len() > 0 and body_height > 6 { tui_approval_rows(&menu, app, if body_height > 15 { 8 } else { body_height - 6 })?; (); } else { if menu_visible and menu_max > 0 { tui_menu_rows(&menu, app, menu_max)?; (); }; }; };
     let pending_limit = if menu_visible or app.queue_edit_index >= 0 { 0 } else { if body_height > 12 { 4 } else { if body_height > 8 { 3 } else { if body_height > 5 { 2 } else { 0 } } } };
-    let pending = pending_rows(&app.queue, width, pending_limit)?;
+    let pending: Vec<UiLine> = vec_new();
+    if app.inserting.len() > 0 and pending_limit > 0 {
+        let label = cli_text("INSERTING / "); label.push_str(pending_preview(app.inserting.as_str(), width - 12)?.as_str())?;
+        pending_row(&pending, label.as_str(), width)?; ();
+    };
+    let queued = pending_rows(&app.queue, width, pending_limit - pending.len())?; tui_copy_rows(&pending, &queued)?;
     let view_height = if body_height > menu.len() + pending.len() { body_height - menu.len() - pending.len() } else { 0 };
     let body: Vec<UiLine> = vec_new();
     if app.home and not app.busy and app.messages.len() == 0 and not menu_visible and not app.reading.active { tui_home_rows(&body, app, view_height)?; (); } else {

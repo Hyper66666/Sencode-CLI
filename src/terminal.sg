@@ -152,7 +152,9 @@ def ui_turn_end(terminal: &Terminal, success: bool) -> Result<bool, i64> {
 }
 def ui_notice(terminal: &Terminal, text: &str) -> Result<bool, i64> {
     if not terminal.is_tty() { return ui_output(text); };
-    ui_section(terminal, "Notice", text)
+    let safe = cli_terminal_safe(text)?;
+    ui_style(terminal, "\x1b[31m")?; terminal.write("\r\n  NOTICE\r\n")?;
+    terminal.write(safe.as_str())?; terminal.write("\r\n")?; ui_style(terminal, "\x1b[0m")
 }
 def ui_mode(terminal: &Terminal, label: &str) -> Result<bool, i64> { ui_section(terminal, "Mode", label) }
 

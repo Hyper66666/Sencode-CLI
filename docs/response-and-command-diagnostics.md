@@ -71,5 +71,8 @@ unlimited process memory or that all other transports/storage paths are unbounde
 For shell exit status, owned-descendant timeouts, multi-line script previews and
 PowerShell selection, see [command lifecycle diagnostics](command-lifecycle-diagnostics.md).
 
+For local code-2 failures after large child output, see
+[evidence digest recovery](evidence-digest-recovery.md).
+
 Sencode's event admission is deliberately explicit and separate from Sengoo's
 legacy JSON API; the current event budget is 65536 nodes / 1 MiB, depth 64.

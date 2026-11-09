@@ -152,7 +152,9 @@ def engine_execute_selected_with_images(state: &CliState, options: &AgentOptions
     if options.effort.len() > 0 { let catalog = config_snapshot(state)?; model_selection_target(&catalog, options.connection.as_str(), options.model.as_str(), options.effort.as_str())?; (); };
     if operation == "compact" {
         let result = controller_compact(state, options, maximum_requests, token_budget, terminal);
-        return if result.is_ok() { string_from_str("Context compacted; request accounting was preserved") } else { string_result_err(result.error) };
+        // The context_compacted event owns the single informational row.
+        // A successful control operation does not invent an assistant reply.
+        return if result.is_ok() { string_from_str("") } else { string_result_err(result.error) };
     };
     if operation == "consult" {
         let reports = controller_consult(state, options, prompt, maximum_requests, token_budget, terminal);
@@ -234,6 +236,9 @@ def engine_stdio(state: &CliState, options: &mut AgentOptions, maximum_requests:
         if not remembered.is_ok() { policy_finish_plan(&mut options.policy); engine_result(options, id.as_str(), "Session permissions could not be saved while the session is busy or unavailable; no request or tool was started. Retry after its owner finishes.", remembered.error)?; continue; };
         engine_control_begin(&options.input, id.as_str())?;
         let session = engine_selected_document(options, &target.value)?;
+        let live_steering = cli_json_optional_string(session.root(), "engine").as_str() == "sengoo-native-api" and (operation.len() == 0 or operation.as_str() == "turn");
+        if live_steering { options.input.push(engine_control_record(100, 0, "")); (); };
+        cli_put_bool(&session, session.root(), "live_steering", live_steering)?;
         cli_put_string(&session, session.root(), "type", "session")?;
         cli_put_string(&session, session.root(), "id", id.as_str())?;
         cli_put_string(&session, session.root(), "request_id", id.as_str())?;
@@ -250,6 +255,7 @@ def engine_stdio(state: &CliState, options: &mut AgentOptions, maximum_requests:
         let finished = time_monotonic_ms();
         let elapsed = if started >= 0 and finished >= started { finished - started } else { -1 };
         let failure = if result.is_ok() { string_new() } else { execution_diagnostic_content(&execution_diagnostic_document(&options.input, result.error)?)? };
+        engine_control_reject_steering(&options.input)?;
         engine_result_elapsed(options, id.as_str(), if result.is_ok() { result.value.as_str() } else { failure.as_str() }, if result.is_ok() { 0 } else { result.error }, elapsed)?;
         engine_control_end(&options.input);
         options.goal_text = string_new();

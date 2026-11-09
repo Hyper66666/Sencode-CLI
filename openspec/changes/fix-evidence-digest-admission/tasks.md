@@ -1,0 +1,6 @@
+- [x] Reproduce the 64-KiB evidence digest mismatch using synthetic input and inspect reported records read-only.
+- [x] Align reference and page verification hashing with existing evidence source admission.
+- [x] Attribute child projection/context failures and persist closed host-stage metadata.
+- [x] Pass native hash/projection/authorization/Unicode and diagnostic regression tests.
+- [x] Pass final-executable child output, parent continuation, restart and recovery fixtures.
+- [x] Package, validate and update both local aliases with source/hash/rollback evidence.

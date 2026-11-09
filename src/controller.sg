@@ -248,6 +248,13 @@ def controller_request(state: &CliState, execution: &CliExecution, options: &Age
         scheduler_release_model(scheduler, task_id)?;
         let reported = observed.root().object_has("usage_reported") and observed.root().object_get("usage_reported")?.bool_value()?;
         let settled = request_attempt_finish(state, execution, request_id.as_str(), connection.connection_id(), connection.model_id(), "native-agent", attempt, if result.is_ok() { 0 } else { result.error }, input, output, reported);
+        if not result.is_ok() {
+            let host_failure = execution_diagnostic_saved(&options.input)?;
+            if cli_json_optional_string(host_failure.root(), "reason").as_str() == "child_coordination_failed" {
+                cli_put_string(&observed, observed.root(), "host_stage", cli_json_optional_string(host_failure.root(), "stage").as_str())?;
+                cli_put_i64(&observed, observed.root(), "child_task_id", cli_json_optional_i64(host_failure.root(), "child_task_id", 0))?; ();
+            };
+        };
         let recorded = if settled.is_ok() and not result.is_ok() { request_attempt_diagnostic(state, execution, request_id.as_str(), &observed) } else { settled };
         if not recorded.is_ok() {
             execution_diagnostic_failure(&options.input, "request_state_failed", "request_commit", "", request_id.as_str(), false)?;
@@ -318,7 +325,7 @@ def controller_request_body(state: &CliState, execution: &CliExecution, options:
     let mut message_id = string_new();
     if terminal.is_tty() and options.format.as_str() == "text" { ui_turn_start(terminal, connection.model_id())?; (); };
     controller_event(options, execution, request_id, "request_started", connection.connection_id(), connection.model_id(), "")?;
-    controller_event(options, execution, request_id, "phase", connection.connection_id(), connection.model_id(), "working")?;
+    controller_event(options, execution, request_id, "phase", connection.connection_id(), connection.model_id(), if internal { "compacting" } else { "working" })?;
     let mut activity = 0;
     let mut delta_index = 0;
     while not job.finished() {
@@ -328,7 +335,7 @@ def controller_request_body(state: &CliState, execution: &CliExecution, options:
         if not polled.is_ok() { cli_put_bool(observed, observed.root(), "model_request_failed", true)?; controller_observe_request(observed, &job)?; job.cancel(); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: polled.error }; };
         if job.activity() != activity {
             activity = job.activity();
-            controller_event(options, execution, request_id, "phase", connection.connection_id(), connection.model_id(), if activity == 1 { "thinking" } else { "working" })?; ();
+            controller_event(options, execution, request_id, "phase", connection.connection_id(), connection.model_id(), if internal { "compacting" } else { if activity == 1 { "thinking" } else { "working" } })?; ();
         };
         let delta = polled.value;
         if delta.len() > 0 and not internal {
@@ -352,7 +359,7 @@ def controller_request_body(state: &CliState, execution: &CliExecution, options:
         cli_state_stream_finish(state, execution, message_id.as_str(), &result)?; ();
     };
     controller_event(options, execution, request_id, "request_completed", connection.connection_id(), connection.model_id(), "")?;
-    controller_event(options, execution, request_id, "phase", connection.connection_id(), connection.model_id(), "working")?;
+    controller_event(options, execution, request_id, "phase", connection.connection_id(), connection.model_id(), if internal { "compacting" } else { "working" })?;
     if terminal.is_tty() and options.format.as_str() == "text" { terminal.write("\r\n")?; (); };
     Result { is_ok: true, value: result, error: 0 }
 }
@@ -365,6 +372,51 @@ def controller_append_message(state: &CliState, execution: &CliExecution, histor
     cli_state_append(state, execution, &message)?;
     let projected = evidence_project_message(state, execution.session.as_str(), message.root())?;
     history.root().object_get("messages")?.array_push(history.copy(projected.root())?)
+}
+
+// Steering is admitted only between complete assistant/tool pairs. It is a
+// user message in the same execution, never a cancellation or a policy update.
+def controller_apply_steering(state: &CliState, execution: &CliExecution, options: &AgentOptions, connection: &ProviderConnection, history: &JsonDoc, terminal: &Terminal) -> Result<bool, i64> {
+    if not engine_control_enabled(&options.input) { return Result { is_ok: true, value: false, error: 0 }; };
+    if ui_poll_busy(terminal, &options.input)? { return state_bool_error(19); };
+    let mut changed = false; let mut slot = engine_control_slot(&options.input, 97);
+    while slot >= 0 {
+        let raw = options.input.get(slot).data.clone()?; let command = json_parse(raw.as_str())?;
+        let id = cli_json_string(command.root(), "id")?; let text = cli_json_string(command.root(), "text")?;
+        // Exact metadata comparison makes a previously committed ID safe even
+        // if a caller reconnects after losing its acknowledgment.
+        let mut query = state.db.prepare("SELECT message_json FROM shared_history WHERE session_id=? AND instr(message_json,?)>0")?;
+        query.bind_text(1, execution.session.as_str())?; query.bind_text(2, id.as_str())?;
+        let mut seen = false;
+        while query.step()? { let saved = query.text(0)?; let message = json_parse(saved.as_str())?;
+            if cli_json_optional_string(message.root(), "cli_steering_id").as_str() == id.as_str() { seen = true; break; };
+        };
+        if not seen {
+            let empty = json_parse("{\"images\":[]}")?;
+            let paths = if command.root().object_has("images") { command.root().object_get("images")? } else { empty.root().object_get("images")? };
+            let captured = image_request_capture(paths);
+            let supported = if paths.array_len()? == 0 { Result { is_ok: true, value: true, error: 0 } } else { controller_images_supported(state, connection.connection_id(), connection.model_id()) };
+            if not captured.is_ok() or not supported.is_ok() or not supported.value {
+                engine_control_emit("steering_rejected", id.as_str(), engine_control_active(&options.input).as_str(), "图片不可用或当前模型不支持；补充消息已保留")?;
+                engine_control_steering_receipt(&options.input, id.as_str(), 2); options.input.remove(slot); slot = engine_control_slot(&options.input, 97); continue;
+            };
+            let message = json_doc_object()?; cli_put_string(&message, message.root(), "role", "user")?; cli_put_string(&message, message.root(), "content", text.as_str())?;
+            cli_put_string(&message, message.root(), "cli_steering_id", id.as_str())?;
+            let refs = captured.value.root().object_get("image_refs")?;
+            if refs.array_len()? > 0 {
+                let previous = controller_image_grants(state, options.session.as_str())?; let grants = image_request_merge_grants(&previous, &captured.value)?;
+                cli_state_mode_save(state, execution, "image_grants", &grants)?;
+                message.root().object_set("image_refs", message.copy(refs)?)?; ();
+            };
+            cli_state_append(state, execution, &message)?;
+            history.root().object_get("messages")?.array_push(history.copy(message.root())?)?;
+            changed = true;
+        };
+        engine_control_steering_receipt(&options.input, id.as_str(), 1); options.input.remove(slot);
+        controller_event(options, execution, id.as_str(), "steering_applied", connection.connection_id(), connection.model_id(), text.as_str())?;
+        slot = engine_control_slot(&options.input, 97);
+    };
+    Result { is_ok: true, value: changed, error: 0 }
 }
 
 // Host continuation context is retained for recovery without impersonating a
@@ -538,7 +590,6 @@ def controller_reduce_context(state: &CliState, execution: &CliExecution, option
     let prompt = context_summary_prompt_with_min(&prefix, cli_json_optional_i64(plan.root(), "min_summary_chars", 500))?;
     let no_tools = json_parse("{\"tools\":[]}")?;
     let summarized = controller_request(state, execution, options, connection, &prompt, &no_tools, scheduler, task, goal, terminal, children, child_states, true);
-    controller_event(options, execution, execution.id.as_str(), "phase", connection.connection_id(), connection.model_id(), "working")?;
     if not summarized.is_ok() { if goal.status == 1 { goal.status = 2; }; return Result { is_ok: false, value: false, error: summarized.error }; };
     execution_diagnostic_stage(&options.input, "context", "", "")?;
     if summarized.value.root().object_get("tool_calls")?.array_len()? != 0 { goal.status = 2; return Result { is_ok: false, value: false, error: 10 }; };
@@ -564,7 +615,8 @@ def controller_reduce_context(state: &CliState, execution: &CliExecution, option
     // context and previous checkpoint intact; no transcript rows are removed.
     cli_state_mode_save(state, execution, "context", &mode)?;
     *history = reduced.value;
-    controller_event(options, execution, execution.id.as_str(), "notice", connection.connection_id(), connection.model_id(), if force { "Context compacted; recent tool pairs, public history and cumulative budgets were preserved." } else { "Context auto-compacted; recent tool pairs, public history and cumulative budgets were preserved." })?;
+    controller_event(options, execution, execution.id.as_str(), "context_compacted", connection.connection_id(), connection.model_id(), "上下文已压缩")?;
+    controller_event(options, execution, execution.id.as_str(), "phase", connection.connection_id(), connection.model_id(), "working")?;
     Result { is_ok: true, value: true, error: 0 }
 }
 
@@ -840,6 +892,7 @@ def controller_interrupted_tools(state: &CliState, execution: &CliExecution, his
 def controller_loop(state: &CliState, execution: &CliExecution, options: &AgentOptions, connection: &ProviderConnection, history: &mut JsonDoc, scheduler: &Scheduler, task_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, child_states: &Vec<ControllerChild>) -> Result<String, i64> {
     let tools = agent_tools()?;
     loop {
+        controller_apply_steering(state, execution, options, connection, history, terminal)?;
         execution_diagnostic_stage(&options.input, "context", "", "")?;
         let compacted = controller_reduce_context(state, execution, options, connection, history, &tools, scheduler, task_id, goal, terminal, children, child_states, false);
         if not compacted.is_ok() {
@@ -848,11 +901,13 @@ def controller_loop(state: &CliState, execution: &CliExecution, options: &AgentO
             controller_event(options, execution, execution.id.as_str(), "notice", connection.connection_id(), connection.model_id(), "Context reduction paused: complete tool history or a valid bounded summary is unavailable; the previous context checkpoint and public transcript were retained.")?;
             return string_result_err(compacted.error);
         };
+        controller_apply_steering(state, execution, options, connection, history, terminal)?;
         let turn = controller_request(state, execution, options, connection, history, &tools, scheduler, task_id, goal, terminal, children, child_states, false)?;
         if goal.status == 3 { execution_diagnostic_budget(&options.input, goal)?; return string_result_err(13); };
         history.root().object_get("messages")?.array_push(history.copy(turn.root())?)?;
         let calls = turn.root().object_get("tool_calls")?;
         if calls.array_len()? == 0 {
+            if controller_apply_steering(state, execution, options, connection, history, terminal)? { continue; };
             // A completed Responses response can explicitly declare an
             // intermediate answer. Continue the same task and budget without
             // inventing a user instruction or replaying completed tools.
@@ -1117,7 +1172,8 @@ def controller_child_record(records: &Vec<ControllerChild>, id: i64) -> i64 {
 }
 
 def controller_pump_children(state: &CliState, parent_execution: &CliExecution, parent: &AgentOptions, children: &Children, records: &Vec<ControllerChild>, scheduler: &Scheduler, goal: &mut GoalState, terminal: &Terminal) -> Result<bool, i64> {
-    children_poll(children, scheduler, goal)?;
+    let polled = children_poll(children, scheduler, goal);
+    if not polled.is_ok() { execution_diagnostic_child(&parent.input, "child_scheduler", 0, "", "")?; return polled; };
     controller_save_goal(state, parent_execution, parent, goal)?;
     let events = children_take_events(children)?;
     let entries = events.root().object_get("events")?;
@@ -1225,14 +1281,22 @@ def controller_pump_children(state: &CliState, parent_execution: &CliExecution, 
             cli_put_string(&persisted, persisted.root(), "tool_call_id", call_id.as_str())?;
             cli_put_string(&persisted, persisted.root(), "content", executed.value.as_str())?;
             cli_state_append(state, &record.execution, &persisted)?;
-            let projected = evidence_project_tool(state, record.options.session.as_str(), call_id.as_str(), executed.value.as_str())?;
-            let model_result = json_parse_limits(projected.as_str(), 1048576, 32768)?;
-            children_complete_tool(children, record.id, call_id.as_str(), &model_result, scheduler)?;
+            let projected = controller_child_tool_projection(state, &parent.input, record.id, record.options.session.as_str(), cli_json_string(call, "name")?.as_str(), call_id.as_str(), executed.value.as_str())?;
+            let completed = children_complete_tool(children, record.id, call_id.as_str(), &projected, scheduler);
+            if not completed.is_ok() { execution_diagnostic_child(&parent.input, "child_tool_context", record.id, cli_json_string(call, "name")?.as_str(), call_id.as_str())?; return completed; };
             ();
         };
         index = index + 1;
     };
     Result { is_ok: true, value: children_done(children, 0), error: 0 }
+}
+
+def controller_child_tool_projection(state: &CliState, input: &Vec<TerminalEvent>, child: i64, session: &str, tool: &str, call_id: &str, text: &str) -> Result<JsonDoc, i64> {
+    let projected = evidence_project_tool(state, session, call_id, text);
+    if not projected.is_ok() { execution_diagnostic_child(input, "child_tool_projection", child, tool, call_id)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: projected.error }; };
+    let model = json_parse_limits(projected.value.as_str(), 1048576, 32768);
+    if not model.is_ok() { execution_diagnostic_child(input, "child_tool_projection", child, tool, call_id)?; (); };
+    model
 }
 
 def controller_wait_children(state: &CliState, execution: &CliExecution, options: &AgentOptions, scheduler: &Scheduler, parent_id: i64, goal: &mut GoalState, terminal: &Terminal, children: &Children, records: &Vec<ControllerChild>, timeout_ms: i64) -> Result<bool, i64> {

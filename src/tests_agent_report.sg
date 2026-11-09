@@ -37,6 +37,13 @@ def agent_report_test_invalid_field(key: &str, encoded: &str, label: &str) -> Re
     agent_report_test_invalid(wire.as_str(), label)
 }
 
+// Keep checks as raw JSON so duplicate names are not collapsed by fixture setup.
+def agent_report_test_invalid_checks(encoded: &str, label: &str) -> Result<bool, i64> {
+    let raw = cli_join("{\"schema\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":", encoded)?;
+    raw.push_str(",\"blocker\":\"\",\"next_action\":\"\"}")?;
+    agent_report_test_invalid(raw.as_str(), label)
+}
+
 def agent_report_test_invalid_string(key: &str, value: &str, label: &str) -> Result<bool, i64> {
     let claims = agent_report_test_claims()?;
     cli_put_string(&claims, claims.root(), key, value)?;
@@ -93,7 +100,7 @@ def agent_report_test_valid() -> Result<bool, i64> {
     let items: Vec<String> = vec_new(); items.push(cli_text("completed")); items.push(cli_text("partial")); items.push(cli_text("blocked"));
     let mut index = 0;
     while index < items.len() {
-        let candidate = agent_report_test_claims()?; let outcome: &String = items.get(index);
+        let candidate = agent_report_test_claims()?; let outcome = items.get(index)?;
         cli_put_string(&candidate, candidate.root(), "outcome", outcome.as_str())?;
         candidate.root().object_set("changed_paths", candidate.new_array()?)?;
         candidate.root().object_set("checks", candidate.new_array()?)?;
@@ -144,6 +151,49 @@ def agent_report_test_invalids() -> Result<bool, i64> {
     let escaped_duplicate = cli_join("{\"schem\\u0061\":1,", tail.as_str())?;
     agent_report_test_invalid(escaped_duplicate.as_str(), "escaped duplicate root key must fail validation")?;
     agent_report_test_invalid("{\"schema\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":[{\"command\":\"fixture\",\"status\":\"fail\",\"status\":\"pass\"}],\"blocker\":\"\",\"next_action\":\"\"}", "duplicate nested key must fail validation")
+}
+
+// Exercise every missing root member, including a wire with seven members in
+// which a duplicate valid name takes the missing member's place. The runtime
+// parser currently collapses duplicates; validation must still return fallback.
+def agent_report_test_shapes() -> Result<bool, i64> {
+    println("agent report: every missing key, same-count unknown keys and replacement duplicates");
+    let original = agent_report_test_claims()?; let root = original.root();
+    let mut omitted = 0;
+    while omitted < root.object_len()? {
+        let candidate = json_doc_object()?; let mut index = 0;
+        while index < root.object_len()? {
+            if index != omitted {
+                let key = root.object_key(index)?;
+                candidate.root().object_set(key.as_str(), candidate.copy(root.object_get(key.as_str())?)?)?; ();
+            };
+            index = index + 1;
+        };
+        let wire = candidate.serialize_string()?;
+        agent_report_test_invalid(wire.as_str(), "every missing required root key must return successful fallback")?;
+        let member = json_doc_object()?; let first_key = candidate.root().object_key(0)?;
+        member.root().object_set(first_key.as_str(), member.copy(candidate.root().object_get(first_key.as_str())?)?)?;
+        let member_wire = member.serialize_string()?;
+        let prefix = str_get(member_wire.as_str(), 0, member_wire.len() - 1)?;
+        let tail = str_get(wire.as_str(), 1, wire.len())?;
+        let duplicate = cli_join(prefix.as_str(), ",")?; duplicate.push_str(tail.as_str())?;
+        agent_report_test_invalid(duplicate.as_str(), "a duplicate replacing any missing root key must return successful fallback")?;
+        cli_put_bool(&candidate, candidate.root(), "unknown", true)?;
+        let unknown = candidate.serialize_string()?;
+        agent_report_test_invalid(unknown.as_str(), "an unknown key replacing any required root key must return successful fallback")?;
+        omitted = omitted + 1;
+    };
+    agent_report_test_invalid_checks("[{\"command\":\"first\",\"command\":\"second\"}]", "duplicate command replacing status must return successful fallback")?;
+    agent_report_test_invalid_checks("[{\"status\":\"fail\",\"status\":\"pass\"}]", "duplicate status replacing command must return successful fallback")?;
+    agent_report_test_invalid_checks("[{\"command\":\"first\",\"comman\\u0064\":\"second\"}]", "escaped duplicate command replacing status must return successful fallback")?;
+    agent_report_test_invalid_checks("[{\"command|\":\"fixture\",\"status\":\"pass\"}]", "same-count unknown check key must return successful fallback")?;
+    agent_report_test_invalid_checks("[{\"command\":\"fixture\",\"status\\u0000hidden\":\"pass\"}]", "NUL in a check key must return successful fallback")?;
+    // Serialize helpers collapse duplicates, so use raw wire text to ensure the
+    // overwritten bad values and escaped names remain visible to validation.
+    agent_report_test_invalid("{\"schema\":null,\"schema\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":[],\"blocker\":\"\",\"next_action\":\"\"}", "duplicate schema must fail even when a valid value overwrites an invalid one")?;
+    agent_report_test_invalid("{\"schema\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":[{\"command\":\"fixture\",\"status\":null,\"stat\\u0075s\":\"pass\"}],\"blocker\":\"\",\"next_action\":\"\"}", "escaped duplicate status must fail even when a valid value overwrites an invalid one")?;
+    let escaped = agent_report("{\"schem\\u0061\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":[{\"comman\\u0064\":\"fixture\",\"stat\\u0075s\":\"pass\"}],\"blocker\":\"\",\"next_action\":\"\"}", 3, 0)?;
+    agent_report_test_expect(escaped.root().object_get("valid")?.bool_value()?, "unique escaped required names must validate")
 }
 
 def agent_report_test_bounds() -> Result<bool, i64> {
@@ -237,6 +287,7 @@ def agent_report_tests() -> Result<bool, i64> {
     agent_report_test_unicode()?;
     agent_report_test_valid()?;
     agent_report_test_invalids()?;
+    agent_report_test_shapes()?;
     agent_report_test_bounds()?;
     agent_report_test_nul()
 }

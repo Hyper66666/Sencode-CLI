@@ -3,10 +3,12 @@ import std::terminal;
 import std::time;
 import std::random;
 import question;
+import image_request;
 
 // Private host queue records are never terminal keystrokes. In particular a
 // queued submit cannot answer an approval. 90=partial, 91=submit, 92=cancel,
 // 93=shutdown/EOF, 94=active submission, 95=approval nonce, 96=answer.
+// 97=pending steering, 99=steering receipt, 100=native steering enabled.
 def engine_control_record(kind: i64, code: i64, text: &str) -> TerminalEvent {
     TerminalEvent { kind: kind, code: code, modifiers: 0, width: 0, height: 0, data: cli_text(text) }
 }
@@ -40,6 +42,7 @@ def engine_control_active(input: &Vec<TerminalEvent>) -> String {
 def engine_control_begin(input: &Vec<TerminalEvent>, id: &str) -> Result<bool, i64> {
     engine_control_remove(input, 92); engine_control_remove(input, 94);
     engine_control_remove(input, 95); engine_control_remove(input, 96);
+    engine_control_remove(input, 97); engine_control_remove(input, 99); engine_control_remove(input, 100);
     if not input.push(engine_control_record(94, 0, id)) { return Result { is_ok: false, value: false, error: 8 }; };
     Result { is_ok: true, value: true, error: 0 }
 }
@@ -47,6 +50,61 @@ def engine_control_begin(input: &Vec<TerminalEvent>, id: &str) -> Result<bool, i
 def engine_control_end(input: &Vec<TerminalEvent>) {
     engine_control_remove(input, 92); engine_control_remove(input, 94);
     engine_control_remove(input, 95); engine_control_remove(input, 96);
+    engine_control_remove(input, 97); engine_control_remove(input, 99); engine_control_remove(input, 100);
+}
+
+def engine_control_steering_valid(document: &JsonDoc) -> Result<bool, i64> {
+    let keys = document.root().object_keys()?; let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        if key.as_str() != "type" and key.as_str() != "id" and key.as_str() != "request_id" and key.as_str() != "text" and key.as_str() != "images" { return Result { is_ok: true, value: false, error: 0 }; };
+        index = index + 1;
+    };
+    let id = cli_json_string(document.root(), "id")?; let request = cli_json_string(document.root(), "request_id")?; let text = cli_json_string(document.root(), "text")?;
+    if id.len() == 0 or id.len() > 128 or id.len() != id.as_str().len() or request.len() == 0 or request.len() != request.as_str().len() or text.len() > 65536 or text.len() != text.as_str().len() { return Result { is_ok: true, value: false, error: 0 }; };
+    let trimmed = str_trim(text.as_str())?;
+    if trimmed.len() == 0 { return Result { is_ok: true, value: false, error: 0 }; };
+    if document.root().object_has("images") and not image_paths_valid(document.root().object_get("images")?) { return Result { is_ok: true, value: false, error: 0 }; };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def engine_control_steering_receipt(input: &Vec<TerminalEvent>, id: &str, status: i64) {
+    let mut index = 0;
+    while index < input.len() { let item: &TerminalEvent = input.get(index);
+        if item.kind == 99 and item.data.as_str() == id { input.set(index, engine_control_record(99, status, id)); return; };
+        index = index + 1;
+    };
+}
+
+def engine_control_steer(input: &Vec<TerminalEvent>, document: &JsonDoc, line: &str) -> Result<bool, i64> {
+    let id = cli_json_optional_string(document.root(), "id"); let request = cli_json_optional_string(document.root(), "request_id"); let active = engine_control_active(input);
+    let valid = engine_control_steering_valid(document);
+    if not valid.is_ok() or not valid.value or active.len() == 0 or request.as_str() != active.as_str() or engine_control_slot(input, 100) < 0 or engine_control_slot(input, 92) >= 0 or engine_control_slot(input, 93) >= 0 {
+        engine_control_emit("steering_rejected", id.as_str(), request.as_str(), "当前任务未接受补充消息；消息保留在待发队列")?;
+        return Result { is_ok: true, value: false, error: 0 };
+    };
+    let mut index = 0; let mut count = 0;
+    while index < input.len() { let item: &TerminalEvent = input.get(index);
+        if item.kind == 97 { count = count + 1; };
+        if item.kind == 99 and item.data.as_str() == id.as_str() {
+            let kind = if item.code == 1 { "steering_applied" } else { if item.code == 2 { "steering_rejected" } else { "steering_pending" } };
+            return engine_control_emit(kind, id.as_str(), request.as_str(), "");
+        }; index = index + 1;
+    };
+    if count >= 8 { return engine_control_emit("steering_rejected", id.as_str(), request.as_str(), "补充消息队列已满；消息保留在待发队列"); };
+    if not input.push(engine_control_record(97, 0, line)) or not input.push(engine_control_record(99, 0, id.as_str())) { return Result { is_ok: false, value: false, error: 8 }; };
+    engine_control_emit("steering_pending", id.as_str(), request.as_str(), "将在当前响应或工具批次完成后插入")
+}
+
+def engine_control_reject_steering(input: &Vec<TerminalEvent>) -> Result<bool, i64> {
+    let active = engine_control_active(input);
+    let mut slot = engine_control_slot(input, 97);
+    while slot >= 0 {
+        let raw = input.get(slot).data.clone()?; let command = json_parse(raw.as_str())?; let id = cli_json_string(command.root(), "id")?;
+        engine_control_emit("steering_rejected", id.as_str(), active.as_str(), "任务已结束或取消；尚未插入的消息已保留")?;
+        engine_control_steering_receipt(input, id.as_str(), 2); input.remove(slot); slot = engine_control_slot(input, 97);
+    };
+    Result { is_ok: true, value: true, error: 0 }
 }
 
 def engine_control_emit(kind: &str, id: &str, request: &str, text: &str) -> Result<bool, i64> {
@@ -68,6 +126,7 @@ def engine_control_accept(input: &Vec<TerminalEvent>, line: &str) -> Result<bool
     if document.root().kind()? != JSON_KIND_OBJECT() { engine_control_emit("notice", "invalid-command", "", "Engine JSONL commands must be objects")?; return Result { is_ok: true, value: false, error: 0 }; };
     let kind = cli_json_optional_string(document.root(), "type");
     let id = cli_json_optional_string(document.root(), "id");
+    if kind.as_str() == "steer" { return engine_control_steer(input, &document, line); };
     if kind.as_str() == "shutdown" {
         if engine_control_slot(input, 93) < 0 { input.push(engine_control_record(93, 0, "shutdown")); (); };
         return Result { is_ok: true, value: true, error: 0 };

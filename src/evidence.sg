@@ -5,13 +5,22 @@ import agent_report;
 def evidence_error(code: i64) -> Result<JsonDoc, i64> { Result { is_ok: false, value: JsonDoc { handle: 0 }, error: code } }
 def evidence_document() -> Result<JsonDoc, i64> { json_doc_object_limits(1048576, 32768) }
 
+// Evidence admits retained rows up to 16 MiB. state_digest intentionally keeps
+// the legacy 64-KiB identity contract and must not hash these larger sources.
+def evidence_digest(text: &str) -> Result<String, i64> {
+    if text.len() > 16777216 { return string_result_err(13); };
+    let digest = ffi_buffer_new(64)?;
+    hash_sha256_str_bounded(text, 16777216, digest)?;
+    string_from_buffer(digest, 64)
+}
+
 def evidence_reference(kind: &str, session: &str, id: &str, text: &str) -> Result<JsonDoc, i64> {
     if text.len() > 16777216 or session.len() == 0 or id.len() == 0 { return evidence_error(13); };
     let reference = json_doc_object()?;
     cli_put_string(&reference, reference.root(), "kind", kind)?;
     cli_put_string(&reference, reference.root(), "session_id", session)?;
     cli_put_string(&reference, reference.root(), "source_id", id)?;
-    cli_put_string(&reference, reference.root(), "sha256", state_digest(text)?.as_str())?;
+    cli_put_string(&reference, reference.root(), "sha256", evidence_digest(text)?.as_str())?;
     Result { is_ok: true, value: reference, error: 0 }
 }
 
@@ -90,7 +99,7 @@ def evidence_read(state: &CliState, execution: &CliExecution, args: &JsonDoc) ->
         return evidence_error(source.error);
     };
     let text = source.value;
-    let digest = state_digest(text.as_str())?;
+    let digest = evidence_digest(text.as_str())?;
     if expected.as_str() != digest.as_str() { return evidence_status("source_changed"); };
     let page = evidence_page(text.as_str(), cli_json_optional_i64(args.root(), "offset", 0), cli_json_optional_i64(args.root(), "limit", 4096))?;
     cli_put_string(&page, page.root(), "sha256", digest.as_str())?;

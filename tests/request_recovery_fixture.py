@@ -320,7 +320,7 @@ def main():
                             "context_window_tokens": 9000, "threshold_percent": 80, "max_input_bytes": 24000}]}), encoding="utf-8")
         for index in range(16):
             text = f"history-{index} " + ("verified 中文😀 evidence; " * 100)
-            start = compact.submit(f"history-{index}", text, goal="context work", maximum_requests=30, allow_commands=True, checks=["exit 0"])
+            start = compact.submit(f"history-{index}", text, goal="context work", maximum_requests=0, allow_commands=True, checks=["exit 0"])
             compact.result(f"history-{index}", start)
         assert RecoveryProvider.counts.get("summary", 0) >= 2, "repeated automatic compaction was not exercised"
         checkpoint = modes(database, compact.session)["context"]
@@ -330,9 +330,21 @@ def main():
         assert "<summary>" not in checkpoint["summary"]
         assert any(value.get("context_summary") for value in checkpoint["messages"]), "summary carrier lost its identity"
         cumulative = modes(database, compact.session)["goal"]["requests"]
+        assert modes(database, compact.session)["goal"]["max_requests"] == 0, "compaction does not introduce a request cap"
         assert cumulative == len(RecoveryProvider.requests) - compact_request_start, "summary requests did not share the cumulative Goal budget"
-        assert any(event.get("type") == "notice" and "auto-compacted" in event.get("text", "") for event in compact.events)
+        assert any(event.get("type") == "context_compacted" and event.get("text") == "上下文已压缩" for event in compact.events)
+        assert not any(event.get("type") == "notice" and "compacted;" in event.get("text", "") for event in compact.events)
         assert any(event.get("type") == "phase" and event.get("text") == "compacting" for event in compact.events)
+        reducing = False
+        for event in compact.events:
+            if event.get("type") == "phase" and event.get("text") == "compacting":
+                reducing = True
+            elif event.get("type") == "context_compacted":
+                assert reducing and event.get("text") == "上下文已压缩"
+                reducing = False
+            elif event.get("type") == "phase" and reducing:
+                assert event.get("text") == "compacting", "summary activity was overwritten by Working/Thinking"
+        assert not reducing, "successful compaction never reported its checkpoint"
         assert not any(SUMMARY_PRIVATE_MARKER in event.get("text", "") or SUMMARY_DRAFT_MARKER in event.get("text", "")
                        for event in compact.events if event.get("type") == "text_delta"), "internal summary appeared as public streamed output"
         with closing(sqlite3.connect(database)) as db:
@@ -343,7 +355,7 @@ def main():
         compact.stop()
         resumed = Host(executable, project, database, identifier, session)
         hosts.append(resumed)
-        start = resumed.submit("after-compact-restart", "continue compacted context", goal="context work", maximum_requests=30, allow_commands=True, checks=["exit 0"])
+        start = resumed.submit("after-compact-restart", "continue compacted context", goal="context work", maximum_requests=0, allow_commands=True, checks=["exit 0"])
         resumed.result("after-compact-restart", start)
         assert modes(database, session)["goal"]["requests"] > cumulative
         assert any("Continuation summary" in value.get("content", "") for value in RecoveryProvider.requests[-1]["messages"])
@@ -354,7 +366,7 @@ def main():
         for index in range(16, 24):
             before = modes(database, session).get("context")
             text = f"history-{index} " + ("verified 中文😀 evidence; " * 100)
-            start = resumed.submit(f"failure-{index}", text, goal="context work", maximum_requests=50, allow_commands=True, checks=["exit 0"])
+            start = resumed.submit(f"failure-{index}", text, goal="context work", maximum_requests=0, allow_commands=True, checks=["exit 0"])
             result = resumed.wait("result", f"failure-{index}", start)
             if result["code"] == 400:
                 after = modes(database, session)
@@ -372,7 +384,7 @@ def main():
         before = modes(database, session)["context"]
         before_requests = modes(database, session)["goal"]["requests"]
         summary_count = RecoveryProvider.counts["summary"]
-        start = resumed.submit("short-summary", "compact", operation="compact", goal="context work", maximum_requests=50,
+        start = resumed.submit("short-summary", "compact", operation="compact", goal="context work", maximum_requests=0,
                                allow_commands=True, checks=["exit 0"])
         resumed.result("short-summary", start, 10)
         after = modes(database, session)

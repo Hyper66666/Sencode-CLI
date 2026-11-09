@@ -61,4 +61,30 @@ def interaction_local() -> Result<bool, i64> {
     interaction_assert(app.draft.as_str() == "Historical prompt\nwith needle 中文", "Esc closes history without replacing draft")
 }
 
-def interaction_tests() -> Result<bool, i64> { interaction_questions()?; interaction_pending()?; interaction_local()?; println("interaction UI: choices/custom/cancel, pending recall, stash, history and code-copy passed"); tui_true() }
+def interaction_steering() -> Result<bool, i64> {
+    let mut app = tui_new("D:/fixture", "api", "model", "steering"); tui_resize(&mut app, 80, 30)?; tui_begin(&mut app)?;
+    let enter = interaction_key(13); tui_set_draft(&mut app, "补充条件 中文😀")?;
+    interaction_assert(tui_event(&mut app, &enter)?.kind == 0 and app.queue.len() == 1 and app.draft.len() == 0, "first Enter queues without interrupting")?;
+    let insert = tui_event(&mut app, &enter)?;
+    interaction_assert(insert.kind == 10 and insert.text.as_str() == "补充条件 中文😀" and app.busy and app.queue.len() == 1, "second Enter explicitly transfers FIFO ownership only after send succeeds")?;
+    app.inserting = cli_text("already transferring");
+    interaction_assert(tui_event(&mut app, &enter)?.kind == 0, "repeated Enter cannot duplicate a transfer awaiting acknowledgment")?; app.inserting.clear();
+    tui_set_draft(&mut app, "another condition")?; tui_event(&mut app, &enter)?;
+    interaction_assert(tui_event(&mut app, &enter)?.text.as_str() == "补充条件 中文😀" and app.queue.len() == 2, "steering preserves older queued conditions before newer ones")?;
+    let multiline = TerminalEvent { kind: 1, code: 13, modifiers: 1, width: 80, height: 30, data: string_new() };
+    interaction_assert(tui_event(&mut app, &multiline)?.kind == 0 and app.draft.as_str() == "\n", "modified Enter edits instead of steering")?;
+    tui_set_draft(&mut app, "/")?;
+    interaction_assert(tui_event(&mut app, &enter)?.kind == 0 and app.queue.len() == 2, "completion Enter never falls through to steering")?;
+    let rows: Vec<UiLine> = vec_new(); tui_message_rows(&rows, "notice", "错误 中文😀\nwrapped failure details", 12)?;
+    let mut index = 1; while index < rows.len() { interaction_assert(rows.get(index).style == 6, "NOTICE heading and every wrapped body row use red foreground")?; index = index + 1; };
+    tui_message(&mut app, "notice", "multi-line error\nretained failure")?; tui_paint_update(&mut app, true)?;
+    index = 0; while index < app.visible_group_ids.len() { interaction_assert(app.visible_group_ids.get(index).unwrap_or(0) == 0, "red notices never acquire a tool expansion hit target")?; index = index + 1; };
+    let plain = tui_paint_update(&mut app, false)?;
+    interaction_assert(not str_contains(plain.as_str(), "\x1b[31m"), "NO_COLOR keeps notices readable without red SGR sequences")?;
+    let information: Vec<UiLine> = vec_new(); tui_message_rows(&information, "status", "上下文已压缩", 80)?;
+    interaction_assert(information.len() == 1 and information.get(0).style == 2 and not str_contains(information.get(0).text.as_str(), "NOTICE"), "compaction completion is a standalone muted informational row")?;
+    tui_activity(&mut app, "compacting")?;
+    interaction_assert(str_starts_with(tui_activity_text(&app, app.phase.as_str())?.as_str(), "Compacting"), "summary generation uses Compacting")
+}
+
+def interaction_tests() -> Result<bool, i64> { interaction_questions()?; interaction_pending()?; interaction_local()?; interaction_steering()?; println("interaction UI: choices/custom/cancel, pending recall, live steering, red notices, stash, history and code-copy passed"); tui_true() }

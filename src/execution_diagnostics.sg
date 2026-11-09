@@ -1,6 +1,16 @@
 import engine_control;
 import policy;
 
+def execution_diagnostic_child(input: &Vec<TerminalEvent>, stage: &str, child: i64, tool: &str, call_id: &str) -> Result<bool, i64> {
+    if not engine_control_enabled(input) { return Result { is_ok: true, value: false, error: 0 }; };
+    let previous = execution_diagnostic_saved(input)?;
+    if previous.root().object_has("reason") { return Result { is_ok: true, value: false, error: 0 }; };
+    execution_diagnostic_failure(input, "child_coordination_failed", stage, tool, call_id, false)?;
+    let document = execution_diagnostic_saved(input)?;
+    cli_put_i64(&document, document.root(), "child_task_id", child)?;
+    execution_diagnostic_store(input, &document)
+}
+
 def execution_diagnostic_budget(input: &Vec<TerminalEvent>, goal: &GoalState) -> Result<bool, i64> {
     execution_diagnostic_failure(input, "budget", "budget", "", "", false)?;
     let document = execution_diagnostic_saved(input)?;
@@ -124,6 +134,16 @@ def execution_diagnostic_document(input: &Vec<TerminalEvent>, code: i64) -> Resu
 def execution_diagnostic_content(document: &JsonDoc) -> Result<String, i64> {
     let reason = cli_json_optional_string(document.root(), "reason");
     let unknown = document.root().object_has("outcome_unknown") and document.root().object_get("outcome_unknown")?.bool_value()?;
+    if not unknown and reason.as_str() == "child_coordination_failed" {
+        let text = cli_text("Execution paused: local child coordination failed at "); text.push_str(cli_json_optional_string(document.root(), "stage").as_str())?;
+        let child = cli_json_optional_i64(document.root(), "child_task_id", 0);
+        if child > 0 { text.push_str(" for Agent #")?; text.push_i64(child)?; (); };
+        let tool = cli_json_optional_string(document.root(), "tool");
+        if tool.len() > 0 { text.push_str(" (")?; text.push_str(tool.as_str())?; text.push_str(")")?; (); };
+        text.push_str("; code ")?; text.push_i64(cli_json_optional_i64(document.root(), "code", 1))?;
+        text.push_str(". Completed tool results were retained. The parent request was stopped for cleanup; this was not a user cancellation or an HTTP response error. Completed tools will not be replayed.")?;
+        return Result { is_ok: true, value: text, error: 0 };
+    };
     if not unknown and reason.as_str() == "budget" and document.root().object_has("requests") {
         let text = cli_text("Paused at your configured budget: ");
         let maximum = cli_json_optional_i64(document.root(), "max_requests", 0);

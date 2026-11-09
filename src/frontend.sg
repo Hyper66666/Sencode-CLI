@@ -23,6 +23,7 @@ import input_history;
 struct FrontHost {
     process: ProcessHandle, input: Buffer, output: Buffer, errors: Buffer,
     active: String, ready: bool, exit_requested: bool, stopped_at: i64,
+    steering_id: String, steering_text: String, steering_enabled: bool,
     export_path: String, export_text: String,
     permission_profile: String, agents: UiAgents,
     checkpoint_id: String, target_dirty: bool, permissions_dirty: bool, permission_retry_at: i64,
@@ -36,7 +37,40 @@ def front_spawn(state: &CliState, options: &AgentOptions) -> Result<FrontHost, i
     command.arg("resume")?; command.arg(options.session.as_str())?;
     command.cwd(options.cwd.as_str())?;
     let process = command.spawn_piped()?;
-    Result { is_ok: true, value: FrontHost { process: process, input: cli_bytes(524288), output: cli_bytes(2097152), errors: cli_bytes(65536), active: string_new(), ready: false, exit_requested: false, stopped_at: 0, export_path: string_new(), export_text: string_new(), permission_profile: cli_text("strict"), agents: tui_agents_new(), checkpoint_id: string_new(), target_dirty: false, permissions_dirty: false, permission_retry_at: 0 }, error: 0 }
+    Result { is_ok: true, value: FrontHost { process: process, input: cli_bytes(524288), output: cli_bytes(2097152), errors: cli_bytes(65536), active: string_new(), ready: false, exit_requested: false, stopped_at: 0, steering_id: string_new(), steering_text: string_new(), steering_enabled: false, export_path: string_new(), export_text: string_new(), permission_profile: cli_text("strict"), agents: tui_agents_new(), checkpoint_id: string_new(), target_dirty: false, permissions_dirty: false, permission_retry_at: 0 }, error: 0 }
+}
+
+def front_steering_restore(host: &mut FrontHost, app: &mut UiApp, uncertain: bool) -> Result<bool, i64> {
+    if host.steering_id.len() == 0 { return tui_true(); };
+    app.queue.push(InputHistory { text: string_new() }); let mut index = app.queue.len() - 1;
+    while index > 0 { let text = app.queue.get(index - 1).text.clone()?; app.queue.set(index, InputHistory { text: text }); index = index - 1; };
+    app.queue.set(0, InputHistory { text: host.steering_text.clone()? }); app.queue_paused = true;
+    host.steering_id.clear(); host.steering_text.clear(); app.inserting.clear();
+    if uncertain { return tui_message(app, "notice", "补充消息的提交状态未确认，已保留并暂停待发队列。请检查历史后再决定是否重发。"); };
+    tui_status(app, "补充消息尚未插入，已保留在待发队列")
+}
+
+def front_steer(state: &CliState, options: &AgentOptions, host: &mut FrontHost, app: &mut UiApp) -> Result<bool, i64> {
+    if not app.busy or host.active.len() == 0 or host.steering_id.len() > 0 or app.queue.len() == 0 { return tui_true(); };
+    if not host.steering_enabled { return tui_status(app, "当前引擎或操作不支持插入，消息保留在待发队列"); };
+    let text = app.queue.get(0).text.clone()?;
+    if str_starts_with(text.as_str(), "/") { return tui_status(app, "斜杠命令将在当前任务结束后执行"); };
+    let expanded = images_expand(text.as_str(), &app.images);
+    if not expanded.is_ok() { return tui_status(app, "图片引用不可用，补充消息已保留"); };
+    let paths = expanded.value.root().object_get("images")?;
+    if paths.array_len()? > 0 {
+        let supported = controller_images_supported(state, options.connection.as_str(), options.model.as_str());
+        if not supported.is_ok() or not supported.value { return tui_status(app, "当前模型不支持图片，补充消息已保留"); };
+    };
+    let document = json_doc_object()?; let id = state_id("steering-")?;
+    cli_put_string(&document, document.root(), "type", "steer")?; cli_put_string(&document, document.root(), "id", id.as_str())?;
+    cli_put_string(&document, document.root(), "request_id", host.active.as_str())?;
+    cli_put_string(&document, document.root(), "text", cli_json_string(expanded.value.root(), "text")?.as_str())?;
+    if paths.array_len()? > 0 { document.root().object_set("images", document.copy(paths)?)?; (); };
+    let sent = front_send(host, &document);
+    if not sent.is_ok() { return tui_status(app, "补充消息暂时无法发送，已保留在待发队列"); };
+    host.steering_id = id; host.steering_text = text; app.inserting = host.steering_text.clone()?; app.queue.remove(0);
+    tui_status(app, "将在当前响应或工具批次完成后插入")
 }
 
 def front_send(host: &FrontHost, document: &JsonDoc) -> Result<bool, i64> {
@@ -343,6 +377,14 @@ def front_event(host: &mut FrontHost, app: &mut UiApp, event: &JsonDoc, terminal
     if request.len() == 0 and kind.as_str() != "notice" { return tui_true(); };
     if request.len() > 0 and (host.active.len() == 0 or request.as_str() != host.active.as_str()) { return tui_true(); };
     let text = cli_json_optional_string(event.root(), "text");
+    if kind.as_str() == "context_compacted" { return tui_message(app, "status", "上下文已压缩"); };
+    if kind.as_str() == "steering_pending" { return tui_true(); };
+    if kind.as_str() == "steering_applied" or kind.as_str() == "steering_rejected" {
+        if cli_json_optional_string(event.root(), "id").as_str() != host.steering_id.as_str() or host.steering_id.len() == 0 { return tui_true(); };
+        if kind.as_str() == "steering_rejected" { return front_steering_restore(host, app, false); };
+        tui_message(app, "user", host.steering_text.as_str())?;
+        host.steering_id.clear(); host.steering_text.clear(); app.inserting.clear(); return tui_status(app, "补充条件已插入，继续任务");
+    };
     if kind.as_str() == "retry" {
         let source = cli_json_optional_string(event.root(), "session_id");
         if source.len() > 0 and source.as_str() != app.session.as_str() { return tui_true(); };
@@ -376,6 +418,7 @@ def front_event(host: &mut FrontHost, app: &mut UiApp, event: &JsonDoc, terminal
         return tui_true();
     };
     if kind.as_str() == "session" {
+        host.steering_enabled = event.root().object_has("live_steering") and event.root().object_get("live_steering")?.bool_value()?;
         let engine = cli_json_optional_string(event.root(), "engine");
         if engine.as_str() != "sengoo-native-api" and engine.len() > 0 {
             tui_mode(app, "BACKEND POLICY")?;
@@ -395,6 +438,7 @@ def front_event(host: &mut FrontHost, app: &mut UiApp, event: &JsonDoc, terminal
     if kind.as_str() == "agent" { return tui_agent_event(&host.agents, app, text.as_str()); };
     if kind.as_str() == "notice" { return tui_message(app, "notice", text.as_str()); };
     if kind.as_str() == "result" {
+        front_steering_restore(host, app, true)?;
         let content = cli_json_optional_string(event.root(), "content");
         let success = event.root().object_get("success")?.bool_value()?;
         if not app.received_text and content.len() > 0 and success { tui_delta(app, content.as_str())?; (); };
@@ -461,6 +505,7 @@ def front_pump(host: &mut FrontHost, app: &mut UiApp, terminal: &Terminal) -> Re
         };
         if not host.process.tree_quiescent()? { host.ready = false; app.queue_paused = true; host.process.terminate_tree()?; return tui_true(); };
         if app.busy { tui_finish(app, false)?; (); };
+        front_steering_restore(host, app, true)?;
         host.ready = false; host.active.clear(); host.stopped_at = time_unix_ms(); app.queue_paused = true;
         if not host.exit_requested { tui_message(app, "notice", "Execution host stopped. History and draft are retained. Use /resume to reconnect; queued tasks stay paused.")?; (); };
         changed = true;
@@ -583,6 +628,7 @@ def front_command(state: &CliState, options: &mut AgentOptions, app: &mut UiApp,
 }
 
 def front_action(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, host: &mut FrontHost, action: &UiAction, maximum: i64, tokens: i64) -> Result<bool, i64> {
+    if action.kind == 10 { return front_steer(state, options, host, app); };
     if action.kind == 9 { let mode = cli_text(permission_next(&options.policy)); return front_permission_set(state, options, app, host, mode.as_str()); };
     if action.kind == 1 {
         let parsed = slash_command(action.text.as_str());
