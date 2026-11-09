@@ -9,6 +9,19 @@ def expect_schedule(value: bool, message: &str) -> i64 {
 def check_scheduler() -> Result<i64, i64> {
     println("scheduler: limits");
     let mut failures = 0;
+    let unlimited = scheduler_new();
+    let root_unlimited = scheduler_add(&unlimited, 0, "a", ".", false)?;
+    let child_unlimited = scheduler_add(&unlimited, root_unlimited, "a", ".", false)?;
+    let mut no_cap = goal_new(0, 0); let mut request_index = 0;
+    while request_index < 160 {
+        let owner = if request_index % 2 == 0 { root_unlimited } else { child_unlimited };
+        scheduler_acquire_model(&unlimited, owner)?;
+        failures = failures + expect_schedule(scheduler_take_request(&unlimited, owner, &mut no_cap), "unlimited parent and child requests continue past fifty calls");
+        scheduler_report_usage(&unlimited, owner, &mut no_cap, 5);
+        scheduler_release_model(&unlimited, owner)?;
+        request_index = request_index + 1;
+    };
+    failures = failures + expect_schedule(no_cap.status == 1 and no_cap.requests == 160 and no_cap.tokens == 800, "unlimited admission retains shared usage accounting");
     let scheduler = scheduler_new();
     let parent = scheduler_add(&scheduler, 0, "a", ".", true)?;
     let child1 = scheduler_add(&scheduler, parent, "a", ".", false)?;

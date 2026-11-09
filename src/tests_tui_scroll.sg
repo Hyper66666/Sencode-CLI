@@ -47,10 +47,29 @@ def scroll_tests(width: i64, colored: bool) -> Result<bool, i64> {
     tui_scroll(&mut app, -1)?; tui_resize(&mut app, width - 2, 38)?;
     let resized = tui_paint_update(&mut app, colored)?;
     scroll_expect(not str_contains(resized.as_str(), "r\x1b[3;1H"), "resize invalidates region reuse")?;
+    tui_invalidate(&mut app);
+    let rebuilt = tui_paint_update(&mut app, colored)?;
+    scroll_expect(str_contains(rebuilt.as_str(), "\x1b[2J") and str_contains(rebuilt.as_str(), "SENCODE") and str_contains(rebuilt.as_str(), "╭") and str_contains(rebuilt.as_str(), "╯"), "same-size invalidation reconstructs unchanged header and composer rows")?;
+    scroll_expect(tui_paint_update(&mut app, colored)?.len() == 0, "settled reconstruction returns to zero-write idle")?;
+    let header = tui_frame_rows(&app)?;
+    scroll_expect(str_contains(header.get(0).text.as_str(), "D:/fixture") and not str_contains(header.get(0).text.as_str(), "BUILD") and str_contains(header.get(0).text.as_str(), "model"), "header owns workspace path and retains model")?;
+    tui_scroll(&mut app, 20)?;
+    let jump = tui_frame_rows(&app)?; let row = tui_jump_row(&app)?;
+    scroll_expect(str_contains(jump.get(row).text.as_str(), "▾") and jump.get(row).style == 2, "scrolled history shows muted jump marker in composer gap")?;
+    let click = TerminalMouseEvent { column: (app.width - tui_content_width(&app)) / 2 + (tui_content_width(&app) - 1) / 2, row: row, button: 1, action: 1, scroll_x: 0, scroll_y: 0, clicks: 1, modifiers: 0 };
+    let clicked = tui_mouse(&mut app, &click)?;
+    scroll_expect(clicked.kind == 0 and app.scroll == 0 and app.mouse_changed and app.draft.as_str() == draft.as_str(), "jump click reaches current tail without changing/submitting the draft")?;
+    scroll_expect(not tui_jump_visible(&app), "jump marker hides at the latest row")?;
     tui_mouse(&mut app, &scroll_wheel(10))?;
     let picker_first = tui_wheel_steps(&mut app, 90, "models", 1)?;
     let picker_next = tui_wheel_steps(&mut app, 30, "models", 1)?;
     scroll_expect(picker_first == 0 and picker_next == 1, "focus change resets fractional input before picker navigation")?;
+    let mut live = tui_new("D:/fixture", "provider", "model", "live-resize"); tui_resize(&mut live, width, 40)?;
+    tui_begin(&mut live)?; tui_delta(&mut live, "Retained prefix 中文")?; tui_paint_update(&mut live, colored)?;
+    tui_invalidate(&mut live); tui_delta(&mut live, " continued")?;
+    let restored = tui_paint_update(&mut live, colored)?;
+    scroll_expect(str_contains(restored.as_str(), "\x1b[2J") and str_contains(restored.as_str(), "Retained prefix 中文 continued"), "invalidated streaming tail repaints its entire prefix instead of appending to cleared cells")?;
+    scroll_expect(tui_paint_update(&mut live, colored)?.len() == 0, "recovered live frame returns to silent idle")?;
     tui_true()
 }
 

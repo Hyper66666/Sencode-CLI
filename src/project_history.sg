@@ -192,6 +192,7 @@ def project_history_import_modes(raw:&str)->Result<JsonDoc,i64>{
     if source.root().object_has("goal"){
         let value=source.root().object_get("goal")?;if value.kind()?!=JSON_KIND_OBJECT(){return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};
         let goal=safe.new_object()?;
+        if value.object_has("request_limit_explicit") { cli_put_bool(&safe,goal,"request_limit_explicit",value.object_get("request_limit_explicit")?.bool_value()?)?; (); };
         let fields=cli_text("requests,tokens,max_requests,token_budget,same_failure_count");let list=fields.split(",");
         loop{let field=list.next();if not field.is_some{break;};if value.object_has(field.value.as_str()){let number=value.object_get(field.value.as_str())?.number_i64()?;if number<0{list.free();return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};cli_put_i64(&safe,goal,field.value.as_str(),number)?; ();};};list.free();
         if value.object_has("requests_used"){let used=value.object_get("requests_used")?.number_i64()?;if used<0{return Result{is_ok:false,value:JsonDoc{handle:0},error:8};};let current=cli_json_optional_i64(value,"requests",0);cli_put_i64(&safe,goal,"requests",if used>current{used}else{current})?;cli_put_i64(&safe,goal,"requests_used",used)?; ();};

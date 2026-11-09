@@ -27,10 +27,10 @@ def executor_job_start(builder: &ProcessCommand, timeout_ms: i64) -> Result<Exec
     let stdout = ffi_buffer_new(1048576)?;
     let stderr = ffi_buffer_new(1048576)?;
     let state: Vec<i64> = vec_new();
-    state.push(time_unix_ms()); state.push(timeout_ms);
+    state.push(time_monotonic_ms()); state.push(timeout_ms);
     state.push(0); state.push(0); state.push(0); state.push(0);
     let process = builder.spawn_piped()?;
-    let output = ExecutorOutput { stdout: stdout, stderr: stderr, exit_code: -1, timed_out: false, cancelled: false, truncated: false };
+    let output = ExecutorOutput { stdout: stdout, stderr: stderr, exit_code: -1, timed_out: false, cancelled: false, truncated: false, timeout_phase: 0, timeout_ms: timeout_ms, elapsed_ms: 0 };
     let job = ExecutorJob { process: process, output: output, stdout_chunk: stdout_chunk, stderr_chunk: stderr_chunk, state: state };
     let closed = job.process.close_stdin();
     if not closed.is_ok() { job.state.set(3, closed.error); job.state.set(4, 1); (); };
@@ -61,10 +61,11 @@ def executor_job_poll_io(job: &mut ExecutorJob) -> Result<bool, i64> {
         if job.output.stderr.used_len() + errors <= job.output.stderr.capacity() { job.output.stderr.append_copy(&job.stderr_chunk, 0, errors)?; (); }
         else { job.output.truncated = true; };
     };
-    if not job.process.try_wait()? or not job.process.stdout_eof()? or not job.process.stderr_eof()? or not job.process.tree_quiescent()? {
+    if not job.process.try_wait()? { return Result { is_ok: true, value: false, error: 0 }; };
+    job.output.exit_code = job.process.exit_code()?;
+    if not job.process.stdout_eof()? or not job.process.stderr_eof()? or not job.process.tree_quiescent()? {
         return Result { is_ok: true, value: false, error: 0 };
     };
-    job.output.exit_code = job.process.exit_code()?;
     Result { is_ok: true, value: true, error: 0 }
 }
 
@@ -73,15 +74,11 @@ def executor_job_poll_io(job: &mut ExecutorJob) -> Result<bool, i64> {
 // cleanup remains active; the host must retain its write/execution lease.
 def executor_job_poll(job: &mut ExecutorJob) -> bool {
     if job.state.get(2).unwrap_or(0) != 0 { return true; };
-    if time_since_ms(job.state.get(0).unwrap_or(0)) >= job.state.get(1).unwrap_or(0) {
-        job.output.timed_out = true; job.state.set(4, 1); ();
-    };
-    if job.state.get(4).unwrap_or(0) != 0 and job.state.get(5).unwrap_or(0) == 0 {
-        let stopped = job.process.terminate_tree();
-        if stopped.is_ok() { job.state.set(5, 1); (); }
-        else { executor_job_record_error(job, stopped.error); };
-    };
+    job.output.elapsed_ms = time_monotonic_ms() - job.state.get(0).unwrap_or(0);
+    // Observe completion before expiring the deadline. A delayed event-loop
+    // poll must not turn already-completed work into a fabricated timeout.
     let polled = executor_job_poll_io(job);
+    let mut complete = false;
     if not polled.is_ok() {
         executor_job_record_error(job, polled.error);
         // Even a broken pipe reader cannot certify process-tree exit. Try the
@@ -91,12 +88,28 @@ def executor_job_poll(job: &mut ExecutorJob) -> bool {
         if settled.is_ok() and settled.value and waited.is_ok() and waited.value {
             // Tree death is sufficient on an I/O failure: there is no process
             // left to mutate workspace state. Buffered output is marked failed.
-            job.state.set(2, 1); return true;
+            complete = true;
         };
-        return false;
+        ();
+    } else { complete = polled.value; };
+    if not complete and job.state.get(4).unwrap_or(0) == 0 and job.output.elapsed_ms >= job.state.get(1).unwrap_or(0) {
+        let exited = job.process.try_wait(); let quiet = job.process.tree_quiescent();
+        // No writers means finite buffered bytes can drain on later bounded
+        // polls. Only expire a process/tree which is actually still active.
+        if not (exited.is_ok() and exited.value and quiet.is_ok() and quiet.value) {
+            job.output.timed_out = true;
+            job.output.timeout_phase = if exited.is_ok() and exited.value { 2 } else { 1 };
+            job.state.set(4, 1);
+            ();
+        };
     };
-    if polled.value { job.state.set(2, 1); (); };
-    polled.value
+    if not complete and job.state.get(4).unwrap_or(0) != 0 and job.state.get(5).unwrap_or(0) == 0 {
+        let stopped = job.process.terminate_tree();
+        if stopped.is_ok() { job.state.set(5, 1); (); }
+        else { executor_job_record_error(job, stopped.error); };
+    };
+    if complete { job.state.set(2, 1); (); };
+    complete
 }
 
 def executor_job_result(job: &ExecutorJob) -> Result<JsonDoc, i64> {

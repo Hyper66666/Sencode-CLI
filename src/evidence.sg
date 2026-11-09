@@ -1,0 +1,235 @@
+import state;
+import agent_report;
+
+// Evidence is a view over retained data, not a second persistence owner.
+def evidence_error(code: i64) -> Result<JsonDoc, i64> { Result { is_ok: false, value: JsonDoc { handle: 0 }, error: code } }
+def evidence_document() -> Result<JsonDoc, i64> { json_doc_object_limits(1048576, 32768) }
+
+def evidence_reference(kind: &str, session: &str, id: &str, text: &str) -> Result<JsonDoc, i64> {
+    if text.len() > 16777216 or session.len() == 0 or id.len() == 0 { return evidence_error(13); };
+    let reference = json_doc_object()?;
+    cli_put_string(&reference, reference.root(), "kind", kind)?;
+    cli_put_string(&reference, reference.root(), "session_id", session)?;
+    cli_put_string(&reference, reference.root(), "source_id", id)?;
+    cli_put_string(&reference, reference.root(), "sha256", state_digest(text)?.as_str())?;
+    Result { is_ok: true, value: reference, error: 0 }
+}
+
+def evidence_status(status: &str) -> Result<JsonDoc, i64> {
+    let result = json_doc_object()?;
+    cli_put_string(&result, result.root(), "status", status)?;
+    cli_put_bool(&result, result.root(), "is_error", true)?;
+    cli_put_bool(&result, result.root(), "recoverable", true)?;
+    cli_put_bool(&result, result.root(), "no_side_effects", true)?;
+    cli_put_string(&result, result.root(), "content", "Evidence cannot be read at this reference or byte cursor. No source operation was executed.")?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def evidence_session_allowed(state: &CliState, requester: &str, target: &str) -> Result<bool, i64> {
+    if requester == target { return Result { is_ok: true, value: true, error: 0 }; };
+    // Origin is historical data. This grants read access only, never an execution
+    // claim, command permission, Goal continuation or tool replay authority.
+    let mut query = state.db.prepare("SELECT 1 FROM sessions c JOIN sessions p ON p.project_id=c.project_id JOIN shared_modes m ON m.session_id=c.id WHERE p.id=? AND c.id=? AND c.id<>p.id AND c.archived=0 AND p.archived=0 AND json_type(m.mode_json,'$.session_origin')='object' AND json_extract(m.mode_json,'$.session_origin.version')=1 AND json_type(m.mode_json,'$.session_origin.version')='integer' AND json_extract(m.mode_json,'$.session_origin.kind')='child' AND json_extract(m.mode_json,'$.session_origin.parent_session_id')=p.id AND (SELECT count(*) FROM json_each(m.mode_json) WHERE key='session_origin')=1 AND (SELECT count(*) FROM json_each(m.mode_json,'$.session_origin') WHERE key='version')=1 AND (SELECT count(*) FROM json_each(m.mode_json,'$.session_origin') WHERE key='kind')=1 AND (SELECT count(*) FROM json_each(m.mode_json,'$.session_origin') WHERE key='parent_session_id')=1")?;
+    query.bind_text(1, requester)?; query.bind_text(2, target)?;
+    Result { is_ok: true, value: query.step()?, error: 0 }
+}
+
+def evidence_source(state: &CliState, requester: &str, target: &str, kind: &str, id: &str) -> Result<String, i64> {
+    if not evidence_session_allowed(state, requester, target)? { return string_result_err(5); };
+    let sql = if kind == "tool_result" {
+        "SELECT length(CAST(result AS BLOB)),result FROM shared_tool_ledger WHERE session_id=? AND call_id=? AND state='complete' AND result IS NOT NULL"
+    } else { if kind == "assistant_text" {
+        "SELECT length(CAST(text AS BLOB)),text FROM messages WHERE session_id=? AND id=? AND role='assistant' AND completed_at IS NOT NULL"
+    } else { return string_result_err(2); } };
+    let mut query = state.db.prepare(sql)?;
+    query.bind_text(1, target)?; query.bind_text(2, id)?;
+    if not query.step()? { return string_result_err(5); };
+    let bytes = query.integer(0)?;
+    if bytes < 0 or bytes > 16777216 { return string_result_err(13); };
+    let text = query.text(1)?;
+    if text.len() != bytes or text.len() != text.as_str().len() { return string_result_err(10); };
+    Result { is_ok: true, value: text, error: 0 }
+}
+
+def evidence_page(text: &str, offset: i64, limit: i64) -> Result<JsonDoc, i64> {
+    if offset < 0 or offset > text.len() or limit < 4 or limit > 16384 or text.len() > 16777216 { return evidence_status("invalid_cursor"); };
+    let start = str_get(text, offset, offset);
+    if not start.is_ok() { return evidence_status("invalid_cursor"); };
+    let mut end = offset + limit;
+    if end > text.len() { end = text.len(); };
+    let mut retries = 0;
+    loop {
+        let page = str_get(text, offset, end);
+        if page.is_ok() {
+            let result = json_doc_object_bounded(131072)?;
+            cli_put_string(&result, result.root(), "status", "available")?;
+            cli_put_string(&result, result.root(), "content", page.value.as_str())?;
+            cli_put_i64(&result, result.root(), "offset", offset)?;
+            cli_put_i64(&result, result.root(), "next_offset", end)?;
+            cli_put_i64(&result, result.root(), "total_bytes", text.len())?;
+            cli_put_bool(&result, result.root(), "done", end == text.len())?;
+            cli_put_bool(&result, result.root(), "is_error", false)?;
+            return Result { is_ok: true, value: result, error: 0 };
+        };
+        if page.error != 2 { return evidence_error(page.error); };
+        if retries >= 3 or end <= offset { return evidence_status("invalid_cursor"); };
+        end = end - 1; retries = retries + 1;
+    };
+    evidence_status("invalid_cursor")
+}
+
+def evidence_read(state: &CliState, execution: &CliExecution, args: &JsonDoc) -> Result<JsonDoc, i64> {
+    state_exec_valid(state, execution)?;
+    let target = cli_json_string(args.root(), "session_id")?;
+    let kind = cli_json_string(args.root(), "kind")?;
+    let id = cli_json_string(args.root(), "source_id")?;
+    let expected = cli_json_string(args.root(), "sha256")?;
+    let source = evidence_source(state, execution.session.as_str(), target.as_str(), kind.as_str(), id.as_str());
+    if not source.is_ok() {
+        if source.error == 2 or source.error == 5 or source.error == 10 or source.error == 13 { return evidence_status("unavailable"); };
+        return evidence_error(source.error);
+    };
+    let text = source.value;
+    let digest = state_digest(text.as_str())?;
+    if expected.as_str() != digest.as_str() { return evidence_status("source_changed"); };
+    let page = evidence_page(text.as_str(), cli_json_optional_i64(args.root(), "offset", 0), cli_json_optional_i64(args.root(), "limit", 4096))?;
+    cli_put_string(&page, page.root(), "sha256", digest.as_str())?;
+    Result { is_ok: true, value: page, error: 0 }
+}
+
+def evidence_child_reference(state: &CliState, session: &str, content: &str) -> Result<JsonDoc, i64> {
+    let mut row = state.db.prepare("SELECT id,length(CAST(text AS BLOB)),text FROM messages WHERE session_id=? AND role='assistant' AND completed_at IS NOT NULL ORDER BY revision DESC,created_at DESC,id DESC LIMIT 1")?;
+    row.bind_text(1, session)?;
+    if not row.step()? or row.integer(1)? > 16777216 { return evidence_error(5); };
+    let saved = row.text(2)?;
+    if saved.as_str() != content { return evidence_error(5); };
+    evidence_reference("assistant_text", session, row.text(0)?.as_str(), content)
+}
+
+// Keep attribution/status keys intact; only model-facing child content changes.
+def evidence_child_snapshot(state: &CliState, snapshot: &JsonDoc) -> Result<JsonDoc, i64> {
+    let out = evidence_document()?;
+    let target = out.new_array()?; out.root().object_set("children", target)?;
+    let children = snapshot.root().object_get("children")?;
+    if children.array_len()? > 32 { return evidence_error(13); };
+    let mut index = 0;
+    while index < children.array_len()? {
+        let child = children.array_get(index)?;
+        let content = cli_json_optional_string(child, "content");
+        let row = out.new_object()?;
+        let keys = child.object_keys()?; let mut key_index = 0;
+        while key_index < keys.root().array_len()? {
+            let key = keys.root().array_get(key_index)?.string_value()?;
+            if key.as_str() != "content" { row.object_set(key.as_str(), out.copy(child.object_get(key.as_str())?)?)?; (); };
+            key_index = key_index + 1;
+        };
+        if child.object_get("done")?.bool_value()? {
+            let report = agent_report(content.as_str(), cli_json_optional_i64(child, "status", -1), cli_json_optional_i64(child, "error", -1))?;
+            row.object_set("report", out.copy(report.root())?)?;
+            let summary = cli_json_string(report.root(), "summary")?;
+            cli_put_string(&out, row, "content", if content.len() <= 4096 { content.as_str() } else { summary.as_str() })?;
+            cli_put_bool(&out, row, "content_truncated", content.len() > 4096)?;
+            let reference = evidence_child_reference(state, cli_json_string(child, "session_id")?.as_str(), content.as_str());
+            cli_put_bool(&out, row, "evidence_available", reference.is_ok())?;
+            if reference.is_ok() { row.object_set("evidence_ref", out.copy(reference.value.root())?)?; (); };
+        } else { cli_put_string(&out, row, "content", "")?; (); };
+        target.array_push(row)?; index = index + 1;
+    };
+    Result { is_ok: true, value: out, error: 0 }
+}
+
+def evidence_project_tool(state: &CliState, session: &str, call_id: &str, text: &str) -> Result<String, i64> {
+    let mut ledger = state.db.prepare("SELECT name FROM shared_tool_ledger WHERE session_id=? AND call_id=? AND state='complete' AND result=?")?;
+    ledger.bind_text(1, session)?; ledger.bind_text(2, call_id)?; ledger.bind_text(3, text)?;
+    // Uncommitted/interrupted results cannot acquire a fabricated reference.
+    if not ledger.step()? { return string_from_str(text); };
+    let name = ledger.text(0)?;
+    if name.as_str() == "read_evidence" { return string_from_str(text); };
+    if name.as_str() == "list_agents" or name.as_str() == "wait_agents" or name.as_str() == "cancel_agent" {
+        let raw = json_parse_limits(text, 16777216, 65536)?;
+        if raw.root().object_has("children") { return evidence_child_snapshot(state, &raw)?.serialize_string(); };
+    };
+    if text.len() <= 16384 or text.len() > 16777216 { return string_from_str(text); };
+    let original = json_parse_limits(text, 16777216, 65536)?;
+    let result = json_doc_object_bounded(131072)?;
+    // Every host control flag is preserved, including uncertainty and permissions.
+    let keys = original.root().object_keys()?; let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        if key.as_str() != "content" {
+            let value = original.root().object_get(key.as_str())?;
+            // Large structured payloads also stay in the exact retained source.
+            if value.kind()? != JSON_KIND_ARRAY() and value.kind()? != JSON_KIND_OBJECT() and (value.kind()? != JSON_KIND_STRING() or value.string_value()?.len() <= 2048) { result.root().object_set(key.as_str(), result.copy(value)?)?; (); };
+        };
+        index = index + 1;
+    };
+    let preview = agent_report_excerpt(cli_json_optional_string(original.root(), "content").as_str(), 4096)?;
+    cli_put_string(&result, result.root(), "content", preview.as_str())?;
+    cli_put_bool(&result, result.root(), "content_truncated", true)?;
+    cli_put_i64(&result, result.root(), "retained_result_bytes", text.len())?;
+    cli_put_string(&result, result.root(), "evidence_format", "tool-result-json")?;
+    let reference = evidence_reference("tool_result", session, call_id, text)?;
+    result.root().object_set("evidence_ref", result.copy(reference.root())?)?;
+    result.serialize_string()
+}
+
+// Project only a tool message's content. Never change calls, IDs or group order.
+def evidence_project_message(state: &CliState, session: &str, message: JsonValue) -> Result<JsonDoc, i64> {
+    let row = evidence_document()?;
+    let keys = message.object_keys()?; let mut index = 0;
+    while index < keys.root().array_len()? {
+        let key = keys.root().array_get(index)?.string_value()?;
+        if key.as_str() != "content" { row.root().object_set(key.as_str(), row.copy(message.object_get(key.as_str())?)?)?; (); };
+        index = index + 1;
+    };
+    let original = cli_json_optional_string(message, "content");
+    let text = if cli_json_optional_string(message, "role").as_str() == "tool" {
+        evidence_project_tool(state, session, cli_json_string(message, "tool_call_id")?.as_str(), original.as_str())?
+    } else { if message.object_has("cli_child_snapshot") and message.object_get("cli_child_snapshot")?.bool_value()? and message.object_has("cli_internal") and message.object_get("cli_internal")?.bool_value()? and str_starts_with(original.as_str(), evidence_snapshot_prefix()) {
+        let encoded = str_get(original.as_str(), evidence_snapshot_prefix().len(), original.len())?;
+        let snapshot = json_parse_limits(encoded.as_str(), 16777216, 65536)?;
+        cli_join(evidence_snapshot_prefix(), evidence_child_snapshot(state, &snapshot)?.serialize_string()?.as_str())?
+    } else { original.clone()? } };
+    cli_put_string(&row, row.root(), "content", text.as_str())?;
+    Result { is_ok: true, value: row, error: 0 }
+}
+
+// Canonical model tail: all requested rows or explicit failure. Public/UI state
+// readers remain unchanged. SQL byte lengths are checked before allocating rows.
+def evidence_history_window(state: &CliState, session: &str, start: i64, count: i64, total: i64, max_bytes: i64) -> Result<JsonDoc, i64> {
+    if start < 0 or count < 0 or start > total or count != total - start or count > 999 or max_bytes < 64 or max_bytes > 786432 { return evidence_error(13); };
+    let result = evidence_document()?;
+    let items = result.new_array()?; result.root().object_set("messages", items)?;
+    let mut query = state.db.prepare("SELECT m.role,m.text,h.message_json,CASE WHEN h.message_json IS NULL THEN length(CAST(m.text AS BLOB)) ELSE length(CAST(h.message_json AS BLOB)) END FROM messages m LEFT JOIN shared_history h ON h.message_id=m.id WHERE m.session_id=? ORDER BY m.revision,m.created_at,m.id LIMIT ? OFFSET ?")?;
+    query.bind_text(1, session)?; query.bind_i64(2, count)?; query.bind_i64(3, start)?;
+    let mut admitted = 64; let mut rows = 0; let mut source_bytes = 0;
+    while query.step()? {
+        let size = query.integer(3)?;
+        // Bound total work as well as each row; no unbounded large-history scan.
+        if size < 0 or size > 16777216 or source_bytes > 67108864 - size { return evidence_error(13); };
+        source_bytes = source_bytes + size;
+        let original = if query.is_null(2)? {
+            let fallback = json_doc_object_limits(16777216, 32768)?;
+            cli_put_string(&fallback, fallback.root(), "role", query.text(0)?.as_str())?;
+            cli_put_string(&fallback, fallback.root(), "content", query.text(1)?.as_str())?;
+            fallback
+        } else {
+            let raw = query.text(2)?;
+            if raw.len() != raw.as_str().len() { return evidence_error(10); };
+            json_parse_limits(raw.as_str(), 16777216, 65536)?
+        };
+        let projected = evidence_project_message(state, session, original.root())?;
+        let bytes = projected.serialize_string()?.len() + 1;
+        if bytes > max_bytes - admitted { return evidence_error(13); };
+        admitted = admitted + bytes;
+        items.array_push(result.copy(projected.root())?)?; rows = rows + 1;
+    };
+    if rows != count { return evidence_error(12); };
+    result.serialize_string()?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+def evidence_snapshot_prefix() -> &str { "Current child task results (all terminal; summarize their findings once, retain useful provider attribution and omit internal IDs):\n" }
+
+def evidence_tool_schema() -> Result<JsonDoc, i64> {
+    json_parse("{\"name\":\"read_evidence\",\"description\":\"Read retained tool-result JSON or assistant text by an exact evidence reference. Requires kind, session_id, source_id and sha256 from the host. Pages use UTF-8 byte offsets; use next_offset to continue. Only your session and its direct children are readable; missing/changed evidence never reruns a tool.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"tool_result\",\"assistant_text\"]},\"session_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":256},\"source_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":256},\"sha256\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{64}$\"},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":16777216},\"limit\":{\"type\":\"integer\",\"minimum\":4,\"maximum\":16384}},\"required\":[\"kind\",\"session_id\",\"source_id\",\"sha256\"],\"additionalProperties\":false}}")
+}

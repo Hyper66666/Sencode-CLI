@@ -40,6 +40,7 @@ struct UiApp {
     previous_frame: String, previous_rows: Vec<InputHistory>, previous_styles: Vec<i64>, previous_spans: Vec<InputHistory>, visible_tool_ids: Vec<i64>, previous_width: i64, previous_height: i64,
     previous_view_start: i64, previous_view_height: i64, previous_view_safe: bool, previous_colored: bool,
     previous_cursor_row: i64, previous_cursor_column: i64, previous_cursor_visible: bool,
+    resize_settle_at: i64,
     images: Vec<UiImageRef>, open_groups: Vec<i64>, group_focus: i64, visible_group_ids: Vec<i64>,
 }
 
@@ -66,7 +67,7 @@ def tui_new(cwd: &str, connection: &str, model: &str, session: &str) -> UiApp {
         approval_options: approval_options, approval_selected: 0, approval_custom: false,
         messages: messages, transcript: transcript, transcript_bytes: 0, next_message_id: 1, streaming: string_new(), stream_lines: stream_lines, stream_tail: string_new(), stream_markdown: md_new(), stream_id: 0, tail_rows: tail_rows, tail_plain: false, scroll: 0, wheel_remainder: 0, wheel_focus: string_new(), mouse_changed: false,
         previous_frame: string_new(), previous_rows: ui_history_empty(), previous_styles: previous_styles, previous_spans: ui_history_empty(), visible_tool_ids: visible_tool_ids, previous_width: 0, previous_height: 0, previous_view_start: 0, previous_view_height: 0, previous_view_safe: false, previous_colored: true,
-        previous_cursor_row: -1, previous_cursor_column: -1, previous_cursor_visible: false, images: images, open_groups: ui_ids_empty(), group_focus: 0, visible_group_ids: ui_ids_empty() }
+        previous_cursor_row: -1, previous_cursor_column: -1, previous_cursor_visible: false, resize_settle_at: 0, images: images, open_groups: ui_ids_empty(), group_focus: 0, visible_group_ids: ui_ids_empty() }
 }
 
 def tui_content_width(app: &UiApp) -> i64 { let available = app.width - 4; if available > 100 { 100 } else { if available < 8 { 8 } else { available } } }
@@ -186,7 +187,18 @@ def tui_reflow(app: &mut UiApp) -> Result<bool, i64> {
 
 def tui_resize(app: &mut UiApp, width: i64, height: i64) -> Result<bool, i64> {
     let w = if width < 12 { 12 } else { if width > 500 { 500 } else { width } }; let h = if height < 6 { 6 } else { if height > 300 { 300 } else { height } };
-    if app.width != w or app.height != h { selection_clear(&mut app.selection); app.width = w; app.height = h; tui_reflow(app)?; app.previous_frame.clear(); (); }; tui_true()
+    if app.width != w or app.height != h {
+        let old_width = tui_content_width(app); let anchor = tui_read_anchor(app);
+        selection_clear(&mut app.selection); app.width = w; app.height = h;
+        if old_width != tui_content_width(app) { tui_reflow(app)?; (); } else { tui_restore_read_anchor(app, anchor); };
+        tui_invalidate(app); app.resize_settle_at = time_monotonic_ms() + 80;
+    }; tui_true()
+}
+
+def tui_invalidate(app: &mut UiApp) { app.previous_frame.clear(); app.previous_view_safe = false; (); }
+
+def tui_resize_settled(app: &mut UiApp, now: i64) -> bool {
+    if app.resize_settle_at > 0 and now >= app.resize_settle_at { app.resize_settle_at = 0; tui_invalidate(app); return true; }; false
 }
 
 def tui_target(app: &mut UiApp, connection: &str, model: &str, session: &str) -> Result<bool, i64> {
@@ -263,11 +275,13 @@ def tui_tool(app: &mut UiApp, key: &str, name: &str, status: &str, detail: &str,
     if slot >= 0 and app.messages.get(slot).tool_status.as_str() != "running" { return tui_true(); };
     if slot < 0 { tui_seal_stream(app)?; (); };
     let safe_name = tui_limit(name, 128)?;
-    let safe_detail = if detail.len() == 0 and slot >= 0 { app.messages.get(slot).tool_detail.clone()? } else { tui_limit(detail, 512)? };
+    let safe_detail = if detail.len() == 0 and slot >= 0 { app.messages.get(slot).tool_detail.clone()? } else { tui_limit(detail, if name == "run_command" { 8192 } else { 512 })? };
+    let script_boundary = str_index_of(safe_detail.as_str(), "\n");
     let summary = cli_text("  "); summary.push_str(safe_name.as_str())?;
-    if safe_detail.len() > 0 { summary.push_str("  ")?; summary.push_str(safe_detail.as_str())?; (); };
+    if safe_detail.len() > 0 { summary.push_str("  ")?; if script_boundary >= 0 { let heading = cli_byte_slice(safe_detail.as_str(), 0, script_boundary)?; summary.push_str(heading.as_str())?; (); } else { summary.push_str(safe_detail.as_str())?; (); }; };
     summary.push_str("  ·  ")?; summary.push_str(status)?;
     if error.len() > 0 { summary.push_str("\n")?; summary.push_str(tui_limit(error, 2048)?.as_str())?; (); };
+    if script_boundary >= 0 { summary.push_str(cli_byte_slice(safe_detail.as_str(), script_boundary, safe_detail.len())?.as_str())?; (); };
     let now = time_monotonic_ms(); let id = if slot >= 0 { app.messages.get(slot).id } else { let value = app.next_message_id; app.next_message_id = value + 1; value };
     let started = if slot >= 0 { app.messages.get(slot).tool_started } else { now };
     let replacement = UiMessage { id: id, role: cli_text("tool"), text: summary, tool_key: cli_text(key), tool_name: safe_name, tool_detail: safe_detail, tool_status: cli_text(status), tool_started: started, tool_ended: if status == "running" { 0 } else { now }, tool_phase: if slot >= 0 { app.messages.get(slot).tool_phase.clone()? } else { cli_text("working") } };
@@ -816,7 +830,7 @@ def tui_editor_event(app: &mut UiApp, event: &TerminalEvent) -> Result<bool, i64
 }
 
 def tui_event(app: &mut UiApp, event: &TerminalEvent) -> Result<UiAction, i64> {
-    if event.kind == 3 { tui_resize(app, event.width, event.height)?; return tui_none(); };
+    if event.kind == 3 { tui_resize(app, event.width, event.height)?; tui_invalidate(app); app.resize_settle_at = time_monotonic_ms() + 80; return tui_none(); };
     if app.approval.len() == 0 and app.picker.len() == 0 and selection_has(&app.selection) {
         if event.kind == 4 or event.kind == 1 and event.code == 3 {
             return Result { is_ok: true, value: UiAction { kind: 6, text: selection_text(&app.selection)?, context: cli_text("clipboard-selection") }, error: 0 };
@@ -1060,10 +1074,15 @@ def tui_permission_style(label: &str) -> i64 {
 
 def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
     let rows: Vec<UiLine> = vec_new(); let width = tui_content_width(app); let margin = (app.width - width) / 2;
-    let header = cli_text("SENCODE"); header.push_str("  /  ")?; header.push_str(app.mode.as_str())?;
-    if app.reading.active { header.push_str("  /  READING")?; (); } else { if app.keymap.mode.as_str() == "vim" { header.push_str(if app.vim.insert { "  /  VIM INSERT" } else { "  /  VIM NORMAL" })?; (); }; };
-    let target = if app.busy and app.active_model.len() > 0 { app.active_model.clone()? } else { if app.model.len() > 0 { app.model.clone()? } else { cli_text("no model selected") } }; let gap = width - ui_cells(header.as_str())? - ui_cells(target.as_str())?;
-    if gap > 1 { header.push_str(ui_repeat(" ", gap)?.as_str())?; header.push_str(target.as_str())?; (); };
+    let target = ui_fit(if app.busy and app.active_model.len() > 0 { app.active_model.as_str() } else { if app.model.len() > 0 { app.model.as_str() } else { "no model selected" } }, if width > 16 { width - 10 } else { 0 })?;
+    let header_budget = width - ui_cells(target.as_str())? - if target.len() > 0 { 2 } else { 0 };
+    let header = cli_text("SENCODE");
+    let state = if str_starts_with(app.mode.as_str(), "PLAN") { " PLAN" } else { if app.reading.active { " READ" } else { if app.keymap.mode.as_str() == "vim" { if app.vim.insert { " INSERT" } else { " NORMAL" } } else { "" } } };
+    header.push_str(state)?;
+    let path_budget = header_budget - ui_cells(header.as_str())? - 2;
+    if path_budget > 0 { header.push_str("  ")?; header.push_str(ui_fit(app.cwd.as_str(), path_budget)?.as_str())?; (); };
+    let gap = width - ui_cells(header.as_str())? - ui_cells(target.as_str())?;
+    if target.len() > 0 and gap > 0 { header.push_str(ui_repeat(" ", gap)?.as_str())?; header.push_str(target.as_str())?; (); };
     tui_row(&rows, ui_fit(header.as_str(), width)?.as_str())?; tui_row(&rows, ui_repeat("─", width)?.as_str())?;
     let composer = images_layout(app.draft.as_str(), app.cursor, tui_composer_width(app))?; let visible = tui_visible_composer(app, &composer); let body_height = app.height - visible - 7;
     let menu_visible = app.menu_open or app.picker.len() > 0 or app.approval.len() > 0; let menu_max = if app.picker.as_str() == "models" { body_height - 2 } else { if body_height > 9 { 6 } else { if body_height > 3 { body_height - 2 } else { 0 } } };
@@ -1106,7 +1125,7 @@ def tui_frame_rows(app: &UiApp) -> Result<Vec<UiLine>, i64> {
         } else { tui_row(&rows, "")?; (); }; }; index = index + 1; };
     tui_copy_rows(&rows, &menu)?;
     tui_copy_rows(&rows, &pending)?;
-    tui_row(&rows, "")?;
+    if tui_jump_visible(app) { let jump = ui_repeat(" ", (width - 1) / 2)?; jump.push_str("▾")?; md_row(&rows, jump.as_str(), 2, 0)?; (); } else { tui_row(&rows, "")?; (); };
     let top = cli_text("╭─ "); top.push_str(if app.queue_edit_index >= 0 { "EDIT QUEUED TASK " } else { if app.busy { "NEXT MESSAGE " } else { "MESSAGE " } })?; let fill = width - ui_cells(top.as_str())? - 1; top.push_str(ui_repeat("─", fill)?.as_str())?; top.push_str("╮")?; tui_row(&rows, top.as_str())?;
     let start = if composer.cursor_row >= visible { composer.cursor_row - visible + 1 } else { 0 }; index = start;
     while index < start + visible {
@@ -1235,6 +1254,12 @@ def tui_paint_update(app: &mut UiApp, colored: bool) -> Result<String, i64> {
     let cursor_changed = app.previous_cursor_row != cursor_row or app.previous_cursor_column != cursor_column or app.previous_cursor_visible != cursor_visible;
     if not frame_changed and not cursor_changed { app.previous_view_start = view_start; app.previous_view_height = view_height; app.previous_view_safe = view_safe; return string_from_str(""); };
     let out = string_new(); index = 0;
+    let repaint = app.previous_frame.len() == 0 or app.previous_width != app.width or app.previous_height != app.height;
+    if repaint { out.push_str("\x1b[0m\x1b[?6l\x1b[r\x1b[2J\x1b[H")?; (); };
+    // No soft wraps at the right/bottom edge: resize can change geometry
+    // between computing a frame and terminal delivery. Atomic row addresses
+    // and a settled recovery repaint repair such races without scrolling UI.
+    out.push_str("\x1b[?7l")?;
     // Shift only an unchanged overlapping message viewport. The comparison
     // includes semantic spans; overlays, resize and changed content fall back
     // to ordinary row differences. The fixed composer is outside this region.
@@ -1264,12 +1289,12 @@ def tui_paint_update(app: &mut UiApp, colored: bool) -> Result<String, i64> {
         if shift != 0 and index >= 2 and index < 2 + view_height { before = index + shift; entering = before < 2 or before >= 2 + view_height; };
         let old_text = if not entering and before >= 0 and before < app.previous_rows.len() { app.previous_rows.get(before).text.as_str() } else { "" };
         let old_valid = not entering and before >= 0 and before < app.previous_rows.len() and before < app.previous_styles.len() and before < app.previous_spans.len();
-        if not old_valid or span_keys.get(index).text.as_str() != app.previous_spans.get(before).text.as_str() or old_text != row.text.as_str() or app.previous_styles.get(before).value != row.style or app.previous_width != app.width or app.previous_height != app.height or colored != app.previous_colored {
+        if repaint or not old_valid or span_keys.get(index).text.as_str() != app.previous_spans.get(before).text.as_str() or old_text != row.text.as_str() or app.previous_styles.get(before).value != row.style or app.previous_width != app.width or app.previous_height != app.height or colored != app.previous_colored {
             let emphasis = row_number == 1 or row.message_id == 0 and str_contains(row.text.as_str(), "█");
             let selected = app.picker.as_str() != "models" and row.message_id == 0 and str_contains(row.text.as_str(), "› ");
             let panel = selected;
             let mut append_column = 0;
-            if old_valid and row.spans.len() == 0 and app.previous_spans.get(before).text.len() == 0 and row.message_id > 0 and app.previous_styles.get(before).value == row.style and app.previous_width == app.width and app.previous_height == app.height and colored == app.previous_colored {
+            if not repaint and old_valid and row.spans.len() == 0 and app.previous_spans.get(before).text.len() == 0 and row.message_id > 0 and app.previous_styles.get(before).value == row.style and app.previous_width == app.width and app.previous_height == app.height and colored == app.previous_colored {
                 append_column = tui_append_column(old_text, row.text.as_str(), app.width)?;
             };
             out.push_str("\x1b[")?; out.push_i64(row_number)?; out.push_str(";")?;
@@ -1294,6 +1319,7 @@ def tui_paint_update(app: &mut UiApp, colored: bool) -> Result<String, i64> {
     };
     out.push_str("\x1b[")?; out.push_i64(cursor_row)?; out.push_str(";")?; out.push_i64(cursor_column)?; out.push_str("H")?;
     if cursor_visible and not app.previous_cursor_visible { out.push_str("\x1b[?25h")?; (); };
+    out.push_str("\x1b[?7h")?;
     app.previous_frame = frame; app.previous_rows = text_rows; app.previous_styles = styles; app.previous_spans = span_keys; app.previous_width = app.width; app.previous_height = app.height; app.previous_cursor_row = cursor_row; app.previous_cursor_column = cursor_column; app.previous_cursor_visible = cursor_visible;
     app.previous_view_start = view_start; app.previous_view_height = view_height; app.previous_view_safe = view_safe; app.previous_colored = colored;
     Result { is_ok: true, value: out, error: 0 }
@@ -1306,12 +1332,27 @@ def tui_paint(terminal: &Terminal, app: &mut UiApp) -> Result<bool, i64> {
     app.animation_tick = time_monotonic_ms() / 120;
     let update = tui_paint_update(app, ui_colors(terminal))?;
     if update.len() == 0 { return tui_true(); };
-    terminal.write(update.as_str())
+    let delivered = terminal.write_frame(update.as_str(), app.width, app.height)?;
+    if not delivered { tui_invalidate(app); app.resize_settle_at = time_monotonic_ms() + 80; };
+    Result { is_ok: true, value: delivered, error: 0 }
+}
+
+def tui_jump_visible(app: &UiApp) -> bool { app.scroll > 0 and not app.home and app.approval.len() == 0 and app.picker.len() == 0 and not app.menu_open }
+
+def tui_jump_row(app: &UiApp) -> Result<i64, i64> {
+    let layout = images_layout(app.draft.as_str(), app.cursor, tui_composer_width(app))?;
+    cli_ok(app.height - tui_visible_composer(app, &layout) - 5)
 }
 
 def tui_mouse(app: &mut UiApp, mouse: &TerminalMouseEvent) -> Result<UiAction, i64> {
     app.mouse_changed = false;
     if app.approval.len() > 0 { app.wheel_remainder = 0; app.wheel_focus = cli_text("approval"); return tui_none(); };
+    if mouse.action == 1 and mouse.button == 1 and tui_jump_visible(app) and mouse.row == tui_jump_row(app)? {
+        let column = (app.width - tui_content_width(app)) / 2 + (tui_content_width(app) - 1) / 2;
+        if mouse.column >= column - 1 and mouse.column <= column + 1 {
+            selection_clear(&mut app.selection); app.scroll = 0; app.wheel_remainder = 0; app.mouse_changed = true; return tui_none();
+        };
+    };
     if mouse.action == 1 and mouse.button == 3 and app.picker.len() == 0 and selection_has(&app.selection) {
         return Result { is_ok: true, value: UiAction { kind: 6, text: selection_text(&app.selection)?, context: cli_text("clipboard-selection") }, error: 0 };
     };

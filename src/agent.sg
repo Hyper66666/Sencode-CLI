@@ -3,6 +3,7 @@ import context_capacity;
 import executor;
 import tool_spec;
 import engine_control;
+import evidence;
 
 def agent_history(system: &str) -> Result<JsonDoc, i64> {
     let history = context_document()?;
@@ -45,6 +46,8 @@ def agent_tools() -> Result<JsonDoc, i64> {
     index = 0;
     while index < additional.array_len()? { target.array_push(document.copy(additional.array_get(index)?)?)?; index = index + 1; };
     let coordination = json_parse("{\"tools\":[{\"name\":\"list_agents\",\"description\":\"View this turn's child task status and provider attribution\",\"parameters\":{\"type\":\"object\",\"properties\":{}}},{\"name\":\"wait_agents\",\"description\":\"Wait up to 1000 milliseconds for children while releasing the parent model/write permits\",\"parameters\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1000}}}},{\"name\":\"cancel_agent\",\"description\":\"Cancel a level-one child and its active request\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"]}}]}")?;
+    let evidence = evidence_tool_schema()?;
+    target.array_push(document.copy(evidence.root())?)?;
     let directory = json_parse("{\"name\":\"list_models\",\"description\":\"Search enabled models across all configured providers. query is an optional case-insensitive ID or label fragment; page using offset and limit. Returns public model/provider names and subagent availability, never credentials.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"maxLength\":256},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":131072},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64}}}}")?;
     target.array_push(document.copy(directory.root())?)?;
     let controls = coordination.root().object_get("tools")?;

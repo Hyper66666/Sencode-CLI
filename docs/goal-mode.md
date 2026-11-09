@@ -5,6 +5,12 @@ Start with `/goal TASK` or `sen --goal "TASK"`. You do not have to supply
 `finish_goal.checks`. The host executes them and completes the Goal only after
 all checks succeed. A claim in the model's answer does not mark it complete.
 
+There is no default request-count limit. `--max-requests N` is an optional
+explicit shared limit; zero disables it. Usage accounting continues across
+children, compaction and Goal recovery. Old unmarked default 50 is removed on
+recovery without resetting requests/tokens. New user-set limits are recorded
+explicitly and retained. Token budgets remain opt-in.
+
 Model-proposed commands use Bash by default. The model can explicitly choose
 PowerShell or cmd with `finish_goal.shell`. Existing `--check COMMAND` checks
 keep their PowerShell behavior and take precedence over model proposals.

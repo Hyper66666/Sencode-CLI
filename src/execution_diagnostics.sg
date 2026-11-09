@@ -1,4 +1,15 @@
 import engine_control;
+import policy;
+
+def execution_diagnostic_budget(input: &Vec<TerminalEvent>, goal: &GoalState) -> Result<bool, i64> {
+    execution_diagnostic_failure(input, "budget", "budget", "", "", false)?;
+    let document = execution_diagnostic_saved(input)?;
+    cli_put_i64(&document, document.root(), "requests", goal.requests)?;
+    cli_put_i64(&document, document.root(), "max_requests", goal.max_requests)?;
+    cli_put_i64(&document, document.root(), "tokens", goal.tokens)?;
+    cli_put_i64(&document, document.root(), "token_budget", goal.token_budget)?;
+    execution_diagnostic_store(input, &document)
+}
 
 // Never include response bodies, URLs, headers or credentials in diagnostics.
 def execution_network_label(status: i64, code: i64) -> Result<String, i64> {
@@ -113,6 +124,16 @@ def execution_diagnostic_document(input: &Vec<TerminalEvent>, code: i64) -> Resu
 def execution_diagnostic_content(document: &JsonDoc) -> Result<String, i64> {
     let reason = cli_json_optional_string(document.root(), "reason");
     let unknown = document.root().object_has("outcome_unknown") and document.root().object_get("outcome_unknown")?.bool_value()?;
+    if not unknown and reason.as_str() == "budget" and document.root().object_has("requests") {
+        let text = cli_text("Paused at your configured budget: ");
+        let maximum = cli_json_optional_i64(document.root(), "max_requests", 0);
+        text.push_i64(cli_json_optional_i64(document.root(), "requests", 0))?;
+        if maximum > 0 { text.push_str("/")?; text.push_i64(maximum)?; (); }; text.push_str(" model requests")?;
+        let tokens = cli_json_optional_i64(document.root(), "token_budget", 0);
+        if tokens > 0 { text.push_str("; ")?; text.push_i64(cli_json_optional_i64(document.root(), "tokens", 0))?; text.push_str("/")?; text.push_i64(tokens)?; text.push_str(" tokens")?; (); };
+        text.push_str(". Context and completed tools were retained. Continue the conversation, or explicitly resume the Goal with its saved budget.")?;
+        return Result { is_ok: true, value: text, error: 0 };
+    };
     if not unknown and reason.as_str() == "request_state_failed" { return string_from_str("Execution paused: request evidence could not be saved. No new tool was executed after this failure. Saved results were retained; resume after state storage is available."); };
     if not unknown and reason.as_str() == "provider_request" and document.root().object_has("network_error") {
         let text = cli_json_string(document.root(), "network_error")?;

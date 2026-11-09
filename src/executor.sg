@@ -11,6 +11,9 @@ struct ExecutorOutput {
     timed_out: bool,
     cancelled: bool,
     truncated: bool,
+    timeout_phase: i64,
+    timeout_ms: i64,
+    elapsed_ms: i64,
 }
 
 struct ExecutorDisplayText {
@@ -201,6 +204,9 @@ def executor_search_child_path(builder: &ProcessCommand, cwd: &str) -> Result<bo
 // shadow the interpreter used to execute its own command.
 def executor_shell_executable(cwd: &str, shell: &str) -> Result<String, i64> {
     if shell == "powershell" {
+        if env_has_var("ProgramW6432") { let modern = path_join_string(ui_env("ProgramW6432")?.as_str(), "PowerShell/7/pwsh.exe")?; if file_exists(modern.as_str()) { return string_from_str(modern.as_str()); }; };
+        if env_has_var("ProgramFiles") { let modern = path_join_string(ui_env("ProgramFiles")?.as_str(), "PowerShell/7/pwsh.exe")?; if file_exists(modern.as_str()) { return string_from_str(modern.as_str()); }; };
+        if file_exists("C:/Program Files/PowerShell/7/pwsh.exe") { return string_from_str("C:/Program Files/PowerShell/7/pwsh.exe"); };
         let buffer = ffi_buffer_new(32768)?;
         let count = env_var_copy("SystemRoot", buffer)?;
         let root = string_from_buffer(buffer, count)?;
@@ -250,6 +256,9 @@ def executor_result(output: &ExecutorOutput) -> Result<JsonDoc, i64> {
     cli_put_bool(&document, root, "timed_out", output.timed_out)?;
     cli_put_bool(&document, root, "cancelled", output.cancelled)?;
     cli_put_bool(&document, root, "truncated", output.truncated)?;
+    cli_put_i64(&document, root, "timeout_ms", output.timeout_ms)?;
+    cli_put_i64(&document, root, "elapsed_ms", output.elapsed_ms)?;
+    cli_put_string(&document, root, "termination_reason", if output.cancelled { "cancelled" } else { if output.timed_out { if output.timeout_phase == 2 { "timeout_descendants" } else { "timeout_process" } } else { "exit" } })?;
     let text = executor_display_text(output.stdout)?;
     let errors = executor_display_text(output.stderr)?;
     cli_put_string(&document, root, "stdout", text.text.as_str())?;

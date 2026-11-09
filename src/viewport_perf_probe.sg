@@ -1,0 +1,21 @@
+import tui;
+
+def viewport_probe() -> Result<i64, i64> {
+    let mut app = tui_new("D:\\Sencode-CLI", "fixture", "fixture medium", "viewport");
+    tui_resize(&mut app, 120, 40)?;
+    // Retained wrapped output, as in a long tool transcript; no provider needed.
+    app.home = false;
+    let mut index = 0;
+    while index < 12000 {
+        let text = cli_text("history "); text.push_i64(index)?; text.push_str(" 中文 é output")?;
+        app.transcript.push(UiLine { cells: ui_cells(text.as_str())?, text: text, style: 4, message_id: index + 1, spans: ui_spans_empty() });
+        index = index + 1;
+    };
+    tui_paint_update(&mut app, true)?;
+    let started = time_monotonic_ms(); index = 0;
+    while index < 60 { tui_scroll(&mut app, 3)?; tui_paint_update(&mut app, true)?; index = index + 1; };
+    println(time_monotonic_ms() - started);
+    cli_ok(0)
+}
+
+def main() -> i64 { let result = viewport_probe(); if not result.is_ok() { println(result.error); return 1; }; result.value }

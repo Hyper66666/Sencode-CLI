@@ -16,7 +16,17 @@ def tui_tool_outcome(value: JsonValue) -> i64 {
 
 def tui_tool_detail(arguments: JsonValue) -> Result<String, i64> {
     let path = cli_json_optional_string(arguments, "path"); if path.len() > 0 { return pending_preview(path.as_str(), 160); };
-    let command = cli_json_optional_string(arguments, "command"); if command.len() > 0 { return pending_preview(command.as_str(), 160); };
+    let command = cli_json_optional_string(arguments, "command"); if command.len() > 0 {
+        let lines = command.split("\n"); let mut count = 0;
+        loop { let line = lines.next(); if not line.is_some { break; }; let trimmed = str_trim(line.value.as_str())?; if trimmed.len() > 0 { count = count + 1; }; };
+        if count <= 1 { return pending_preview(command.as_str(), 160); };
+        let shell = cli_json_optional_string(arguments, "shell"); let text = cli_text(if shell.len() > 0 { shell.as_str() } else { "bash" });
+        text.push_str(" script (")?; text.push_i64(count)?; text.push_str(" lines)  ")?;
+        let boundary = str_index_of(command.as_str(), "\n"); text.push_str(pending_preview(cli_byte_slice(command.as_str(), 0, boundary)?.as_str(), 90)?.as_str())?;
+        text.push_str("\nscript:\n")?; text.push_str(tui_limit(command.as_str(), 4096)?.as_str())?;
+        if command.len() > 4096 { text.push_str("\n… script preview clipped; full arguments remain in the saved tool call.")?; (); };
+        return Result { is_ok: true, value: text, error: 0 };
+    };
     let query = cli_json_optional_string(arguments, "query"); if query.len() > 0 { return pending_preview(query.as_str(), 160); };
     Result { is_ok: true, value: string_new(), error: 0 }
 }
@@ -27,6 +37,23 @@ def tui_tool_flag(value: JsonValue, key: &str) -> bool {
     if not value.object_has(key) { return false; };
     let node = value.object_get(key); if not node.is_ok() { return false; };
     let flag = node.value.bool_value(); flag.is_ok() and flag.value
+}
+
+def tui_diagnostic_excerpt(text: &str, maximum: i64) -> Result<String, i64> {
+    if text.len() <= maximum { return string_from_str(text); };
+    let head = tui_limit(text, maximum / 3)?;
+    let start = text.len() - maximum * 2 / 3;
+    let bytes = cli_bytes(text.len()); bytes.append_str(text)?;
+    let mut boundary = start;
+    while boundary < text.len() and bytes.get_u8(boundary)? >= 128 and bytes.get_u8(boundary)? < 192 { boundary = boundary + 1; };
+    let mut end = text.len();
+    while end > 0 and (bytes.get_u8(end - 1)? == 10 or bytes.get_u8(end - 1)? == 13 or bytes.get_u8(end - 1)? == 32) { end = end - 1; };
+    let mut last = end; while last > 0 and bytes.get_u8(last - 1)? != 10 and bytes.get_u8(last - 1)? != 13 { last = last - 1; };
+    let final_line = cli_byte_slice(text, last, end)?;
+    let out = cli_text("last diagnostic: "); out.push_str(tui_limit(final_line.as_str(), 240)?.as_str())?;
+    out.push_str("\n")?; out.push_str(head.as_str())?; out.push_str("\n… diagnostic middle omitted …\n")?;
+    out.push_str(cli_byte_slice(text, boundary, text.len())?.as_str())?;
+    Result { is_ok: true, value: out, error: 0 }
 }
 
 def tui_tool_error_text(result: JsonValue) -> Result<String, i64> {
@@ -40,11 +67,16 @@ def tui_tool_error_text(result: JsonValue) -> Result<String, i64> {
     if value.kind()? != JSON_KIND_OBJECT() or not value.object_has("exit_code") { return tui_limit(content.as_str(), 8192); };
     let code = value.object_get("exit_code")?.number_i64();
     if not code.is_ok() { return tui_limit(content.as_str(), 8192); };
-    let out = cli_text("Command exited with code "); out.push_i64(code.value)?;
-    if tui_tool_flag(value, "timed_out") { out.push_str(" (timed out)")?; (); };
-    if tui_tool_flag(value, "cancelled") { out.push_str(" (cancelled)")?; (); };
-    let errors = tui_limit(cli_json_optional_string(value, "stderr").as_str(), 6144)?;
-    let output = tui_limit(cli_json_optional_string(value, "stdout").as_str(), 2048)?;
+    let out = string_new(); let reason = cli_json_optional_string(value, "termination_reason");
+    if tui_tool_flag(value, "cancelled") { out.push_str("Command cancelled; direct process exit ")?; out.push_i64(code.value)?; (); }
+    else { if tui_tool_flag(value, "timed_out") {
+        out.push_str(if reason.as_str() == "timeout_descendants" { "Command timed out waiting for child processes" } else { if code.value == 0 { "Command timed out before process-tree cleanup completed" } else { "Command timed out" } })?;
+        let limit = cli_json_optional_i64(value, "timeout_ms", 0); if limit > 0 { out.push_str(" after ")?; out.push_i64(limit)?; out.push_str(" ms")?; (); };
+        out.push_str("; direct process exit ")?; out.push_i64(code.value)?;
+        if reason.as_str() == "timeout_descendants" { out.push_str(". Background descendants remained owned by this command.")?; (); }; ();
+    } else { out.push_str("Command exited with code ")?; out.push_i64(code.value)?; (); }; };
+    let errors = tui_diagnostic_excerpt(cli_json_optional_string(value, "stderr").as_str(), 1000)?;
+    let output = tui_diagnostic_excerpt(cli_json_optional_string(value, "stdout").as_str(), if errors.len() > 0 { 400 } else { 1200 })?;
     if errors.len() > 0 { out.push_str("\n")?; out.push_str(errors.as_str())?; (); };
     if output.len() > 0 { out.push_str("\nstdout:\n")?; out.push_str(output.as_str())?; (); };
     if tui_tool_flag(value, "stdout_lossy") or tui_tool_flag(value, "stderr_lossy") { out.push_str("\nSome invalid UTF-8 bytes were replaced.")?; (); };

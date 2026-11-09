@@ -402,7 +402,7 @@ def front_event(host: &mut FrontHost, app: &mut UiApp, event: &JsonDoc, terminal
         tui_agents_finish(&host.agents, app, success)?;
         let code = cli_json_optional_i64(event.root(), "code", if success { 0 } else { 1 });
         let reason = if event.root().object_has("diagnostic") { cli_json_optional_string(event.root().object_get("diagnostic")?, "reason") } else { string_new() };
-        tui_finish_outcome(app, success, cli_json_optional_i64(event.root(), "elapsed_ms", -1), if success { "completed" } else { if code == 19 or reason.as_str() == "cancelled" { "cancelled" } else { if str_starts_with(reason.as_str(), "goal_") { "paused" } else { "stopped" } } })?;
+        tui_finish_outcome(app, success, cli_json_optional_i64(event.root(), "elapsed_ms", -1), if success { "completed" } else { if code == 19 or reason.as_str() == "cancelled" { "cancelled" } else { if reason.as_str() == "budget" or str_starts_with(reason.as_str(), "goal_") { "paused" } else { "stopped" } } })?;
         host.active.clear();
         return tui_true();
     };
@@ -779,8 +779,9 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
         // motion never builds a frame or resets the native cursor blink.
         if event.kind == 6 and app.mouse_changed { needs_paint = true; };
         let immediate = event.kind != 0 and event.kind != 6;
+        if tui_resize_settled(&mut app, time_monotonic_ms()) { needs_paint = true; };
         let animation_due = tui_animation_due(&app, time_monotonic_ms() / 120);
-        if immediate or (needs_paint or animation_due) and time_monotonic_ms() - painted >= 16 { if pane.active { pane_paint(&mut pane, terminal)?; (); } else { tui_paint(terminal, &mut app)?; (); }; painted = time_monotonic_ms(); needs_paint = false; };
+        if immediate or (needs_paint or animation_due) and time_monotonic_ms() - painted >= 16 { let delivered = if pane.active { pane_paint(&mut pane, terminal)? } else { tui_paint(terminal, &mut app)? }; painted = time_monotonic_ms(); needs_paint = not delivered; };
         let queue_ready = not pane.active and not pane.pending and not front_worktree_owns(&worktrees) and front_queue_ready(&host, &app);
         if queue_ready { let queued = tui_take_submission(&mut app)?; if queued.kind != 0 { front_action(state, options, &mut app, &mut host, &queued, maximum, tokens)?; needs_paint = true; (); }; };
     };

@@ -1,0 +1,8 @@
+- [x] Integration: reproduce viewport invalidation, long-history latency and reported budget pause.
+- [x] Integration: implement geometry-safe full repaint and anchored resize recovery.
+- [x] Integration: implement jump-to-latest and workspace header without input fallthrough.
+- [x] Integration: present actual budget counters and distinguish compaction failure.
+- [x] Integration: remove implicit request cap across all entrypoints and old Goal recovery; audit related CC/Grok constraints.
+- [x] Integration: pass native UI/context/diagnostic and production recovery fixtures.
+- [x] Integration: measure 80/120/160-column resize and long-history wheel in real Windows console.
+- [x] Integration: package, validate and install one candidate with rollback evidence.

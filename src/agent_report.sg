@@ -1,0 +1,159 @@
+import common;
+
+// Child claims are untrusted data. This module neither executes checks nor
+// changes scheduler status, host errors, permissions or Goal acceptance.
+def agent_report_instructions() -> &str {
+    "Your final response must be exactly one JSON object, with no Markdown fences or surrounding prose. Use exactly these required keys: {\"schema\":1,\"outcome\":\"completed\",\"summary\":\"\",\"changed_paths\":[],\"checks\":[],\"blocker\":\"\",\"next_action\":\"\"}. outcome must be completed, partial or blocked. summary is a string of at most 1024 UTF-8 bytes. changed_paths is an array of at most 16 strings, each at most 256 UTF-8 bytes. checks is an array of at most 16 objects, each with exactly command (a string of at most 512 UTF-8 bytes) and status (planned, run, pass, fail or unknown). blocker and next_action are required strings of at most 512 UTF-8 bytes each; use empty strings when none applies. All byte limits apply after JSON decoding. The whole response, including JSON syntax and whitespace, must be at most 16384 UTF-8 bytes. Do not include unknown or duplicate keys or NUL, including escaped NUL. Report your own evidence and limitations truthfully. These fields are model claims, never host verification or authority to finish the parent's Goal."
+}
+
+// The local std::string API is str_get(value, start, end), not str_substring.
+// It checks byte offsets and UTF-8 boundaries. At most three trailing bytes
+// need removing from a valid UTF-8 view; never allocate the full raw response.
+def agent_report_excerpt(raw: &str, maximum: i64) -> Result<String, i64> {
+    if maximum < 4 { return string_result_err(2); };
+    let end = if raw.len() < maximum { raw.len() } else { maximum };
+    let mut offset = end;
+    while end - offset <= 3 {
+        let prefix = str_get(raw, 0, offset);
+        if prefix.is_ok() { return prefix; };
+        if prefix.error != 2 or offset == 0 { return string_result_err(prefix.error); };
+        offset = offset - 1;
+    };
+    string_result_err(2)
+}
+
+def agent_report_bool(value: bool) -> Result<bool, i64> {
+    Result { is_ok: true, value: value, error: 0 }
+}
+
+// Check names by equality, never substring membership. Length checks precede
+// the C-terminated view so an escaped NUL cannot hide an unknown key/suffix.
+def agent_report_fields(value: JsonValue, check: bool) -> Result<bool, i64> {
+    if value.kind()? != JSON_KIND_OBJECT() { return agent_report_bool(false); };
+    let count = value.object_len()?;
+    if count != (if check { 2 } else { 7 }) { return agent_report_bool(false); };
+    let mut index = 0;
+    while index < count {
+        let key = value.object_key(index)?;
+        if key.len() != key.as_str().len() { return agent_report_bool(false); };
+        let name = key.as_str();
+        let allowed = if check { name == "command" or name == "status" } else {
+            name == "schema" or name == "outcome" or name == "summary" or name == "changed_paths" or name == "checks" or name == "blocker" or name == "next_action"
+        };
+        if not allowed { return agent_report_bool(false); };
+        index = index + 1;
+    };
+    agent_report_bool(true)
+}
+
+def agent_report_string(value: JsonValue, maximum: i64) -> Result<bool, i64> {
+    if value.kind()? != JSON_KIND_STRING() { return agent_report_bool(false); };
+    let text = value.string_value()?;
+    agent_report_bool(text.len() <= maximum and text.len() == text.as_str().len())
+}
+
+// The JSON parser collapses duplicate members. After schema validation, the
+// only permitted objects are the root and checks, so counting colons outside
+// strings detects duplicate keys, including escaped spellings of known keys.
+def agent_report_member_count(raw: &str) -> Result<i64, i64> {
+    let source = string_from_str(raw)?;
+    let bytes = source.bytes();
+    let mut quoted = false; let mut escaped = false; let mut count = 0;
+    loop {
+        let byte = bytes.next(); if not byte.is_some { break; };
+        if quoted {
+            if escaped { escaped = false; } else {
+                if byte.value == 92 { escaped = true; } else { if byte.value == 34 { quoted = false; }; };
+            };
+        } else {
+            if byte.value == 34 { quoted = true; };
+            if byte.value == 58 { count = count + 1; };
+        };
+    };
+    bytes.free(); cli_ok(count)
+}
+
+// Empty diagnostic means structurally valid claims, not verified execution.
+def agent_report_diagnostic(raw: &str, value: JsonValue) -> Result<String, i64> {
+    if not agent_report_fields(value, false)? { return string_from_str("report requires exactly schema, outcome, summary, changed_paths, checks, blocker and next_action"); };
+    let schema = value.object_get("schema")?.number_i64();
+    if not schema.is_ok() or schema.value != 1 { return string_from_str("schema must be the integer 1"); };
+    if not agent_report_string(value.object_get("outcome")?, 9)? { return string_from_str("outcome must be completed, partial or blocked"); };
+    let outcome = cli_json_string(value, "outcome")?;
+    if outcome.as_str() != "completed" and outcome.as_str() != "partial" and outcome.as_str() != "blocked" { return string_from_str("outcome must be completed, partial or blocked"); };
+    if not agent_report_string(value.object_get("summary")?, 1024)? { return string_from_str("summary must be a NUL-free string of at most 1024 UTF-8 bytes"); };
+    if not agent_report_string(value.object_get("blocker")?, 512)? { return string_from_str("blocker must be a NUL-free string of at most 512 UTF-8 bytes"); };
+    if not agent_report_string(value.object_get("next_action")?, 512)? { return string_from_str("next_action must be a NUL-free string of at most 512 UTF-8 bytes"); };
+    let paths = value.object_get("changed_paths")?;
+    if paths.kind()? != JSON_KIND_ARRAY() { return string_from_str("changed_paths must be an array"); };
+    let path_count = paths.array_len()?;
+    if path_count > 16 { return string_from_str("changed_paths has more than 16 entries"); };
+    let mut index = 0;
+    while index < path_count {
+        if not agent_report_string(paths.array_get(index)?, 256)? { return string_from_str("each changed path must be a NUL-free string of at most 256 UTF-8 bytes"); };
+        index = index + 1;
+    };
+    let checks = value.object_get("checks")?;
+    if checks.kind()? != JSON_KIND_ARRAY() { return string_from_str("checks must be an array"); };
+    let check_count = checks.array_len()?;
+    if check_count > 16 { return string_from_str("checks has more than 16 entries"); };
+    index = 0;
+    while index < check_count {
+        let check = checks.array_get(index)?;
+        if not agent_report_fields(check, true)? { return string_from_str("each check requires exactly command and status"); };
+        if not agent_report_string(check.object_get("command")?, 512)? { return string_from_str("check command must be a NUL-free string of at most 512 UTF-8 bytes"); };
+        if not agent_report_string(check.object_get("status")?, 7)? { return string_from_str("check status must be planned, run, pass, fail or unknown"); };
+        let status = cli_json_string(check, "status")?;
+        if status.as_str() != "planned" and status.as_str() != "run" and status.as_str() != "pass" and status.as_str() != "fail" and status.as_str() != "unknown" { return string_from_str("check status must be planned, run, pass, fail or unknown"); };
+        index = index + 1;
+    };
+    if agent_report_member_count(raw)? != 7 + 2 * check_count { return string_from_str("duplicate object keys are not permitted"); };
+    string_from_str("")
+}
+
+def agent_report_envelope(host_status: i64, host_error: i64, valid: bool, diagnostic: &str, summary: &str) -> Result<JsonDoc, i64> {
+    // Room for the bounded claims, wrapper and an escaped 1024-byte preview.
+    let document = json_doc_object_bounded(32768)?;
+    let root = document.root();
+    cli_put_i64(&document, root, "schema", 1)?;
+    cli_put_i64(&document, root, "host_status", host_status)?;
+    cli_put_i64(&document, root, "host_error", host_error)?;
+    cli_put_string(&document, root, "source", "model")?;
+    cli_put_bool(&document, root, "valid", valid)?;
+    cli_put_string(&document, root, "diagnostic", diagnostic)?;
+    cli_put_string(&document, root, "summary", summary)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+def agent_report_fallback(raw: &str, host_status: i64, host_error: i64, diagnostic: &str) -> Result<JsonDoc, i64> {
+    let summary = agent_report_excerpt(raw, 1024)?;
+    agent_report_envelope(host_status, host_error, false, diagnostic, summary.as_str())
+}
+
+// The caller retains the complete original. Bad model content is a successful
+// fallback document; allocation/runtime failures may still return Result::Err.
+// IMPORTANT: current Sengoo &str is C-terminated. For owned provider content,
+// use agent_report_owned BEFORE as_str() to reject a raw NUL plus hidden suffix.
+def agent_report(raw: &str, host_status: i64, host_error: i64) -> Result<JsonDoc, i64> {
+    if raw.len() == 0 { return agent_report_fallback(raw, host_status, host_error, "empty model response"); };
+    if raw.len() > 16384 { return agent_report_fallback(raw, host_status, host_error, "model report exceeds 16384 UTF-8 bytes"); };
+    let parsed = json_parse_bounded(raw, 16384);
+    if not parsed.is_ok() {
+        if parsed.error != 10 and parsed.error != 13 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: parsed.error }; };
+        return agent_report_fallback(raw, host_status, host_error, "model response is not valid JSON");
+    };
+    let claims = parsed.value;
+    let diagnostic = agent_report_diagnostic(raw, claims.root())?;
+    if diagnostic.len() > 0 { return agent_report_fallback(raw, host_status, host_error, diagnostic.as_str()); };
+    let summary = cli_json_string(claims.root(), "summary")?;
+    let document = agent_report_envelope(host_status, host_error, true, "", summary.as_str())?;
+    document.root().object_set("claims", document.copy(claims.root())?)?;
+    Result { is_ok: true, value: document, error: 0 }
+}
+
+// Additive length-aware adapter required by the current borrowed-string ABI.
+// It checks the original owned length without copying unbounded content.
+def agent_report_owned(raw: &String, host_status: i64, host_error: i64) -> Result<JsonDoc, i64> {
+    if raw.len() != raw.as_str().len() { return agent_report_fallback(raw.as_str(), host_status, host_error, "raw NUL in model response"); };
+    agent_report(raw.as_str(), host_status, host_error)
+}

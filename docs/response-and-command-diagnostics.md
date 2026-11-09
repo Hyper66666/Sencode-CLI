@@ -68,5 +68,8 @@ control caching, not response admission. In the supplied Grok Build snapshot
 without a node-count ceiling. Its pinned serde_json 1.0.149 defaults to 128
 levels of recursion; depth is not node count. Neither observation implies
 unlimited process memory or that all other transports/storage paths are unbounded.
+For shell exit status, owned-descendant timeouts, multi-line script previews and
+PowerShell selection, see [command lifecycle diagnostics](command-lifecycle-diagnostics.md).
+
 Sencode's event admission is deliberately explicit and separate from Sengoo's
 legacy JSON API; the current event budget is 65536 nodes / 1 MiB, depth 64.

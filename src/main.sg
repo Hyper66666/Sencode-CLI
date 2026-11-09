@@ -301,9 +301,9 @@ def main_run() -> Result<i64, i64> {
     };
     // Plan is explicitly armed by --plan or /plan, never restored from session
     // metadata (including legacy active=true written before turn scoping).
-    let maximum_requests = cli_parse_unsigned(cli_option(&arguments, "max-requests", "50")?.as_str(), 10)?;
+    let maximum_requests = cli_parse_unsigned(cli_option(&arguments, "max-requests", "0")?.as_str(), 10)?;
     let token_budget = cli_parse_unsigned(cli_option(&arguments, "token-budget", "0")?.as_str(), 10)?;
-    if maximum_requests < 1 or maximum_requests > 10000 { return cli_ok(2); };
+    if maximum_requests > 10000 { return cli_ok(2); };
     if cli_flag(&arguments, "engine-stdio") { return engine_stdio(&state, &mut options, maximum_requests, token_budget, &terminal); };
     let prompt = if arguments.root().object_has("prompt") { cli_json_string(arguments.root(), "prompt")? } else { options.goal_text.clone()? };
     if prompt.len() > 0 {

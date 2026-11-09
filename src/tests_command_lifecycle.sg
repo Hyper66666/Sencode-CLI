@@ -1,0 +1,61 @@
+import executor;
+import tui_history;
+import command_line;
+
+extern "C" { fn sengoo_process_live_resource_count() -> i64; fn sengoo_process_live_handle_count() -> i64; }
+
+def lifecycle_expect(value: bool, label: &str) -> Result<bool,i64> {
+    if not value { println(label); return Result{is_ok:false,value:false,error:99}; }; tui_true()
+}
+
+def lifecycle_late_poll() -> Result<bool,i64> {
+    let builder=executor_command_builder("D:/Sencode-CLI","echo completed","cmd","C:/Windows/System32/cmd.exe")?;
+    let mut job=executor_job_start(&builder,100)?;
+    while not job.process.try_wait()? { time_sleep_ms(1); };
+    time_sleep_ms(200);
+    while not executor_job_poll(&mut job) { time_sleep_ms(1); };
+    lifecycle_expect(not job.output.timed_out and job.output.exit_code==0,"completed-before-delayed-poll must not expire")?;
+    let result=executor_job_result(&job)?; let body=json_parse(cli_json_string(result.root(),"content")?.as_str())?;
+    lifecycle_expect(not result.root().object_get("is_error")?.bool_value()? and str_contains(cli_json_string(body.root(),"stdout")?.as_str(),"completed"),"late poll drains its original output")
+}
+
+def lifecycle_timeout_and_cancel() -> Result<bool,i64> {
+    let terminal=terminal_open()?; let pending: Vec<TerminalEvent> = vec_new();
+    let cwd=cli_current_directory()?;
+    let modern=executor_shell_executable(cwd.as_str(),"powershell")?;
+    if file_exists("C:/Program Files/PowerShell/7/pwsh.exe") { lifecycle_expect(str_contains(modern.as_str(),"pwsh.exe"),"prefer system PowerShell 7")?; (); };
+    let result=executor_command_shell_pending(cwd.as_str(),"[Console]::Out.Write('世界'); exit 0","powershell",10000,&terminal,&pending)?;
+    let success=json_parse(cli_json_string(result.root(),"content")?.as_str())?;
+    lifecycle_expect(cli_json_string(success.root(),"stdout")?.as_str()=="世界" and not result.root().object_get("is_error")?.bool_value()?,"PowerShell UTF-8 success")?;
+    let active=executor_command_builder(cwd.as_str(),"Start-Sleep -Seconds 20","powershell",modern.as_str())?;
+    let mut cancelled=executor_job_start(&active,10000)?; executor_job_cancel(&mut cancelled);
+    while not executor_job_poll(&mut cancelled) { time_sleep_ms(1); };
+    lifecycle_expect(cancelled.output.cancelled and not cancelled.output.timed_out and cancelled.process.tree_quiescent()?,"cancellation reaps owned tree without timeout attribution")?;
+    let timed=executor_command_shell_pending(cwd.as_str(),"Start-Sleep -Seconds 20","powershell",200,&terminal,&pending)?;
+    let timed_body=json_parse(cli_json_string(timed.root(),"content")?.as_str())?;
+    lifecycle_expect(timed_body.root().object_get("timed_out")?.bool_value()? and cli_json_string(timed_body.root(),"termination_reason")?.as_str()=="timeout_process","live process gets genuine execution timeout")?;
+    let descendant=executor_command_shell_pending(cwd.as_str(),"Start-Process -FilePath $env:ComSpec -ArgumentList '/d /c ping.exe -n 21 127.0.0.1 >nul' -WindowStyle Hidden; [Console]::Out.Write('parent-finished'); exit 0","powershell",3000,&terminal,&pending)?;
+    let child=json_parse(cli_json_string(descendant.root(),"content")?.as_str())?;
+    lifecycle_expect(child.root().object_get("timed_out")?.bool_value()? and cli_json_optional_i64(child.root(),"exit_code",-1)==0 and cli_json_string(child.root(),"termination_reason")?.as_str()=="timeout_descendants","shell success never releases an active descendant")?;
+    let shown=tui_tool_error_text(descendant.root())?;
+    lifecycle_expect(str_contains(shown.as_str(),"waiting for child processes") and str_contains(shown.as_str(),"direct process exit 0") and not str_contains(shown.as_str(),"Command exited with code 0"),"descendant timeout is distinct from successful shell exit")
+}
+
+def lifecycle_script_preview() -> Result<bool,i64> {
+    let arguments=json_parse("{\"command\":\"rg needle .\\n\\nsgc check main.sg\\nexit 7\",\"shell\":\"powershell\"}")?;
+    let detail=tui_tool_detail(arguments.root())?;
+    lifecycle_expect(str_contains(detail.as_str(),"powershell script (3 lines)") and str_contains(detail.as_str(),"sgc check main.sg"),"multi-line scripts retain their later commands")?;
+    let stderr=string_new(); let mut index=0; while index<80 { stderr.push_str("warning: earlier diagnostic with Unicode 中文\n")?; index=index+1; }; stderr.push_str("error: decisive-final\n")?;
+    let payload=json_doc_object()?; cli_put_i64(&payload,payload.root(),"exit_code",7)?; cli_put_string(&payload,payload.root(),"stderr",stderr.as_str())?;
+    let result=workspace_result(payload.serialize_string()?.as_str(),true)?; let summary=tui_tool_error_text(result.root())?;
+    let mut app=tui_new("D:/fixture","fixture","model","commands"); tui_resize(&mut app,120,40)?;
+    tui_tool(&mut app,"script","run_command","running",detail.as_str(),"")?;
+    tui_tool(&mut app,"script","run_command","failed","",summary.as_str())?;
+    let frame=tui_frame(&app)?;
+    lifecycle_expect(str_contains(frame.as_str(),"script (3 lines)") and str_contains(frame.as_str(),"decisive-final"),"collapsed card shows script identity and decisive diagnostic tail")?;
+    let message_id=app.messages.get(0).id; tui_detail_toggle(&mut app,message_id)?;
+    lifecycle_expect(str_contains(tui_frame(&app)?.as_str(),"sgc check main.sg"),"expanded command contains full bounded script")
+}
+
+def cases()->Result<bool,i64> { lifecycle_late_poll()?; lifecycle_timeout_and_cancel()?; lifecycle_script_preview()?; tui_true() }
+def main()->i64 {let result=cases(); if not result.is_ok {println(result.error);return 1;}; if sengoo_process_live_handle_count()!=0 or sengoo_process_live_resource_count()!=0 {println("process resource leak");return 1;}; println("Command lifecycle, descendants, cancellation, PowerShell and script diagnostics passed");0}

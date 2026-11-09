@@ -43,9 +43,9 @@ def engine_submit_valid(command: &JsonDoc) -> Result<bool, i64> {
         let mut check_index = 0;
         while check_index < count { let check = checks.array_get(check_index)?.string_value()?; if check.len() == 0 or check.len() > 8192 { return Result { is_ok: false, value: false, error: 2 }; }; check_index = check_index + 1; };
     };
-    let maximum = cli_json_optional_i64(command.root(), "maximum_requests", 50);
+    let maximum = cli_json_optional_i64(command.root(), "maximum_requests", 0);
     let tokens = cli_json_optional_i64(command.root(), "token_budget", 0);
-    if maximum < 1 or maximum > 10000 or tokens < 0 or text.len() > 131072 or cli_json_optional_string(command.root(), "goal").len() > 131072 { return Result { is_ok: false, value: false, error: 2 }; };
+    if maximum < 0 or maximum > 10000 or tokens < 0 or text.len() > 131072 or cli_json_optional_string(command.root(), "goal").len() > 131072 { return Result { is_ok: false, value: false, error: 2 }; };
     Result { is_ok: true, value: true, error: 0 }
 }
 

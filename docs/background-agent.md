@@ -21,7 +21,8 @@ its existing behavior.
 The start command prints the job ID, public session ID and selected target.
 Each job runs one top-level Agent turn, including its existing child tasks. It
 has a default one-hour lifetime; `--job-timeout-ms` accepts 1000 through 86400000.
-`--max-requests` and an explicitly provided `--token-budget` retain their engine
+There is no default request cap. Explicit `--max-requests` (zero disables it)
+and an explicitly provided `--token-budget` retain their engine
 meaning. Switching the application's default connection does not retarget an
 already admitted job.
 

@@ -12,7 +12,7 @@ struct ToolSpec {
 }
 
 def tool_spec(name: &str) -> ToolSpec {
-    let read = name == "read_file" or name == "list_directory" or name == "search" or name == "find_files" or name == "git_status" or name == "git_diff" or name == "list_models";
+    let read = name == "read_file" or name == "list_directory" or name == "search" or name == "find_files" or name == "git_status" or name == "git_diff" or name == "list_models" or name == "read_evidence";
     let write = name == "write_file" or name == "apply_patch" or name == "write_plan";
     let process = name == "run_command" or name == "mcp__list_tools" or name == "mcp__call";
     let coordinator = name == "spawn_agent" or name == "list_agents" or name == "wait_agents" or name == "cancel_agent" or name == "finish_goal" or name == "ask_user";
@@ -85,6 +85,24 @@ def tool_spec_valid(name: &str, arguments: &JsonDoc) -> bool {
     if name == "list_models" {
         if arguments.root().object_has("query") and (not tool_spec_string(arguments, "query") or cli_json_optional_string(arguments.root(), "query").len() > 256) { return false; };
         return tool_spec_integer(arguments, "offset", 0, 131072) and tool_spec_integer(arguments, "limit", 1, 64);
+    };
+    if name == "read_evidence" {
+        if not tool_spec_string(arguments, "session_id") or not tool_spec_string(arguments, "source_id") or not tool_spec_string(arguments, "kind") or not tool_spec_string(arguments, "sha256") { return false; };
+        let session = cli_json_optional_string(arguments.root(), "session_id");
+        let source = cli_json_optional_string(arguments.root(), "source_id");
+        let kind = cli_json_optional_string(arguments.root(), "kind");
+        let hash = cli_json_optional_string(arguments.root(), "sha256");
+        if session.len() < 1 or session.len() > 256 or source.len() < 1 or source.len() > 256 or hash.len() != 64 or (kind.as_str() != "tool_result" and kind.as_str() != "assistant_text") { return false; };
+        let bytes = hash.bytes(); let mut valid = true;
+        loop { let next = bytes.next(); if not next.is_some { break; }; if not (next.value >= 48 and next.value <= 57 or next.value >= 97 and next.value <= 102) { valid = false; }; };
+        bytes.free();
+        let keys = arguments.root().object_keys(); if not keys.is_ok() { return false; }; let mut index = 0;
+        while index < keys.value.root().array_len().unwrap_or(0) {
+            let key = keys.value.root().array_get(index).value.string_value().unwrap_or(string_new());
+            if key.as_str() != "session_id" and key.as_str() != "source_id" and key.as_str() != "kind" and key.as_str() != "sha256" and key.as_str() != "offset" and key.as_str() != "limit" { return false; };
+            index = index + 1;
+        };
+        return valid and tool_spec_integer(arguments, "offset", 0, 16777216) and tool_spec_integer(arguments, "limit", 4, 16384);
     };
     if name == "spawn_agent" {
         if not tool_spec_string(arguments, "prompt") or not tool_spec_string(arguments, "role") { return false; };

@@ -20,7 +20,7 @@ def policy_finish_plan(policy: &mut AgentPolicy) { policy.plan = false; }
 
 // 0 = allow, 1 = ask, 2 = deny. Unknown tools never acquire privileges.
 def policy_decision(policy: &AgentPolicy, tool: &str, exact_plan_file: bool) -> i64 {
-    if tool == "read_file" or tool == "list_directory" or tool == "search" or tool == "find_files" or tool == "git_status" or tool == "git_diff" or tool == "ask_user" { return 0; };
+    if tool == "read_file" or tool == "list_directory" or tool == "search" or tool == "find_files" or tool == "git_status" or tool == "git_diff" or tool == "ask_user" or tool == "read_evidence" { return 0; };
     if tool == "spawn_agent" {
         if policy.depth >= policy.maximum_depth { return 2; };
         return 0;
@@ -60,8 +60,9 @@ def goal_new(max_requests: i64, token_budget: i64) -> GoalState {
 
 def goal_accept_request(goal: &mut GoalState) -> bool {
     if goal.status != 1 { return false; };
-    if goal.requests >= goal.max_requests or goal.token_budget > 0 and goal.tokens >= goal.token_budget { goal.status = 3; return false; };
-    goal.requests = goal.requests + 1;
+    // Zero is an absent user budget, not a hidden fifty-request allowance.
+    if goal.max_requests > 0 and goal.requests >= goal.max_requests or goal.token_budget > 0 and goal.tokens >= goal.token_budget { goal.status = 3; return false; };
+    if goal.requests < 9223372036854775807 { goal.requests = goal.requests + 1; };
     true
 }
 

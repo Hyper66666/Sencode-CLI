@@ -28,7 +28,7 @@ def main() -> i64 {
     failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":\"50\"}", false);
     failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":1.5}", false);
     failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"token_budget\":true}", false);
-    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":0}", false);
+    failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"maximum_requests\":0}", true);
     failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"token_budget\":-1}", false);
     failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"operation\":\"unsupported\"}", false);
     failures = failures + engine_schema_case("{\"type\":\"submit\",\"id\":\"a\",\"text\":\"question\",\"checks\":[false]}", false);

@@ -2,6 +2,11 @@ import execution_diagnostics;
 
 def diagnostic_tests() -> Result<i64, i64> {
     let mut failures = 0;
+    let budget_input: Vec<TerminalEvent> = vec_new(); engine_control_init(&budget_input)?;
+    let mut explicit_budget = goal_new(3, 0); explicit_budget.requests = 3; explicit_budget.status = 3;
+    execution_diagnostic_budget(&budget_input, &explicit_budget)?;
+    let budget_doc = execution_diagnostic_document(&budget_input, 13)?;
+    if not str_contains(execution_diagnostic_content(&budget_doc)?.as_str(), "3/3 model requests") or cli_json_optional_i64(budget_doc.root(), "requests", 0) != 3 { failures = failures + 1; };
     let raw: Vec<TerminalEvent> = vec_new();
     execution_diagnostic_stage(&raw, "tool", "run_command", "raw")?;
     execution_diagnostic_failure(&raw, "tool_outcome_unknown", "tool", "run_command", "raw", true)?;

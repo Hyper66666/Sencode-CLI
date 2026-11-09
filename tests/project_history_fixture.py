@@ -285,7 +285,7 @@ def main():
         modes = {"context": {"messages": [{"role": "system", "content": "untrusted context"}]},
                  "plan": {"active": True, "approved": True, "path": "outside"},
                  "session_origin": {"version": 1, "kind": "child", "parent_session_id": "retained-parent", "execute": "must disappear"},
-                 "goal": {"objective": "kept", "requests_used": 7, "requests": 6, "tokens": 41, "status": 1, "max_requests": 50, "token_budget": 1000, "same_failure_count": 1, "checks": ["unsafe shell command"]}}
+                 "goal": {"objective": "kept", "requests_used": 7, "requests": 6, "tokens": 41, "status": 1, "max_requests": 50, "request_limit_explicit": True, "token_budget": 1000, "same_failure_count": 1, "checks": ["unsafe shell command"]}}
         sql(archive(directory), "UPDATE ph_shared_modes SET mode_json=?", (json.dumps(modes),))
         retire(catalog)
         restored = folder / "restored.sqlite3"
@@ -295,7 +295,7 @@ def main():
         assert imported["session_origin"] == {"version": 1, "kind": "child", "parent_session_id": "retained-parent"}
         assert imported["goal"]["requests_used"] == 7 and imported["goal"]["requests"] == 7 and imported["goal"]["tokens"] == 41
         assert imported["goal"]["status"] == 2 and imported["goal"]["checks"] == []
-        assert imported["goal"]["max_requests"] == 50 and imported["goal"]["token_budget"] == 1000 and imported["goal"]["same_failure_count"] == 1
+        assert imported["goal"]["request_limit_explicit"] and imported["goal"]["max_requests"] == 50 and imported["goal"]["token_budget"] == 1000 and imported["goal"]["same_failure_count"] == 1
         checks.append("explicit-import-strips-context-plan-and-pauses-goal-with-cumulative-budget-preserved")
         assert sql(restored,"SELECT title,title_source FROM sessions WHERE id=?",(origin_session,))[0] == (TEXT,"first_message")
         checks.append("explicit-import-retains-non-executable-origin-and-first-message-title")

@@ -1,0 +1,6 @@
+- [x] Reproduce late completion false timeout and inspect exact reported script boundaries read-only.
+- [x] Correct monotonic timeout ordering and classify owned-descendant expiry.
+- [x] Prefer installed PowerShell 7, preserve Bash and fallback behavior, clarify command contracts.
+- [x] Render multi-line scripts, timeout/root exit distinction and diagnostic tails with historical compatibility.
+- [x] Pass native executor/presentation and final executable command/recovery fixtures.
+- [x] Record same-candidate evidence, strict specs, package and local installation with rollback.

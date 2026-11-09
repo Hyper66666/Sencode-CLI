@@ -186,7 +186,7 @@ children; tool descriptions cannot bypass this restriction. Approval to execute 
 plan is a human decision.
 
 `--goal OBJECTIVE` enables a foreground goal. `--check COMMAND` specifies required
-verification and may be repeated. `--max-requests` defaults to 50 across the whole
+verification and may be repeated. `--max-requests` is optional (default unlimited; zero disables the cap) across the whole
 goal, including child and verification requests. Exact `--token-budget` execution
 is currently rejected because complete token accounting is not guaranteed by
 every provider stream; the CLI does not silently substitute an estimate.

@@ -20,6 +20,7 @@ import execution_diagnostics;
 import turn_metrics;
 import model_routing;
 import config_catalog;
+import evidence;
 import std::time;
 
 struct AgentOptions {
@@ -157,6 +158,7 @@ def controller_save_goal(state: &CliState, execution: &CliExecution, options: &A
     cli_put_i64(&mode, mode.root(), "status", goal.status)?;
     cli_put_i64(&mode, mode.root(), "requests", goal.requests)?;
     cli_put_i64(&mode, mode.root(), "max_requests", goal.max_requests)?;
+    cli_put_bool(&mode, mode.root(), "request_limit_explicit", goal.max_requests > 0)?;
     cli_put_i64(&mode, mode.root(), "tokens", goal.tokens)?;
     cli_put_i64(&mode, mode.root(), "token_budget", goal.token_budget)?;
     cli_put_i64(&mode, mode.root(), "same_failure_count", goal.same_failure_count)?;
@@ -187,7 +189,10 @@ def controller_restore_goal(state: &CliState, session: &str, objective: &str, ma
         if auxiliary or objective.len() > 0 and cli_json_optional_string(saved, "objective").as_str() == objective {
             goal.requests = cli_json_optional_i64(saved, "requests", 0);
             goal.tokens = cli_json_optional_i64(saved, "tokens", 0);
-            goal.max_requests = cli_json_optional_i64(saved, "max_requests", maximum_requests);
+            let previous_limit = cli_json_optional_i64(saved, "max_requests", 0);
+            // Old checkpoints implicitly stored the former default 50.
+            let explicit_limit = if saved.object_has("request_limit_explicit") { saved.object_get("request_limit_explicit")?.bool_value()? } else { previous_limit > 0 and previous_limit != 50 };
+            goal.max_requests = if explicit_limit { previous_limit } else { maximum_requests };
             goal.token_budget = cli_json_optional_i64(saved, "token_budget", token_budget);
             goal.same_failure_count = cli_json_optional_i64(saved, "same_failure_count", 0);
             goal.last_failure = cli_json_optional_string(saved, "last_failure");
@@ -205,6 +210,7 @@ def controller_save_auxiliary_goal(state: &CliState, execution: &CliExecution, g
     cli_put_i64(&mode, mode.root(), "status", if goal.status == 3 { 3 } else { 2 })?;
     cli_put_i64(&mode, mode.root(), "requests", goal.requests)?;
     cli_put_i64(&mode, mode.root(), "max_requests", goal.max_requests)?;
+    cli_put_bool(&mode, mode.root(), "request_limit_explicit", goal.max_requests > 0)?;
     cli_put_i64(&mode, mode.root(), "tokens", goal.tokens)?;
     cli_put_i64(&mode, mode.root(), "token_budget", goal.token_budget)?;
     cli_put_i64(&mode, mode.root(), "same_failure_count", goal.same_failure_count)?;
@@ -225,14 +231,14 @@ def controller_request(state: &CliState, execution: &CliExecution, options: &Age
         // Children may need this coordinator to execute their pending tools
         // before releasing capacity; keep pumping while awaiting a slot.
         loop {
-            if goal.status != 1 { execution_diagnostic_failure(&options.input, "budget", "budget", "", "", false)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+            if goal.status != 1 { execution_diagnostic_budget(&options.input, goal)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
             if scheduler_acquire_model(scheduler, task_id)? { break; };
             controller_pump_children(state, execution, options, children, child_states, scheduler, goal, terminal)?;
             if ui_poll_busy(terminal, &options.input)? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 19 }; };
             time_sleep_ms(1);
         };
         execution_diagnostic_stage(&options.input, "budget", "", "")?;
-        if not scheduler_take_request(scheduler, task_id, goal) { scheduler_release_model(scheduler, task_id)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+        if not scheduler_take_request(scheduler, task_id, goal) { scheduler_release_model(scheduler, task_id)?; if goal.status == 3 { execution_diagnostic_budget(&options.input, goal)?; (); } else { execution_diagnostic_failure(&options.input, "scheduler", "scheduler", "", "", false)?; (); }; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
         let observed = json_doc_object()?;
         let request_id = state_id("request-")?;
         let result = controller_request_body(state, execution, options, connection, history, tools, goal, terminal, &observed, scheduler, task_id, children, child_states, request_id.as_str(), attempt, internal);
@@ -258,7 +264,7 @@ def controller_request(state: &CliState, execution: &CliExecution, options: &Age
         let evidence = RetryEvidence { attempt: attempt, status: cli_json_optional_i64(observed.root(), "status", 0), error: result.error, request_started: if observed.root().object_has("request_started") { observed.root().object_get("request_started")?.bool_value()? } else { true }, stream_observed: observed.root().object_has("stream_observed") and observed.root().object_get("stream_observed")?.bool_value()?, side_effects: false };
         let retry = request_retry(&evidence, cli_json_optional_string(observed.root(), "retry_after").as_str(), time_unix_ms(), waited);
         if not retry.retry or goal.status != 1 {
-            if goal.status != 1 and result.error != 19 { execution_diagnostic_failure(&options.input, "budget", "budget", "", request_id.as_str(), false)?; } else { execution_diagnostic_failure(&options.input, if result.error == 19 { "cancelled" } else { "provider_request" }, "provider", "", request_id.as_str(), false)?; };
+            if goal.status != 1 and result.error != 19 { execution_diagnostic_budget(&options.input, goal)?; } else { execution_diagnostic_failure(&options.input, if result.error == 19 { "cancelled" } else { "provider_request" }, "provider", "", request_id.as_str(), false)?; };
             execution_diagnostic_network(&options.input, evidence.status, result.error, attempt, retry.reason.as_str())?;
             execution_diagnostic_response(&options.input, cli_json_optional_string(observed.root(), "response_stage").as_str(), cli_json_optional_string(observed.root(), "response_failure").as_str())?;
             return result;
@@ -357,7 +363,8 @@ def controller_append_message(state: &CliState, execution: &CliExecution, histor
     cli_put_string(&message, message.root(), "content", text)?;
     if call_id.len() > 0 { cli_put_string(&message, message.root(), "tool_call_id", call_id)?; (); };
     cli_state_append(state, execution, &message)?;
-    history.root().object_get("messages")?.array_push(history.copy(message.root())?)
+    let projected = evidence_project_message(state, execution.session.as_str(), message.root())?;
+    history.root().object_get("messages")?.array_push(history.copy(projected.root())?)
 }
 
 // Host continuation context is retained for recovery without impersonating a
@@ -425,7 +432,7 @@ def controller_context_history_pending(state: &CliState, options: &AgentOptions)
     };
     if total > seen {
         if 786432 - admitted < 64 { return controller_history_limit(); };
-        let previous = state_history_window_limits(state, options.session.as_str(), seen, total - seen, total, 786432 - admitted, 999 - retained_count, 32768);
+        let previous = evidence_history_window(state, options.session.as_str(), seen, total - seen, total, 786432 - admitted);
         if not previous.is_ok() { if previous.error == 13 { return controller_history_limit(); }; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: previous.error }; };
         let messages = previous.value.root().object_get("messages")?;
         let mut index = 0;
@@ -533,6 +540,7 @@ def controller_reduce_context(state: &CliState, execution: &CliExecution, option
     let summarized = controller_request(state, execution, options, connection, &prompt, &no_tools, scheduler, task, goal, terminal, children, child_states, true);
     controller_event(options, execution, execution.id.as_str(), "phase", connection.connection_id(), connection.model_id(), "working")?;
     if not summarized.is_ok() { if goal.status == 1 { goal.status = 2; }; return Result { is_ok: false, value: false, error: summarized.error }; };
+    execution_diagnostic_stage(&options.input, "context", "", "")?;
     if summarized.value.root().object_get("tool_calls")?.array_len()? != 0 { goal.status = 2; return Result { is_ok: false, value: false, error: 10 }; };
     let summary = context_clean_summary(cli_json_string(summarized.value.root(), "content")?.as_str())?;
     let reduced = context_compacted(history, summary.as_str(), &plan);
@@ -759,6 +767,10 @@ def controller_perform_tool(state: &CliState, execution: &CliExecution, options:
     if name == "list_agents" or name == "wait_agents" or name == "cancel_agent" { return controller_child_action(state, execution, options, name, args, scheduler, task_id, goal, terminal, children, child_states); };
     if name == "write_plan" and options.policy.depth > 0 { return workspace_result("Children cannot edit the parent's plan file", true); };
     if name == "spawn_agent" { return controller_start_child(state, options, current, args, scheduler, task_id, terminal, children, child_states); };
+    if name == "read_evidence" {
+        if tool_spec_decision(&options.policy, name, false) != 0 { return workspace_result("Evidence reading is unavailable under the current policy", true); };
+        return evidence_read(state, execution, args);
+    };
     if name == "list_models" {
         if tool_spec_decision(&options.policy, name, false) != 0 { return workspace_result("Model discovery is unavailable to this child role", true); };
         let snapshot = config_snapshot(state)?;
@@ -837,7 +849,7 @@ def controller_loop(state: &CliState, execution: &CliExecution, options: &AgentO
             return string_result_err(compacted.error);
         };
         let turn = controller_request(state, execution, options, connection, history, &tools, scheduler, task_id, goal, terminal, children, child_states, false)?;
-        if goal.status == 3 { return string_result_err(13); };
+        if goal.status == 3 { execution_diagnostic_budget(&options.input, goal)?; return string_result_err(13); };
         history.root().object_get("messages")?.array_push(history.copy(turn.root())?)?;
         let calls = turn.root().object_get("tool_calls")?;
         if calls.array_len()? == 0 {
@@ -854,8 +866,7 @@ def controller_loop(state: &CliState, execution: &CliExecution, options: &AgentO
                 // one-second polling snapshots are not new user instructions.
                 while not children_done(children, task_id) { controller_wait_children(state, execution, options, scheduler, task_id, goal, terminal, children, child_states, 1000)?; (); };
                 let reports = children_list(children)?;
-                let text = cli_join("Current child task results (all terminal; summarize their findings once, retain useful provider attribution and omit internal IDs):\n", reports.serialize_string()?.as_str())?;
-                controller_append_internal(state, execution, history, text.as_str())?;
+                controller_append_children(state, execution, history, &reports)?;
                 continue;
             };
             if options.goal_text.len() == 0 or goal.status != 1 { return cli_json_string(turn.root(), "content"); };
@@ -884,7 +895,7 @@ def controller_loop(state: &CliState, execution: &CliExecution, options: &AgentO
                 // Replace only these read-only status tool results in model
                 // context with the freshly observed snapshot. Durable ledger
                 // records still describe the actual tool invocation unchanged.
-                let reports = children_list(children)?; let encoded = reports.serialize_string()?;
+                let reports = children_list(children)?; let encoded = evidence_child_snapshot(state, &reports)?.serialize_string()?;
                 let messages = history.root().object_get("messages")?; let mut scan = messages.array_len()? - 1;
                 while scan >= 0 {
                     let message = messages.array_get(scan)?;
@@ -1208,13 +1219,15 @@ def controller_pump_children(state: &CliState, parent_execution: &CliExecution, 
             let child_task: &ChildTask = children.tasks.get(children_slot(children, record.id));
             let executed = controller_tool(state, &record.execution, &record.options, &child_task.options.connection, call, scheduler, record.id, goal, terminal, &parent.input, children, records);
             if not executed.is_ok() { children_cancel(children, record.id, scheduler, goal)?; return Result { is_ok: false, value: false, error: executed.error }; };
-            let result = json_parse(executed.value.as_str())?;
+            let result = json_parse_limits(executed.value.as_str(), 16777216, 65536)?;
             let persisted = json_doc_object()?;
             cli_put_string(&persisted, persisted.root(), "role", "tool")?;
             cli_put_string(&persisted, persisted.root(), "tool_call_id", call_id.as_str())?;
             cli_put_string(&persisted, persisted.root(), "content", executed.value.as_str())?;
             cli_state_append(state, &record.execution, &persisted)?;
-            children_complete_tool(children, record.id, call_id.as_str(), &result, scheduler)?;
+            let projected = evidence_project_tool(state, record.options.session.as_str(), call_id.as_str(), executed.value.as_str())?;
+            let model_result = json_parse_limits(projected.as_str(), 1048576, 32768)?;
+            children_complete_tool(children, record.id, call_id.as_str(), &model_result, scheduler)?;
             ();
         };
         index = index + 1;
@@ -1245,4 +1258,17 @@ def controller_child_action(state: &CliState, execution: &CliExecution, options:
     if tool == "wait_agents" { controller_wait_children(state, execution, options, scheduler, parent_id, goal, terminal, children, records, cli_json_optional_i64(args.root(), "timeout_ms", 1000))?; (); };
     controller_pump_children(state, execution, options, children, records, scheduler, goal, terminal)?;
     children_list(children)
+}
+
+// Public history retains the complete host snapshot; only model content is reduced.
+def controller_append_children(state: &CliState, execution: &CliExecution, history: &JsonDoc, snapshot: &JsonDoc) -> Result<bool, i64> {
+    let text = cli_join(evidence_snapshot_prefix(), snapshot.serialize_string()?.as_str())?;
+    let message = json_doc_object_limits(16777216, 65536)?;
+    cli_put_string(&message, message.root(), "role", "user")?;
+    cli_put_string(&message, message.root(), "content", text.as_str())?;
+    cli_put_bool(&message, message.root(), "cli_internal", true)?;
+    cli_put_bool(&message, message.root(), "cli_child_snapshot", true)?;
+    cli_state_append(state, execution, &message)?;
+    let projected = evidence_project_message(state, execution.session.as_str(), message.root())?;
+    history.root().object_get("messages")?.array_push(history.copy(projected.root())?)
 }

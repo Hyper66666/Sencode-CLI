@@ -126,7 +126,7 @@ def job_commands_start(state:&CliState,args:&JsonDoc,cwd:&str,format:&str,termin
     cli_put_string(&submit,submit.root(),"connection",cli_json_string(metadata.root(),"connection_id")?.as_str())?;cli_put_string(&submit,submit.root(),"model",cli_json_string(metadata.root(),"model")?.as_str())?;
     cli_put_string(&submit,submit.root(),"operation","turn")?;cli_put_string(&submit,submit.root(),"permission_profile","strict")?;cli_put_string(&submit,submit.root(),"goal",goal.as_str())?;
     cli_put_bool(&submit,submit.root(),"plan",cli_flag(args,"plan"))?;cli_put_bool(&submit,submit.root(),"auto_edit",cli_flag(args,"auto-edit"))?;cli_put_bool(&submit,submit.root(),"allow_commands",cli_flag(args,"allow-commands"))?;
-    cli_put_i64(&submit,submit.root(),"maximum_requests",cli_parse_unsigned(cli_option(args,"max-requests","50")?.as_str(),10)?)?;cli_put_i64(&submit,submit.root(),"token_budget",cli_parse_unsigned(cli_option(args,"token-budget","0")?.as_str(),10)?)?;
+    cli_put_i64(&submit,submit.root(),"maximum_requests",cli_parse_unsigned(cli_option(args,"max-requests","0")?.as_str(),10)?)?;cli_put_i64(&submit,submit.root(),"token_budget",cli_parse_unsigned(cli_option(args,"token-budget","0")?.as_str(),10)?)?;
     submit.root().object_set("checks",submit.copy(args.root().object_get("checks")?)?)?;engine_submit_valid(&submit)?;
     let lifetime=cli_parse_unsigned(cli_option(args,"job-timeout-ms","3600000")?.as_str(),10)?;
     if lifetime<1000 or lifetime>86400000{return cli_ok(2);};

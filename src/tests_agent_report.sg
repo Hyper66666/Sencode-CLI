@@ -1,0 +1,249 @@
+import agent_report;
+
+// Pure fixtures only: these command strings are claims and are never executed.
+def agent_report_test_expect(condition: bool, label: &str) -> Result<bool, i64> {
+    if condition { return Result { is_ok: true, value: true, error: 0 }; };
+    cli_diagnostic(label);
+    Result { is_ok: false, value: false, error: 99 }
+}
+
+def agent_report_test_claims() -> Result<JsonDoc, i64> {
+    json_parse("{\"schema\":1,\"outcome\":\"completed\",\"summary\":\"Updated 世界😀\",\"changed_paths\":[\"src/agent_report.sg\"],\"checks\":[{\"command\":\"fixture command\",\"status\":\"pass\"}],\"blocker\":\"\",\"next_action\":\"\"}")
+}
+
+def agent_report_test_repeat(text: &str, count: i64) -> Result<String, i64> {
+    let result = string_from_str("")?; let mut index = 0;
+    while index < count { result.push_str(text)?; index = index + 1; };
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def agent_report_test_invalid(raw: &str, label: &str) -> Result<bool, i64> {
+    let result = agent_report(raw, 5, 19)?;
+    let root = result.root();
+    agent_report_test_expect(not root.object_get("valid")?.bool_value()?, label)?;
+    agent_report_test_expect(root.object_len()? == 7 and not root.object_has("claims"), "invalid responses must omit claims")?;
+    agent_report_test_expect(cli_json_string(root, "source")?.as_str() == "model" and cli_json_optional_i64(root, "schema", 0) == 1, "fallback must retain schema and model attribution")?;
+    agent_report_test_expect(cli_json_optional_i64(root, "host_status", -1) == 5 and cli_json_optional_i64(root, "host_error", -1) == 19, "invalid responses must retain host cancellation")?;
+    let diagnostic = cli_json_string(root, "diagnostic")?;
+    agent_report_test_expect(diagnostic.len() > 0, "fallback must explain validation failure")?;
+    let excerpt = agent_report_excerpt(raw, 1024)?;
+    agent_report_test_expect(cli_json_string(root, "summary")?.as_str() == excerpt.as_str(), "fallback summary must be the bounded original prefix")
+}
+
+def agent_report_test_invalid_field(key: &str, encoded: &str, label: &str) -> Result<bool, i64> {
+    let claims = agent_report_test_claims()?; let replacement = json_parse(encoded)?;
+    claims.root().object_set(key, claims.copy(replacement.root())?)?;
+    let wire = claims.serialize_string()?;
+    agent_report_test_invalid(wire.as_str(), label)
+}
+
+def agent_report_test_invalid_string(key: &str, value: &str, label: &str) -> Result<bool, i64> {
+    let claims = agent_report_test_claims()?;
+    cli_put_string(&claims, claims.root(), key, value)?;
+    let wire = claims.serialize_string()?;
+    agent_report_test_invalid(wire.as_str(), label)
+}
+
+// The returned claims must survive destruction of the original input doc.
+def agent_report_test_detached() -> Result<JsonDoc, i64> {
+    let claims = agent_report_test_claims()?; let wire = claims.serialize_string()?;
+    agent_report(wire.as_str(), 3, 0)
+}
+
+def agent_report_test_unicode() -> Result<bool, i64> {
+    println("agent report: UTF-8 prefix boundaries and invalid preview limits");
+    agent_report_test_expect(agent_report_excerpt("ab😀tail", 4)?.as_str() == "ab", "4-byte preview must not split emoji after ASCII")?;
+    agent_report_test_expect(agent_report_excerpt("ab😀tail", 5)?.as_str() == "ab", "preview must retreat through three continuation bytes")?;
+    agent_report_test_expect(agent_report_excerpt("ab😀tail", 6)?.as_str() == "ab😀", "preview must include a complete emoji at the exact boundary")?;
+    agent_report_test_expect(agent_report_excerpt("世界😀tail", 4)?.as_str() == "世", "preview must preserve a complete CJK prefix")?;
+    agent_report_test_expect(agent_report_excerpt("世界😀tail", 9)?.as_str() == "世界", "preview must stop before an incomplete emoji")?;
+    agent_report_test_expect(agent_report_excerpt("ééé", 5)?.as_str() == "éé", "preview must handle two-byte characters")?;
+    agent_report_test_expect(agent_report_excerpt("😀tail", 4)?.as_str() == "😀", "minimum preview size must fit one full emoji")?;
+    agent_report_test_expect(agent_report_excerpt("short", 1024)?.as_str() == "short" and agent_report_excerpt("", 4)?.len() == 0, "short and empty previews must remain exact")?;
+    let negative = agent_report_excerpt("text", -1); let zero = agent_report_excerpt("text", 0); let small = agent_report_excerpt("", 3);
+    agent_report_test_expect(not negative.is_ok() and negative.error == 2 and not zero.is_ok() and zero.error == 2 and not small.is_ok() and small.error == 2, "maximum below four must return status 2")?;
+    let long = agent_report_test_repeat("a", 1023)?; long.push_str("😀retained by caller")?;
+    let result = agent_report(long.as_str(), 4, 10)?;
+    agent_report_test_expect(not result.root().object_get("valid")?.bool_value()? and cli_json_string(result.root(), "summary")?.len() == 1023, "fallback at 1024 bytes must retreat before a split emoji")?;
+    agent_report_test_expect(long.len() == 1045 and str_ends_with(long.as_str(), "retained by caller"), "excerpt must leave full caller content intact")
+}
+
+def agent_report_test_valid() -> Result<bool, i64> {
+    println("agent report: valid claims, detached ownership and host authority");
+    let result = agent_report_test_detached()?; let root = result.root();
+    agent_report_test_expect(root.object_get("valid")?.bool_value()? and root.object_len()? == 8, "complete report must validate and add only the claims object")?;
+    agent_report_test_expect(cli_json_string(root, "diagnostic")?.len() == 0 and cli_json_string(root, "summary")?.as_str() == "Updated 世界😀", "validated summary must use the model summary")?;
+    let claims = root.object_get("claims")?;
+    agent_report_test_expect(claims.kind()? == JSON_KIND_OBJECT() and cli_json_string(claims, "outcome")?.as_str() == "completed", "detached model claims must remain readable")?;
+    agent_report_test_expect(not root.object_has("outcome") and not root.object_has("checks") and not root.object_has("changed_paths"), "model claims must stay nested")?;
+    agent_report_test_expect(cli_json_string(claims.object_get("checks")?.array_get(0)?, "status")?.as_str() == "pass", "claimed pass remains claim data")?;
+    let escaped = agent_report_test_claims()?;
+    cli_put_string(&escaped, escaped.root(), "summary", "quote \" colon : slash \\ newline \n 世界😀")?;
+    let escaped_wire = escaped.serialize_string()?; let escaped_report = agent_report(escaped_wire.as_str(), 3, 0)?;
+    agent_report_test_expect(escaped_report.root().object_get("valid")?.bool_value()? and cli_json_string(escaped_report.root(), "summary")?.as_str() == "quote \" colon : slash \\ newline \n 世界😀", "ordinary escapes and colons inside strings must remain valid and exact")?;
+    let original = agent_report_test_claims()?; let wire = original.serialize_string()?;
+    let mut host_status = 0;
+    while host_status <= 5 {
+        let host_error = if host_status == 5 { 19 } else { if host_status == 4 { 9 } else { 0 } };
+        let forged = agent_report(wire.as_str(), host_status, host_error)?; let envelope = forged.root();
+        agent_report_test_expect(envelope.object_get("valid")?.bool_value()? and cli_json_string(envelope, "source")?.as_str() == "model", "validity must mean schema validity, including during host failure/cancellation")?;
+        agent_report_test_expect(cli_json_optional_i64(envelope, "host_status", -1) == host_status and cli_json_optional_i64(envelope, "host_error", -1) == host_error, "completed/pass claims must not overwrite any host status 0..5 or error")?;
+        host_status = host_status + 1;
+    };
+    let items: Vec<String> = vec_new(); items.push(cli_text("completed")); items.push(cli_text("partial")); items.push(cli_text("blocked"));
+    let mut index = 0;
+    while index < items.len() {
+        let candidate = agent_report_test_claims()?; let outcome: &String = items.get(index);
+        cli_put_string(&candidate, candidate.root(), "outcome", outcome.as_str())?;
+        candidate.root().object_set("changed_paths", candidate.new_array()?)?;
+        candidate.root().object_set("checks", candidate.new_array()?)?;
+        let encoded = candidate.serialize_string()?; let report = agent_report(encoded.as_str(), 3, 0)?;
+        agent_report_test_expect(report.root().object_get("valid")?.bool_value()?, "all outcome values and empty arrays must validate")?;
+        index = index + 1;
+    };
+    agent_report_test_expect(str_contains(agent_report_instructions(), "16384") and str_contains(agent_report_instructions(), "model claims") and str_contains(agent_report_instructions(), "exactly one JSON object"), "child instructions must specify the wire format and claim authority")
+}
+
+def agent_report_test_invalids() -> Result<bool, i64> {
+    println("agent report: malformed, plain, unknown, missing, duplicate and mistyped content");
+    agent_report_test_invalid("", "empty response must return successful fallback")?;
+    agent_report_test_invalid("Completed and all checks passed", "plain response must return successful fallback")?;
+    agent_report_test_invalid("{\"schema\":1,", "malformed JSON must return successful fallback")?;
+    agent_report_test_invalid("{\"schema\":1,}", "trailing comma must fail validation")?;
+    agent_report_test_invalid("null", "null cannot be a model report")?;
+    agent_report_test_invalid("[]", "array cannot be a model report")?;
+    agent_report_test_invalid("1", "number cannot be a model report")?;
+    agent_report_test_invalid("{\"schema\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":[],\"blocker\":\"\"}", "missing next_action must fail validation")?;
+    agent_report_test_invalid_field("host_status", "3", "unknown root authority key must fail validation")?;
+    agent_report_test_invalid_field("schema", "2", "unsupported schema must fail validation")?;
+    agent_report_test_invalid_field("schema", "\"1\"", "string schema must fail validation")?;
+    agent_report_test_invalid_field("schema", "1.5", "fractional schema must fail validation")?;
+    agent_report_test_invalid_field("outcome", "\"done\"", "unknown outcome must fail validation")?;
+    agent_report_test_invalid_field("outcome", "true", "boolean outcome must fail validation")?;
+    agent_report_test_invalid_field("summary", "null", "null summary must fail validation")?;
+    agent_report_test_invalid_field("blocker", "[]", "array blocker must fail validation")?;
+    agent_report_test_invalid_field("next_action", "7", "number next_action must fail validation")?;
+    agent_report_test_invalid_field("changed_paths", "{}", "object changed_paths must fail validation")?;
+    agent_report_test_invalid_field("changed_paths", "[17]", "number changed path must fail validation")?;
+    agent_report_test_invalid_field("checks", "{}", "object checks must fail validation")?;
+    agent_report_test_invalid_field("checks", "[\"pass\"]", "string check must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\",\"status\":\"passed\"}]", "incorrect check status enum must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":7,\"status\":\"pass\"}]", "number command must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\",\"status\":true}]", "boolean status must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\"}]", "missing check status must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\",\"status\":\"pass\",\"verified\":true}]", "unknown check key must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\",\"status\":\"pass\",\"status|\":\"pass\"}]", "key delimiters must not bypass exact key validation")?;
+    let claims = agent_report_test_claims()?; let raw = claims.serialize_string()?;
+    let fenced = cli_join("```json\n", raw.as_str())?; fenced.push_str("\n```")?;
+    agent_report_test_invalid(fenced.as_str(), "Markdown fences must fail validation")?;
+    let trailing = cli_join(raw.as_str(), " true")?;
+    agent_report_test_invalid(trailing.as_str(), "trailing JSON value must fail validation")?;
+    let tail = str_get(raw.as_str(), 1, raw.len())?;
+    let duplicate = cli_join("{\"schema\":1,", tail.as_str())?;
+    agent_report_test_invalid(duplicate.as_str(), "duplicate root key must fail validation")?;
+    let escaped_duplicate = cli_join("{\"schem\\u0061\":1,", tail.as_str())?;
+    agent_report_test_invalid(escaped_duplicate.as_str(), "escaped duplicate root key must fail validation")?;
+    agent_report_test_invalid("{\"schema\":1,\"outcome\":\"completed\",\"summary\":\"ready\",\"changed_paths\":[],\"checks\":[{\"command\":\"fixture\",\"status\":\"fail\",\"status\":\"pass\"}],\"blocker\":\"\",\"next_action\":\"\"}", "duplicate nested key must fail validation")
+}
+
+def agent_report_test_bounds() -> Result<bool, i64> {
+    println("agent report: decoded byte bounds, collection limits and total wire admission");
+    let summary = agent_report_test_repeat("😀", 256)?;
+    let path = agent_report_test_repeat("é", 128)?;
+    let command = agent_report_test_repeat("😀", 128)?;
+    let candidate = agent_report_test_claims()?;
+    cli_put_string(&candidate, candidate.root(), "summary", summary.as_str())?;
+    cli_put_string(&candidate, candidate.root(), "blocker", command.as_str())?;
+    cli_put_string(&candidate, candidate.root(), "next_action", command.as_str())?;
+    let paths = candidate.new_array()?; let checks = candidate.new_array()?; let mut index = 0;
+    while index < 16 {
+        paths.array_push(candidate.new_string(path.as_str())?)?;
+        let check = candidate.new_object()?;
+        cli_put_string(&candidate, check, "command", command.as_str())?;
+        cli_put_string(&candidate, check, "status", if index % 5 == 0 { "planned" } else { if index % 5 == 1 { "run" } else { if index % 5 == 2 { "pass" } else { if index % 5 == 3 { "fail" } else { "unknown" } } } })?;
+        checks.array_push(check)?; index = index + 1;
+    };
+    candidate.root().object_set("changed_paths", paths)?;
+    candidate.root().object_set("checks", checks)?;
+    let encoded = candidate.serialize_string()?;
+    agent_report_test_expect(encoded.len() < 16384, "maximum decoded field fixture must fit wire admission")?;
+    let valid = agent_report(encoded.as_str(), 3, 0)?;
+    agent_report_test_expect(valid.root().object_get("valid")?.bool_value()? and cli_json_string(valid.root(), "summary")?.len() == 1024, "all inclusive byte bounds, 16 entries and all check enums must validate")?;
+    let padded = cli_text(encoded.as_str());
+    while padded.len() < 16384 { padded.push_str(" ")?; };
+    let exact = agent_report(padded.as_str(), 3, 0)?;
+    agent_report_test_expect(exact.root().object_get("valid")?.bool_value()?, "exact 16384-byte response must validate")?;
+    padded.push_str(" ")?;
+    agent_report_test_invalid(padded.as_str(), "16385-byte otherwise valid response must fail validation")?;
+    agent_report_test_expect(padded.len() == 16385, "oversize fallback must not mutate original response")?;
+    let escapes = agent_report_test_repeat("\\u0061", 1024)?;
+    let escaped_wire = cli_join("{\"schema\":1,\"outcome\":\"partial\",\"summary\":\"", escapes.as_str())?;
+    escaped_wire.push_str("\",\"changed_paths\":[],\"checks\":[],\"blocker\":\"\",\"next_action\":\"\"}")?;
+    let escaped = agent_report(escaped_wire.as_str(), 3, 0)?;
+    agent_report_test_expect(escaped.root().object_get("valid")?.bool_value()? and cli_json_string(escaped.root(), "summary")?.len() == 1024, "summary bounds must apply to decoded bytes rather than JSON escape spelling")?;
+    summary.push_str("x")?;
+    agent_report_test_invalid_string("summary", summary.as_str(), "1025-byte Unicode summary must fail validation")?;
+    command.push_str("x")?;
+    agent_report_test_invalid_string("blocker", command.as_str(), "513-byte Unicode blocker must fail validation")?;
+    agent_report_test_invalid_string("next_action", command.as_str(), "513-byte Unicode next_action must fail validation")?;
+    cli_put_string(&candidate, checks.array_get(0)?, "command", command.as_str())?;
+    let command_wire = candidate.serialize_string()?;
+    agent_report_test_invalid(command_wire.as_str(), "513-byte Unicode command must fail validation")?;
+    cli_put_string(&candidate, checks.array_get(0)?, "command", "fixture")?;
+    path.push_str("x")?; paths.array_push(candidate.new_string(path.as_str())?)?;
+    let paths_wire = candidate.serialize_string()?;
+    agent_report_test_invalid(paths_wire.as_str(), "17 changed paths must fail validation")?;
+    let one_path = candidate.new_array()?; one_path.array_push(candidate.new_string(path.as_str())?)?;
+    candidate.root().object_set("changed_paths", one_path)?;
+    let path_wire = candidate.serialize_string()?;
+    agent_report_test_invalid(path_wire.as_str(), "257-byte Unicode path must fail validation")?;
+    candidate.root().object_set("changed_paths", candidate.new_array()?)?;
+    let extra_check = candidate.new_object()?;
+    cli_put_string(&candidate, extra_check, "command", "fixture")?; cli_put_string(&candidate, extra_check, "status", "unknown")?;
+    checks.array_push(extra_check)?;
+    let checks_wire = candidate.serialize_string()?;
+    agent_report_test_invalid(checks_wire.as_str(), "17 checks must fail validation")
+}
+
+def agent_report_test_nul() -> Result<bool, i64> {
+    println("agent report: escaped NUL and raw NUL before borrowed-string narrowing");
+    agent_report_test_invalid_field("summary", "\"visible\\u0000hidden\"", "escaped NUL in summary must fail validation")?;
+    agent_report_test_invalid_field("outcome", "\"completed\\u0000blocked\"", "escaped NUL cannot forge a valid outcome")?;
+    agent_report_test_invalid_field("changed_paths", "[\"path\\u0000hidden\"]", "escaped NUL in changed path must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\\u0000hidden\",\"status\":\"pass\"}]", "escaped NUL in command must fail validation")?;
+    agent_report_test_invalid_field("checks", "[{\"command\":\"fixture\",\"status\":\"pass\\u0000fail\"}]", "escaped NUL cannot forge a valid check status")?;
+    agent_report_test_invalid_field("blocker", "\"visible\\u0000hidden\"", "escaped NUL in blocker must fail validation")?;
+    agent_report_test_invalid_field("next_action", "\"visible\\u0000hidden\"", "escaped NUL in next_action must fail validation")?;
+    agent_report_test_invalid("{\"schema\":1,\"outcome\":\"completed\",\"summary\\u0000hidden\":\"ready\",\"changed_paths\":[],\"checks\":[],\"blocker\":\"\",\"next_action\":\"\"}", "escaped NUL cannot forge an exact required key")?;
+    let candidate = agent_report_test_claims()?; let raw = candidate.serialize_string()?;
+    raw.push_char('\0')?; raw.push_str("hidden suffix")?;
+    agent_report_test_expect(raw.len() > raw.as_str().len(), "raw NUL fixture must retain its owned suffix")?;
+    // A bare &str cannot expose that suffix in the current ABI; use the adapter.
+    let rejected = agent_report_owned(&raw, 5, 19)?;
+    agent_report_test_expect(not rejected.root().object_get("valid")?.bool_value()? and not rejected.root().object_has("claims"), "raw NUL after otherwise valid JSON must fail validation before as_str narrowing")?;
+    agent_report_test_expect(cli_json_string(rejected.root(), "diagnostic")?.as_str() == "raw NUL in model response" and cli_json_optional_i64(rejected.root(), "host_error", 0) == 19, "raw NUL fallback must retain cancellation and a specific diagnostic")?;
+    let leading = string_from_str("")?; leading.push_char('\0')?; leading.push_str("hidden")?;
+    let empty = agent_report_owned(&leading, 4, 10)?;
+    agent_report_test_expect(not empty.root().object_get("valid")?.bool_value()? and cli_json_string(empty.root(), "summary")?.len() == 0, "leading raw NUL must produce a successful empty-prefix fallback")?;
+    let inside = cli_text("{\"schema\":1,\"summary\":\"visible"); inside.push_char('\0')?; inside.push_str("hidden\"}")?;
+    let malformed = agent_report_owned(&inside, 4, 10)?;
+    agent_report_test_expect(not malformed.root().object_get("valid")?.bool_value()? and not malformed.root().object_has("claims"), "raw NUL within a JSON string must return successful fallback")?;
+    agent_report_test_expect(raw.len() > raw.as_str().len() and str_ends_with(cli_json_string(candidate.root(), "summary")?.as_str(), "世界😀"), "NUL rejection must leave the original caller data intact")?;
+    let clean = candidate.serialize_string()?; let accepted = agent_report_owned(&clean, 3, 0)?;
+    agent_report_test_expect(accepted.root().object_get("valid")?.bool_value()?, "owned adapter must admit a clean valid report")
+}
+
+def agent_report_tests() -> Result<bool, i64> {
+    agent_report_test_unicode()?;
+    agent_report_test_valid()?;
+    agent_report_test_invalids()?;
+    agent_report_test_bounds()?;
+    agent_report_test_nul()
+}
+
+def main() -> i64 {
+    let result = agent_report_tests();
+    if not result.is_ok() { println("agent report: FAILED"); println(result.error); return 99; };
+    println("agent report: all fixture checks passed");
+    0
+}

@@ -11,6 +11,7 @@ from ctypes import wintypes
 import hashlib
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -47,7 +48,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close"); self.end_headers()
             if prompt == "HISTORY":
-                self.event("\n".join(f"hist-{i:03d} 中文 `code-{i:03d}`" for i in range(180)) + "\n", True)
+                self.event("\n".join(f"hist-{i:03d} 中文 `code-{i:03d}`" for i in range(12000)) + "\n", True)
             elif prompt == "SLOW":
                 self.event("SLOW_RUNNING\n")
                 deadline = time.monotonic() + 12
@@ -162,7 +163,7 @@ def worker(args):
             wait(console, process, lambda s: "Thinking effort / two" in s["text"], "effort picker")
             console.key(0x28); console.key(0x28); console.key(0x0D, "\r")
             return wait(console, process, lambda s: "Thinking effort /" not in s["text"] and "xhigh" in s["text"], "selected tuple")
-        def markers(screen): return [int(v) for v in re.findall(r"hist-(\d{3})", "\n".join(r["text"] for r in screen["rows"][2:-6]))]
+        def markers(screen): return [int(v) for v in re.findall(r"hist-(\d+)", "\n".join(r["text"] for r in screen["rows"][2:-6]))]
         def scroll_wait(predicate):
             deadline = time.perf_counter() + 5
             while time.perf_counter() < deadline:
@@ -178,18 +179,20 @@ def worker(args):
         for width in (80, 120, 160):
             resize_fullscreen(console, width, 40)
             console.key(0x23, "", 8)
-            tail = wait(console, process, lambda s: s["width"] == width and 179 in markers(s), "tail at width")
+            tail = wait(console, process, lambda s: s["width"] == width and 11999 in markers(s), "tail at width")
             start = markers(tail)[0]
             wheel(console, 10, 4)
             small = wait(console, process, lambda s: markers(s) and markers(s)[0] == start - 1, "fractional wheel line")
             record(f"fractional-wheel-{width}", markers(small)[0] == start - 1)
             latencies = []
-            for _ in range(10):
+            for _ in range(40):
                 begin_at = markers(console.read(viewport=True))[0]; started = time.perf_counter()
                 wheel(console, 120)
                 scroll_wait(lambda s: markers(s) and markers(s)[0] == begin_at - 3)
                 latencies.append((time.perf_counter() - started) * 1000)
-            evidence["scroll_latency_ms"][str(width)] = {"samples": latencies, "p95": sorted(latencies)[int(.95 * (len(latencies)-1))]}
+            evidence["scroll_latency_ms"][str(width)] = {"samples": latencies,
+                "p95": sorted(latencies)[math.ceil(.95 * len(latencies)) - 1],
+                "method": "nearest-rank p95; injection through console snapshot observation"}
             previous = console.read(viewport=True)
             resize_fullscreen(console, width, 38); time.sleep(.05); resize_fullscreen(console, width, 40)
             refreshed = wait(console, process, lambda s: s["height"] == 40 and markers(s) == markers(previous), "full viewport reconstruction")
@@ -199,7 +202,36 @@ def worker(args):
             oldest = wait(console, process, lambda s: 0 in markers(s), "full oldest page")
             record(f"oldest-page-stays-full-{width}", len(markers(oldest)) >= 20)
         record("wheel-p95-below-50ms", all(v["p95"] < 50 for v in evidence["scroll_latency_ms"].values()), evidence["scroll_latency_ms"])
-        console.key(0x23, "", 8)
+        # Jump-to-latest is a UI control, never a prompt or tool action.
+        latest = console.read(viewport=True)
+        assert "▾" in latest["text"], latest["text"]
+        row = next(i for i, r in enumerate(latest["rows"]) if "▾" in r["text"])
+        column = latest["rows"][row]["text"].index("▾")
+        before_requests = len(server.requests)
+        records = (InputRecord * 2)()
+        for i, buttons in enumerate((1, 0)):
+            records[i].EventType = 2
+            value = struct.pack("<hhIII", column, row, buttons, 0, 0)
+            ctypes.memmove(ctypes.byref(records[i].Event), value, 16)
+        written = wintypes.DWORD()
+        checked(console.kernel.WriteConsoleInputW(console.input, records, 2, ctypes.byref(written)))
+        at_bottom = wait(console, process, lambda s: 11999 in markers(s) and "▾" not in s["text"], "jump to latest")
+        record("jump-marker-click-no-submit", len(server.requests) == before_requests)
+        # Poison the actual console while retaining exactly the same dimensions.
+        # A full invalidation must repaint unchanged cached header/composer rows.
+        info = console.info(); written = wintypes.DWORD()
+        checked(console.kernel.FillConsoleOutputCharacterW(console.output, "#", info.dwSize.X * info.dwSize.Y,
+            type(info.dwCursorPosition)(0, 0), ctypes.byref(written)))
+        invalidation = (InputRecord * 1)(); invalidation[0].EventType = 4
+        ctypes.memmove(ctypes.byref(invalidation[0].Event), struct.pack("<hh", info.dwSize.X, info.dwSize.Y), 4)
+        checked(console.kernel.WriteConsoleInputW(console.input, invalidation, 1, ctypes.byref(written)))
+        repaired = wait(console, process, lambda s: "SENCODE" in s["rows"][0]["text"] and "MESSAGE" in s["text"] and "###" not in s["text"], "same-size full reconstruction")
+        record("same-size-full-reconstruction", [r["cells"] for r in repaired["rows"]] == [r["cells"] for r in at_bottom["rows"]])
+        for width, height in [(80, 18), (160, 45), (32, 8), (120, 40)] * 3:
+            resize_fullscreen(console, width, height)
+        settled = wait(console, process, lambda s: s["width"] == 120 and s["height"] == 40 and "SENCODE" in s["rows"][0]["text"] and "MESSAGE" in s["text"] and 11999 in markers(s), "rapid shrink/maximize settled frame")
+        record("rapid-resize-retains-bottom-and-composer", "BUILD" not in settled["rows"][0]["text"])
+        evidence["snapshots"]["settled-resize"] = settled
         choose_b_two()
         eventually(lambda: target(session) == {"schema": 1, "connection": ids[1], "model": "two", "effort": "xhigh"}, "idle selection persistence")
         stop(); requests_before = len(server.requests)
