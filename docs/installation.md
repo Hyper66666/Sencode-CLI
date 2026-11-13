@@ -1,5 +1,34 @@
 # Install the native Sencode CLI on Windows
 
+## Download the Windows preview
+
+Download [install-sencode.ps1](https://github.com/Hyper66666/Sencode-CLI/releases/download/v0.1.0-preview.20261113/install-sencode.ps1)
+from the [Windows preview release](https://github.com/Hyper66666/Sencode-CLI/releases/tag/v0.1.0-preview.20261113),
+then run it from PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-sencode.ps1
+```
+
+The script downloads the fixed ZIP, verifies its embedded SHA-256 and runs the
+payload installer below. No administrator access or development tools are needed.
+This preview includes the CLI, ripgrep and the two pinned optional account runtimes;
+the React/Tauri configuration companion is separate. The application version is
+`0.1.0-dev.0`; the dated preview tag identifies this distribution.
+
+For offline installation, download the ZIP from the same release and run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-sencode.ps1 `
+  -ArchivePath .\sencode-cli-0.1.0-dev.0-windows-x64.zip
+```
+
+Use `-Prefix C:\tools\SencodeCLI -NoPath` for a portable installation. Stop the CLI
+before updating an existing installation. This is a Windows development preview;
+fresh-VM and live-provider qualification remain separate.
+
+## Package installation details
+
 The Windows x64 package provides `sen.exe` and `sencode.exe`. They are identical
 copies of the Sengoo-native application. Either name starts the application
 directly and preserves the caller's working directory and arguments.

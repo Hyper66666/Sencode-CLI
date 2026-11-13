@@ -9,6 +9,10 @@ This is a development candidate. Test configuration and test fixture source are
 not release evidence; consult the recorded acceptance results before distributing
 a build. The existing `sencode` Rust runtime remains a separate product binary.
 
+Windows users can download the [preview installer](https://github.com/Hyper66666/Sencode-CLI/releases/tag/v0.1.0-preview.20261113)
+and follow the [installation guide](docs/installation.md). The CLI needs no compiler
+or administrator access to install and run.
+
 ## Build from source
 
 Keep the two checkouts adjacent. This snapshot requires Sengoo revision
