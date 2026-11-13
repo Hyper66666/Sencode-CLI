@@ -162,6 +162,6 @@ def management_mcp_tool_pending(cwd: &str, name: &str, args: &JsonDoc, policy: &
     // A server is scoped to this admitted call. Do not release the writer's
     // lease merely because its direct process or JSON-RPC response finished.
     client.cancel();
-    loop { let quiet = client.process.tree_quiescent(); if quiet.is_ok() and quiet.value { break; }; client.process.terminate_tree(); time_sleep_ms(1); };
+    loop { let quiet = client.core.process.tree_quiescent(); if quiet.is_ok() and quiet.value { break; }; client.core.process.terminate_tree(); time_sleep_ms(1); };
     result
 }

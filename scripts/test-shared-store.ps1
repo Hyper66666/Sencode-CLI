@@ -20,7 +20,7 @@ $savedCli = $env:SENCODE_SHARED_CLI_TEST
 $savedConfig = $env:TAURI_CONFIG
 try {
     if ($ClangDirectory) { $env:PATH = $ClangDirectory + [IO.Path]::PathSeparator + $env:PATH }
-    $env:SENGOO_MODULE_MAP = 'sgsqlite=' + (Join-Path $SengooRoot 'packages/sgsqlite/src/lib.sg').Replace('\','/')
+    $env:SENGOO_MODULE_MAP = 'sgsqlite=' + (Join-Path $SengooRoot 'packages/sgsqlite/src/lib.sg').Replace('\','/') + ';sgllm=' + (Join-Path $SengooRoot 'packages/sgllm/src/lib.sg') + ';sgmcp=' + (Join-Path $SengooRoot 'packages/sgmcp/src/lib.sg') + ';sgschema=' + (Join-Path $SengooRoot 'packages/sgschema/src/lib.sg') + ';sgagent=' + (Join-Path $SengooRoot 'packages/sgagent/src/lib.sg')
     Push-Location $cliRoot
     try {
         & $Sgc --runtime-mode source-development build src/tests_state.sg --force-rebuild -O 0 -o $candidate
@@ -39,7 +39,7 @@ try {
     } finally { Pop-Location }
 } finally {
     $env:PATH = $savedPath
-    $env:SENGOO_MODULE_MAP = $savedMap
+    $env:SENGOO_MODULE_MAP = $savedMap + ';sgllm=' + (Join-Path $SengooRoot 'packages/sgllm/src/lib.sg') + ';sgmcp=' + (Join-Path $SengooRoot 'packages/sgmcp/src/lib.sg') + ';sgschema=' + (Join-Path $SengooRoot 'packages/sgschema/src/lib.sg') + ';sgagent=' + (Join-Path $SengooRoot 'packages/sgagent/src/lib.sg')
     $env:SENCODE_SHARED_CLI_TEST = $savedCli
     $env:TAURI_CONFIG = $savedConfig
 }

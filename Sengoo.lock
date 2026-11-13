@@ -3,6 +3,14 @@ version = 2
 root = "sencode_sg"
 
 [[package]]
+id = "sgschema@0.1.0+path:../Sengoo/packages/sgschema"
+name = "sgschema"
+version = "0.1.0"
+source.kind = "path"
+source.path = "../Sengoo/packages/sgschema"
+manifest = "../Sengoo/packages/sgschema/Sengoo.toml"
+
+[[package]]
 id = "sgsqlite@0.1.0+path:../Sengoo/packages/sgsqlite"
 name = "sgsqlite"
 version = "0.1.0"
@@ -11,12 +19,66 @@ source.path = "../Sengoo/packages/sgsqlite"
 manifest = "../Sengoo/packages/sgsqlite/Sengoo.toml"
 
 [[package]]
+id = "sgagent@0.1.0+path:../Sengoo/packages/sgagent"
+name = "sgagent"
+version = "0.1.0"
+source.kind = "path"
+source.path = "../Sengoo/packages/sgagent"
+manifest = "../Sengoo/packages/sgagent/Sengoo.toml"
+
+[[package]]
+id = "sgllm@0.1.0+path:../Sengoo/packages/sgllm"
+name = "sgllm"
+version = "0.1.0"
+source.kind = "path"
+source.path = "../Sengoo/packages/sgllm"
+manifest = "../Sengoo/packages/sgllm/Sengoo.toml"
+
+[[package]]
+id = "sgmcp@0.1.0+path:../Sengoo/packages/sgmcp"
+name = "sgmcp"
+version = "0.1.0"
+source.kind = "path"
+source.path = "../Sengoo/packages/sgmcp"
+manifest = "../Sengoo/packages/sgmcp/Sengoo.toml"
+
+[[package]]
 id = "sencode_sg@0.1.0-dev.0+path:."
 name = "sencode_sg"
 version = "0.1.0-dev.0"
 source.kind = "path"
 source.path = "."
 manifest = "Sengoo.toml"
+
+[[dependency]]
+from = "sencode_sg@0.1.0-dev.0+path:."
+alias = "sgagent"
+to = "sgagent@0.1.0+path:../Sengoo/packages/sgagent"
+
+[[dependency]]
+from = "sgagent@0.1.0+path:../Sengoo/packages/sgagent"
+alias = "sgschema"
+to = "sgschema@0.1.0+path:../Sengoo/packages/sgschema"
+
+[[dependency]]
+from = "sgagent@0.1.0+path:../Sengoo/packages/sgagent"
+alias = "sgsqlite"
+to = "sgsqlite@0.1.0+path:../Sengoo/packages/sgsqlite"
+
+[[dependency]]
+from = "sencode_sg@0.1.0-dev.0+path:."
+alias = "sgllm"
+to = "sgllm@0.1.0+path:../Sengoo/packages/sgllm"
+
+[[dependency]]
+from = "sencode_sg@0.1.0-dev.0+path:."
+alias = "sgmcp"
+to = "sgmcp@0.1.0+path:../Sengoo/packages/sgmcp"
+
+[[dependency]]
+from = "sgmcp@0.1.0+path:../Sengoo/packages/sgmcp"
+alias = "sgschema"
+to = "sgschema@0.1.0+path:../Sengoo/packages/sgschema"
 
 [[dependency]]
 from = "sencode_sg@0.1.0-dev.0+path:."

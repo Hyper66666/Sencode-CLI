@@ -1,176 +1,50 @@
+// Permissions and terminal controls stay in Sencode; byte framing, deadlines,
+// JSON-RPC state and owned process cleanup have one implementation in sgmcp.
 import executor;
+import sgmcp;
 
-struct McpClient {
-    process: ProcessHandle,
-    pending: Buffer,
-    next_id: i64,
-    initialized: bool,
-    diagnostics: Buffer,
-    stderr_truncated: bool,
-}
+struct McpClient { core: SgMcpClient }
 
 def mcp_start(command: &str, arguments: JsonValue, cwd: &str) -> Result<McpClient, i64> {
-    let builder = process_command(command)?;
-    builder.cwd(cwd)?;
-    let mut index = 0;
-    while index < arguments.array_len()? { let argument = arguments.array_get(index)?.string_value()?; builder.arg(argument.as_str())?; index = index + 1; };
-    let child = builder.spawn_piped()?;
-    Result { is_ok: true, value: McpClient { process: child, pending: cli_bytes(1048576), next_id: 1, initialized: false, diagnostics: cli_bytes(65536), stderr_truncated: false }, error: 0 }
+    let started = sgmcp_start(command, arguments, cwd)?;
+    Result { is_ok: true, value: McpClient { core: started }, error: 0 }
 }
 
 impl McpClient {
-    def send(&self, document: &JsonDoc, timeout_ms: i64) -> Result<bool, i64> {
-        let text = document.serialize_string()?;
-        text.push_str("\n")?;
-        let buffer = ffi_buffer_from_bytes(text.as_str())?;
-        let mut offset = 0;
-        let start = time_unix_ms();
-        while offset < buffer.used_len() {
-            let part = ffi_buffer_new(buffer.used_len() - offset)?;
-            buffer.copy_range(offset, buffer.used_len() - offset, part)?;
-            let count = self.process.write_stdin(&part, part.used_len())?;
-            offset = offset + count;
-            if time_since_ms(start) >= timeout_ms { return Result { is_ok: false, value: false, error: 11 }; };
-            if count == 0 { time_sleep_ms(5); };
-        };
-        Result { is_ok: true, value: true, error: 0 }
-    }
-
     def rpc(&mut self, method: &str, params: JsonValue, timeout_ms: i64, terminal: &Terminal) -> Result<JsonDoc, i64> {
-        let pending: Vec<TerminalEvent> = vec_new();
-        self.rpc_pending(method, params, timeout_ms, terminal, &pending)
+        let pending: Vec<TerminalEvent> = vec_new(); self.rpc_pending(method, params, timeout_ms, terminal, &pending)
     }
-
-    // An MCP server can stop reading stdin. Keep cancellation and input
-    // collection responsive even before its complete request has been sent.
-    def send_pending(&mut self, document: &JsonDoc, timeout_ms: i64, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<bool, i64> {
-        let text = document.serialize_string()?;
-        text.push_str("\n")?;
-        let buffer = ffi_buffer_from_bytes(text.as_str())?;
-        let mut offset = 0;
-        let start = time_unix_ms();
-        while offset < buffer.used_len() {
-            let input = ui_poll_busy(terminal, pending);
-            if not input.is_ok() { self.cancel(); return Result { is_ok: false, value: false, error: input.error }; };
-            if input.value { self.cancel(); return Result { is_ok: false, value: false, error: 19 }; };
-            let part = ffi_buffer_new(buffer.used_len() - offset)?;
-            buffer.copy_range(offset, buffer.used_len() - offset, part)?;
-            let count = self.process.write_stdin(&part, part.used_len())?;
-            offset = offset + count;
-            if time_since_ms(start) >= timeout_ms { self.cancel(); return Result { is_ok: false, value: false, error: 11 }; };
-            if count == 0 { time_sleep_ms(5); };
-        };
-        Result { is_ok: true, value: true, error: 0 }
-    }
-
-    def rpc_pending(&mut self, method: &str, params: JsonValue, timeout_ms: i64, terminal: &Terminal, input: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
-        let request = json_doc_object()?;
-        let id = self.next_id;
-        self.next_id = self.next_id + 1;
-        cli_put_string(&request, request.root(), "jsonrpc", "2.0")?;
-        cli_put_i64(&request, request.root(), "id", id)?;
-        cli_put_string(&request, request.root(), "method", method)?;
-        request.root().object_set("params", request.copy(params)?)?;
-        self.send_pending(&request, timeout_ms, terminal, input)?;
-        let mut stdout = ffi_buffer_new(8192)?;
-        let mut stderr = ffi_buffer_new(8192)?;
-        let started = time_unix_ms();
+    def wait_pending(&mut self, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<bool, i64> {
         loop {
-            let count = self.process.read_stdout(&mut stdout)?;
-            if count > 0 {
-                if self.pending.used_len() + count > 1048576 { return Result { is_ok: false, value: json_doc_object()?, error: 13 }; };
-                cli_bytes_append(&self.pending, &stdout, 0, count)?;
-                ();
+            let input = ui_poll_busy(terminal, pending);
+            if not input.is_ok() or input.value { self.core.cancel()?; return Result { is_ok: false, value: false, error: if input.is_ok() { 19 } else { input.error } }; };
+            let polled = self.core.poll();
+            if not polled.is_ok() { self.core.cancel()?; return Result { is_ok: false, value: false, error: polled.error }; };
+            // Notifications cannot execute tools or approve work. Drain this
+            // bounded stream even when no UI progress consumer is attached.
+            let mut drained = 0;
+            while drained < 64 {
+                let notice = self.core.next_notification()?;
+                if not notice.root().object_has("method") { break; };
+                drained = drained + 1;
             };
-            let error_count = self.process.read_stderr(&mut stderr)?;
-            if error_count > 0 {
-                let remaining = self.diagnostics.capacity() - self.diagnostics.used_len();
-                let keep = if error_count < remaining { error_count } else { remaining };
-                cli_bytes_append(&self.diagnostics, &stderr, 0, keep)?;
-                if keep < error_count { self.stderr_truncated = true; };
-            };
-            loop {
-                let newline = cli_bytes_index(&self.pending, "\n")?;
-                if newline < 0 { break; };
-                let line = cli_bytes_text(&self.pending, 0, newline)?;
-                self.pending.consume(newline + 1)?;
-                let response = json_parse(line.as_str())?;
-                let root = response.root();
-                if root.object_has("id") and cli_json_optional_i64(root, "id", -1) == id {
-                    if root.object_has("error") { return Result { is_ok: false, value: response, error: 9 }; };
-                    return Result { is_ok: true, value: response, error: 0 };
-                };
-                // Do not honor server-initiated sampling, filesystem or approval requests.
-                if root.object_has("method") and root.object_has("id") {
-                    let rejected = json_doc_object()?;
-                    cli_put_string(&rejected, rejected.root(), "jsonrpc", "2.0")?;
-                    rejected.root().object_set("id", rejected.copy(root.object_get("id")?)?)?;
-                    let error = rejected.new_object()?;
-                    cli_put_i64(&rejected, error, "code", -32601)?;
-                    cli_put_string(&rejected, error, "message", "Server initiated requests are unsupported")?;
-                    rejected.root().object_set("error", error)?;
-                    self.send(&rejected, 1000)?;
-                    ();
-                };
-            };
-            let timed_out = time_since_ms(started) >= timeout_ms;
-            // Only the next input prompt drains this bounded queue. In
-            // particular, queued "yes" cannot approve a later tool call.
-            let observed = ui_poll_busy(terminal, input);
-            if not observed.is_ok() { self.cancel(); return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: observed.error }; };
-            let cancelled = observed.value;
-            if timed_out or cancelled {
-                let notification = json_doc_object()?;
-                cli_put_string(&notification, notification.root(), "jsonrpc", "2.0")?;
-                cli_put_string(&notification, notification.root(), "method", "notifications/cancelled")?;
-                let data = notification.new_object()?;
-                cli_put_i64(&notification, data, "requestId", id)?;
-                notification.root().object_set("params", data)?;
-                self.send(&notification, 500);
-                self.cancel()?;
-                return Result { is_ok: false, value: json_doc_object()?, error: if cancelled { 19 } else { 11 } };
-            };
-            if self.process.try_wait()? { return Result { is_ok: false, value: json_doc_object()?, error: 9 }; };
-            time_sleep_ms(5);
+            if polled.value { return Result { is_ok: true, value: true, error: 0 }; };
+            time_sleep_ms(1);
         };
-        Result { is_ok: false, value: json_doc_object()?, error: 9 }
+        Result { is_ok: true, value: true, error: 0 }
     }
-
+    def rpc_pending(&mut self, method: &str, params: JsonValue, timeout_ms: i64, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
+        self.core.begin(method, params, timeout_ms)?; self.wait_pending(terminal, pending)?; self.core.result()
+    }
     def initialize(&mut self, terminal: &Terminal) -> Result<bool, i64> {
-        let pending: Vec<TerminalEvent> = vec_new();
-        self.initialize_pending(terminal, &pending)
+        let pending: Vec<TerminalEvent> = vec_new(); self.initialize_pending(terminal, &pending)
     }
-
     def initialize_pending(&mut self, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<bool, i64> {
-        let params = json_parse("{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"sencode-sg\",\"version\":\"0.1.0\"}}")?;
-        let response = self.rpc_pending("initialize", params.root(), 30000, terminal, pending)?;
-        let result = response.root().object_get("result")?;
-        let version = cli_json_string(result, "protocolVersion")?;
-        if version.as_str() != "2024-11-05" { return Result { is_ok: false, value: false, error: 10 }; };
-        let notification = json_parse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")?;
-        self.send(&notification, 1000)?;
-        self.initialized = true;
-        Result { is_ok: true, value: true, error: 0 }
+        self.core.begin_initialize("2025-11-25", "sencode-sg", 30000)?;
+        self.wait_pending(terminal, pending)?; self.core.finish_initialize()
     }
-
-    def diagnostic_report(&self) -> Result<JsonDoc, i64> {
-        let report = json_doc_object()?;
-        cli_put_bool(&report, report.root(), "stderr_truncated", self.stderr_truncated)?;
-        cli_put_i64(&report, report.root(), "stderr_bytes", self.diagnostics.used_len())?;
-        // A retained prefix can end in a partial scalar; preserve the raw byte
-        // count and provide a stable marker instead of replacing corrupt data.
-        let text = cli_bytes_text(&self.diagnostics, 0, self.diagnostics.used_len());
-        cli_put_string(&report, report.root(), "stderr", if text.is_ok() { text.value.as_str() } else { "[stderr contains non-UTF-8 or a truncated UTF-8 scalar]" })?;
-        Result { is_ok: true, value: report, error: 0 }
-    }
-
-    def cancel(&mut self) -> Result<bool, i64> {
-        self.process.terminate_tree()?;
-        self.process.reap(5000)?;
-        self.initialized = false;
-        Result { is_ok: true, value: true, error: 0 }
-    }
-
+    def diagnostic_report(&self) -> Result<JsonDoc, i64> { self.core.diagnostic_report() }
+    def cancel(&mut self) -> Result<bool, i64> { self.core.cancel() }
     def tools(&mut self, terminal: &Terminal) -> Result<JsonDoc, i64> {
         let pending: Vec<TerminalEvent> = vec_new();
         self.tools_pending(terminal, &pending)
@@ -190,13 +64,13 @@ impl McpClient {
             let page = result.object_get("tools")?;
             let mut index = 0;
             while index < page.array_len()? {
-                if tools.array_len()? >= 256 { return Result { is_ok: false, value: document, error: 13 }; };
+                if tools.array_len()? >= 256 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
                 tools.array_push(document.copy(page.array_get(index)?)?)?;
                 index = index + 1;
             };
             let next = cli_json_optional_string(result, "nextCursor");
             if next.len() == 0 { break; };
-            if next.as_str() == cursor.as_str() or pages >= 32 { return Result { is_ok: false, value: document, error: 10 }; };
+            if next.as_str() == cursor.as_str() or pages >= 32 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 10 }; };
             cursor = next;
             pages = pages + 1;
         };
@@ -209,7 +83,7 @@ impl McpClient {
     }
 
     def call_tool_pending(&mut self, name: &str, arguments: JsonValue, terminal: &Terminal, pending: &Vec<TerminalEvent>) -> Result<JsonDoc, i64> {
-        if not self.initialized { return Result { is_ok: false, value: json_doc_object()?, error: 3 }; };
+        if not self.core.initialized { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 3 }; };
         let params = json_doc_object()?;
         cli_put_string(&params, params.root(), "name", name)?;
         params.root().object_set("arguments", params.copy(arguments)?)?;

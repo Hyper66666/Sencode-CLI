@@ -9,3 +9,9 @@ path = "src/main.sg"
 
 [dependencies]
 sgsqlite = { path = "../Sengoo/packages/sgsqlite" }
+
+sgllm = { path = "../Sengoo/packages/sgllm" }
+
+sgmcp = { path = "../Sengoo/packages/sgmcp" }
+
+sgagent = { path = "../Sengoo/packages/sgagent" }

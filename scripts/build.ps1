@@ -1,5 +1,6 @@
 param(
     [string]$SengooRoot = $env:SENGOO_ROOT,
+    [string]$CompilerExecutable = $env:SGPM_SGC,
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Debug',
     [switch]$UpdateLock
 )
@@ -9,7 +10,7 @@ if (-not $SengooRoot) {
     $SengooRoot = Join-Path (Split-Path $projectRoot -Parent) 'Sengoo'
 }
 $SengooRoot = (Resolve-Path -LiteralPath $SengooRoot).Path
-$compiler = Join-Path $SengooRoot 'target/debug/sgc.exe'
+$compiler = if ($CompilerExecutable) { (Resolve-Path -LiteralPath $CompilerExecutable).Path } else { Join-Path $SengooRoot 'target/debug/sgc.exe' }
 if (-not (Test-Path -LiteralPath $compiler)) { throw 'Build Sengoo sgc before building Sencode CLI.' }
 $env:SENGOO_STDLIB = Join-Path $SengooRoot 'tools/stdlib'
 $env:SENGOO_RUNTIME = Join-Path $SengooRoot 'tools/stdlib/runtime.c'

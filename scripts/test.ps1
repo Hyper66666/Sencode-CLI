@@ -34,7 +34,7 @@ if (@($Cases | Where-Object { $_ -in $integrationCases }).Count) {
 }
 $env:SENGOO_STDLIB = Join-Path $SengooRoot 'tools/stdlib'
 $env:SENGOO_RUNTIME = Join-Path $SengooRoot 'tools/stdlib/runtime.c'
-$env:SENGOO_MODULE_MAP = 'sgsqlite=' + (Join-Path $SengooRoot 'packages/sgsqlite/src/lib.sg')
+$env:SENGOO_MODULE_MAP = 'sgsqlite=' + (Join-Path $SengooRoot 'packages/sgsqlite/src/lib.sg') + ';sgllm=' + (Join-Path $SengooRoot 'packages/sgllm/src/lib.sg') + ';sgmcp=' + (Join-Path $SengooRoot 'packages/sgmcp/src/lib.sg') + ';sgschema=' + (Join-Path $SengooRoot 'packages/sgschema/src/lib.sg') + ';sgagent=' + (Join-Path $SengooRoot 'packages/sgagent/src/lib.sg')
 $logRoot = Join-Path $projectRoot ('target/acceptance/' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 if (-not $EvidencePath) { $EvidencePath = Join-Path $logRoot 'evidence.json' }
@@ -55,6 +55,12 @@ foreach ($file in Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src'),(Joi
 }
 foreach ($file in Get-ChildItem -LiteralPath (Join-Path $SengooRoot 'tools/stdlib') -File | Where-Object { $_.Extension -in @('.sg','.c','.h') }) {
     $evidence.foundation_sources += [ordered]@{path=$file.FullName;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+}
+foreach ($package in @('sgsqlite','sgllm','sgmcp','sgschema','sgagent')) {
+    $packageRoot = Join-Path $SengooRoot ('packages/' + $package)
+    foreach ($file in Get-ChildItem -LiteralPath (Join-Path $packageRoot 'src') -File -Recurse | Where-Object { $_.Extension -in @('.sg','.c','.h') }) {
+        $evidence.foundation_sources += [ordered]@{path=$file.FullName;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+    }
 }
 function Invoke-AcceptanceStep {
     param([string]$Name,[string]$Command,[string[]]$Arguments)

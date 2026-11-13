@@ -1,0 +1,7 @@
+- [x] Migrate Provider/HTTP/SSE/transport modules to the shared sgllm implementation.
+- [x] Migrate MCP process/protocol machinery to sgmcp with unchanged host permissions.
+- [x] Share policy, scheduler, write admission, tool contracts, questions and retry policy through sgagent without changing the execution host.
+- [x] Lock dependencies and include SDK sources in compiler/test evidence.
+- [x] Run native protocol/MCP tests and the existing real-host integration subset.
+- [x] Rebuild after the additional loop-tail and legacy borrowed-parameter resource fixes and pass their new gates.
+- [x] Package a frozen candidate, verify installed rollback and record limitations.
