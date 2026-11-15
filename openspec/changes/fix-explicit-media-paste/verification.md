@@ -66,3 +66,19 @@ All local reports above are under `target/media-selection-20261116/`.
 The generic adapter's independently published source is Sengoo commit
 `d71113d766bf15927513bdb037de9b9a6bed9b84` on `codex/video-frame-adapter`,
 containing only that adapter/change over the published main checkpoint.
+
+## Published installation
+
+Published prerelease: `v0.1.0-preview.20261116`, GitHub release `446449631`,
+tagging CLI source checkpoint `4a92bb0c9fc265b7fb64ad046273080b62c4520b`.
+The five uploaded asset digests matched local bytes. The package manifest keeps
+its original source-dirty snapshot identity; the application was not relabelled
+as a new clean-checkout rebuild after committing its unchanged source.
+
+`release/public-install-evidence.json` passed at
+`2026-11-15T23:37:18.984073+00:00` (2026-11-16 Asia/Shanghai): without GitHub
+credentials, download the published installer/checksums/evidence, run that
+installer under Windows PowerShell 5.1, download and verify the ZIP, install to
+a fresh Unicode prefix, and compare both aliases to the exact qualified hash.
+The temporary verification installation is removed; the qualified package,
+local installation, original rollback archive and reports remain.
