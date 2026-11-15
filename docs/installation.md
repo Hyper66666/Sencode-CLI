@@ -2,8 +2,8 @@
 
 ## Download the Windows preview
 
-Download [install-sencode.ps1](https://github.com/Hyper66666/Sencode-CLI/releases/download/v0.1.0-preview.20261113/install-sencode.ps1)
-from the [Windows preview release](https://github.com/Hyper66666/Sencode-CLI/releases/tag/v0.1.0-preview.20261113),
+Download [install-sencode.ps1](https://github.com/Hyper66666/Sencode-CLI/releases/download/v0.1.0-preview.20261116/install-sencode.ps1)
+from the [Windows preview release](https://github.com/Hyper66666/Sencode-CLI/releases/tag/v0.1.0-preview.20261116),
 then run it from PowerShell:
 
 ```powershell

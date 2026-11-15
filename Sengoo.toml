@@ -15,3 +15,5 @@ sgllm = { path = "../Sengoo/packages/sgllm" }
 sgmcp = { path = "../Sengoo/packages/sgmcp" }
 
 sgagent = { path = "../Sengoo/packages/sgagent" }
+
+sgmedia = { path = "../Sengoo/packages/sgmedia" }

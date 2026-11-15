@@ -2,6 +2,7 @@ import sessions;
 import views;
 import config_catalog;
 import model_selection;
+import session_preferences;
 
 // Public selection metadata only. No credentials, policies or native sessions.
 def session_target_sanitize(value: JsonValue) -> Result<JsonDoc, i64> {
@@ -54,14 +55,14 @@ def session_target_save(state: &CliState, session: &str, connection: &str, model
     cli_put_string(&value, value.root(), "connection", id.as_str())?; cli_put_string(&value, value.root(), "model", active_model.as_str())?; cli_put_string(&value, value.root(), "effort", effective.as_str())?;
     let safe = session_target_sanitize(value.root())?; let raw = safe.serialize_string()?;
     let path = state_lock_path(state.path.as_str(), "session", session)?; let lease = file_lock(path.as_str())?;
-    session_idle(state, session)?;
     let mut tx = state.db.transaction()?;
+    session_preferences_idle(&tx, state, session)?;
     let mut unchanged = tx.prepare("SELECT 1 FROM shared_modes m JOIN sessions s ON s.id=m.session_id WHERE m.session_id=? AND json_extract(m.mode_json,'$.cli_target')=json(?) AND s.selected_connection_id=? AND s.selected_model_id=?")?;
     unchanged.bind_text(1, session)?; unchanged.bind_text(2, raw.as_str())?; unchanged.bind_text(3, id.as_str())?; unchanged.bind_text(4, active_model.as_str())?;
     if unchanged.step()? { tx.commit()?; return Result { is_ok: true, value: true, error: 0 }; };
     let now = time_unix_ms();
     // Update one JSON member in the transaction, preserving Plan, Goal and
-    // usage state. The session lock/idle check forbids writes during execution.
+    // usage state. The session lock/admission check forbids live execution writes.
     let mut save = tx.prepare("INSERT INTO shared_modes(session_id,mode_json,updated_at) VALUES(?,json_object('cli_target',json(?)),?) ON CONFLICT(session_id) DO UPDATE SET mode_json=json_set(shared_modes.mode_json,'$.cli_target',json(?)),updated_at=excluded.updated_at")?;
     save.bind_text(1, session)?; save.bind_text(2, raw.as_str())?; save.bind_i64(3, now)?; save.bind_text(4, raw.as_str())?; save.step()?;
     let mut update = tx.prepare("UPDATE sessions SET selected_connection_id=?,selected_model_id=?,updated_at=? WHERE id=?")?;

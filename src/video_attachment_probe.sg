@@ -1,0 +1,27 @@
+import video_attachment;
+
+def main() -> i64 {
+    if args_len() == 2 and cli_argument(0).value.as_str() == "--video-duration" and cli_argument(1).value.as_str() == "__fixture_video_hang__" {
+        time_sleep_ms(60000); return 0;
+    };
+    if args_len() == 1 and cli_argument(0).value.as_str() == "--test-video-timeout" {
+        let before = sengoo_process_live_resource_count();
+        let started = time_monotonic_ms();
+        let result = video_attachment_run("--video-duration", "__fixture_video_hang__", 0, "");
+        let elapsed = time_monotonic_ms() - started;
+        if result.is_ok() or result.error != 11 or elapsed < 30000 or elapsed > 36000 or sengoo_process_live_resource_count() != before { println("timeout fixture failed"); return 1; };
+        println("decoder helper timed out, tree reaped and process resources recovered"); return 0;
+    };
+    let helper = video_attachment_helper();
+    if not helper.is_ok() { println(helper.error); return 1; };
+    if helper.value >= 0 { return helper.value; };
+    if args_len() != 1 { return 2; };
+    let path = cli_argument(0); if not path.is_ok() { return 2; };
+    let prepared = video_attachment_prepare(path.value.as_str());
+    if not prepared.is_ok() { println(prepared.error); return 1; };
+    let output = prepared.value.serialize_string(); if not output.is_ok() { video_attachment_cleanup(&prepared.value); return 1; };
+    println(output.value.as_str());
+    let cleanup = video_attachment_cleanup(&prepared.value);
+    if not cleanup.is_ok() { println(cleanup.error); return 1; };
+    0
+}

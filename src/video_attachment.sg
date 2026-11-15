@@ -1,0 +1,166 @@
+import common;
+import command_line;
+import std::process;
+import std::system;
+import std::path;
+import std::file;
+import std::dir;
+import std::env;
+import std::random;
+import std::time;
+import std::strconv;
+import sgmedia;
+
+// Handle before normal argument parsing. The helper never opens application
+// state or credentials and only exposes the two bounded local-media operations.
+// -1 means this invocation is not a helper and the normal CLI should continue.
+def video_attachment_helper() -> Result<i64, i64> {
+    if args_len() == 0 { return cli_ok(-1); };
+    let operation = cli_argument(0)?;
+    if operation.as_str() != "--video-duration" and operation.as_str() != "--video-frame" { return cli_ok(-1); };
+    let expected = if operation.as_str() == "--video-duration" { 2 } else { 4 };
+    if args_len() != expected { return cli_ok(2); };
+    let path = cli_argument(1)?;
+    let result = if operation.as_str() == "--video-duration" { video_duration_ms(path.as_str()) } else {
+        let timestamp = strconv_parse_i64(cli_argument(2)?.as_str())?;
+        let output = cli_argument(3)?;
+        video_sample_png(path.as_str(), timestamp, output.as_str())
+    };
+    let document = json_doc_object()?;
+    cli_put_bool(&document, document.root(), "ok", result.is_ok())?;
+    cli_put_i64(&document, document.root(), "value", if result.is_ok() { result.value } else { 0 })?;
+    cli_put_i64(&document, document.root(), "error", if result.is_ok() { 0 } else { result.error })?;
+    println(document.serialize_string()?.as_str());
+    cli_ok(if result.is_ok() { 0 } else { 1 })
+}
+
+// Spawn this exact executable directly, with no PATH lookup or command shell.
+// Each native decoder call is isolated in a killable, owned process tree.
+def video_attachment_run(operation: &str, path: &str, timestamp: i64, destination: &str) -> Result<i64, i64> {
+    let executable = current_executable_string()?;
+    let command = process_command(executable.as_str())?;
+    command.arg(operation)?; command.arg(path)?;
+    if operation == "--video-frame" {
+        let value = string_new(); value.push_i64(timestamp)?;
+        command.arg(value.as_str())?; command.arg(destination)?; ();
+    };
+    let stdout = ffi_buffer_new(4096)?; let errors = ffi_buffer_new(4096)?;
+    let mut chunk = ffi_buffer_new(1024)?; let mut error_chunk = ffi_buffer_new(1024)?;
+    let process = command.spawn_piped()?;
+    process.close_stdin()?;
+    let started = time_monotonic_ms();
+    loop {
+        let count = process.read_stdout(&mut chunk)?;
+        if count > 0 { if stdout.used_len() + count > 4096 { process.terminate_tree()?; process.reap(5000)?; return cli_fail(13); }; stdout.append_copy(&chunk, 0, count)?; (); };
+        let error_count = process.read_stderr(&mut error_chunk)?;
+        if error_count > 0 { if errors.used_len() + error_count > 4096 { process.terminate_tree()?; process.reap(5000)?; return cli_fail(13); }; errors.append_copy(&error_chunk, 0, error_count)?; (); };
+        if process.try_wait()? and process.stdout_eof()? and process.stderr_eof()? and process.tree_quiescent()? { break; };
+        if time_monotonic_ms() - started >= 30000 {
+            process.terminate_tree()?; process.reap(5000)?;
+            if not process.tree_quiescent()? { return cli_fail(7); };
+            return cli_fail(11);
+        };
+        time_sleep_ms(2);
+    };
+    let output = string_from_buffer(stdout, stdout.used_len())?;
+    let document = json_parse(output.as_str())?;
+    if not document.root().object_get("ok")?.bool_value()? { return cli_fail(cli_json_optional_i64(document.root(), "error", 8)); };
+    if process.exit_code()? != 0 { return cli_fail(8); };
+    cli_ok(document.root().object_get("value")?.number_i64()?)
+}
+
+def video_attachment_temp_root() -> Result<String, i64> {
+    let length = env_var_len("TEMP")?;
+    if length < 1 or length > 32768 { return string_result_err(7); };
+    let bytes = ffi_buffer_new(length + 1)?;
+    let count = env_var_copy("TEMP", bytes)?;
+    let path = string_from_buffer(bytes, count)?;
+    if not path_is_absolute(path.as_str()) { return string_result_err(7); };
+    canonical_path_string(path.as_str())
+}
+
+// Cleanup is internal to the current attachment transaction. Inventory the
+// exact fixed frame names, reject links, then remove files and an empty folder.
+// Never remove the selected original video or recursively traverse a tree.
+def video_attachment_cleanup(document: &JsonDoc) -> Result<bool, i64> {
+    let directory = cli_json_string(document.root(), "temporary_directory")?;
+    let root = video_attachment_temp_root()?;
+    let parent = path_parent_string(directory.as_str())?;
+    let name = path_file_name_string(directory.as_str())?;
+    if parent.as_str() != root.as_str() or not str_starts_with(name.as_str(), "SencodeCLI-video-") or name.len() > 100 { return Result { is_ok: false, value: false, error: 7 }; };
+    if not dir_exists(directory.as_str()) { return Result { is_ok: true, value: true, error: 0 }; };
+    if file_kind(directory.as_str())? != PATH_KIND_DIR() { return Result { is_ok: false, value: false, error: 7 }; };
+    let paths = document.root().object_get("paths")?;
+    if paths.array_len()? != 3 { return Result { is_ok: false, value: false, error: 7 }; };
+    let mut index = 0;
+    while index < 3 {
+        let expected_name = cli_text("frame"); expected_name.push_i64(index)?; expected_name.push_str(".png")?;
+        let expected_path = path_join_string(directory.as_str(), expected_name.as_str())?;
+        let path = paths.array_get(index)?.string_value()?;
+        if path.as_str() != expected_path.as_str() { return Result { is_ok: false, value: false, error: 7 }; };
+        if file_exists(path.as_str()) and file_kind(path.as_str())? != PATH_KIND_FILE() { return Result { is_ok: false, value: false, error: 7 }; };
+        index = index + 1;
+    };
+    index = 0;
+    while index < 3 {
+        let path = paths.array_get(index)?.string_value()?;
+        if file_exists(path.as_str()) and not file_remove(path.as_str()) { return Result { is_ok: false, value: false, error: 7 }; };
+        index = index + 1;
+    };
+    dir_remove(directory.as_str())
+}
+
+def video_attachment_fill(document: &JsonDoc, path: &str, duration: i64) -> Result<bool, i64> {
+    let paths = document.root().object_get("paths")?;
+    let name = path_file_name_string(path)?;
+    let text = cli_text("\nVideo reference: "); text.push_str(name.as_str())?;
+    text.push_str(". The three sampled frames for this video are in order (actual timestamps in milliseconds): ")?;
+    let mut total = 0; let mut index = 0;
+    while index < 3 {
+        let timestamp = if index == 0 { 0 } else { if index == 1 { duration / 2 } else { if duration > 100 { duration - 100 } else { 0 } } };
+        let output = paths.array_get(index)?.string_value()?;
+        let actual = video_attachment_run("--video-frame", path, timestamp, output.as_str())?;
+        let length = file_len(output.as_str())?;
+        if length < 1 or length > 8388608 { return Result { is_ok: false, value: false, error: 13 }; };
+        total = total + length;
+        if total > 8388608 { return Result { is_ok: false, value: false, error: 13 }; };
+        if index > 0 { text.push_str(", ")?; (); };
+        text.push_str("frame ")?; text.push_i64(index + 1)?; text.push_str(" at ")?; text.push_i64(actual)?; text.push_str(" ms from \"")?; text.push_str(output.as_str())?; text.push_str("\"")?;
+        index = index + 1;
+    };
+    text.push_str(". Only these still frames were sampled; no audio or continuous motion was supplied. Do not infer unseen motion or audio.\n")?;
+    cli_put_string(document, document.root(), "text", text.as_str())?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def video_attachment_prepare(path: &str) -> Result<JsonDoc, i64> {
+    if path.len() == 0 or path.len() > 32768 or not path_is_absolute(path) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 2 }; };
+    let original = canonical_path_string(path)?;
+    if file_kind(original.as_str())? != PATH_KIND_FILE() { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    let length = file_len(original.as_str())?;
+    if length < 1 or length > 1073741824 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    let duration = video_attachment_run("--video-duration", original.as_str(), 0, "")?;
+    if duration < 1 or duration > 3600000 { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; };
+    let root = video_attachment_temp_root()?;
+    let name = cli_text("SencodeCLI-video-"); name.push_i64(time_unix_ms())?; name.push_str("-")?; name.push_i64(random_i64())?;
+    let directory = path_join_string(root.as_str(), name.as_str())?;
+    if dir_exists(directory.as_str()) or file_exists(directory.as_str()) { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 7 }; };
+    let document = json_doc_object()?; let paths = document.new_array()?;
+    document.root().object_set("paths", paths)?;
+    let mut index = 0;
+    while index < 3 {
+        let filename = cli_text("frame"); filename.push_i64(index)?; filename.push_str(".png")?;
+        let output = path_join_string(directory.as_str(), filename.as_str())?;
+        paths.array_push(document.new_string(output.as_str())?)?; index = index + 1;
+    };
+    document.root().object_set("temporary_paths", document.copy(paths)?)?;
+    cli_put_string(&document, document.root(), "temporary_directory", directory.as_str())?;
+    cli_put_string(&document, document.root(), "text", "")?;
+    dir_create(directory.as_str())?;
+    let prepared = video_attachment_fill(&document, original.as_str(), duration);
+    if not prepared.is_ok() {
+        video_attachment_cleanup(&document)?;
+        return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: prepared.error };
+    };
+    Result { is_ok: true, value: document, error: 0 }
+}

@@ -1,5 +1,6 @@
 import sessions;
 import permissions;
+import session_preferences;
 
 // Local session preferences, never an authorization source from imported
 // project history. Running requests retain their explicit submit snapshot.
@@ -29,8 +30,8 @@ def session_permissions_restore(state: &CliState, session: &str, policy: &mut Ag
 def session_permissions_save(state: &CliState, session: &str, policy: &AgentPolicy, commands: bool, profile: &str) -> Result<bool, i64> {
     let value = session_permissions_value(permission_mode(policy), commands, profile)?; let raw = value.serialize_string()?;
     let lock_path = state_lock_path(state.path.as_str(), "session", session)?; let lease = file_lock(lock_path.as_str())?;
-    session_idle(state, session)?;
     let mut tx = state.db.transaction()?;
+    session_preferences_idle(&tx, state, session)?;
     let mut unchanged = tx.prepare("SELECT 1 FROM shared_modes WHERE session_id=? AND json_extract(mode_json,'$.cli_permissions')=json(?)")?;
     unchanged.bind_text(1, session)?; unchanged.bind_text(2, raw.as_str())?;
     if unchanged.step()? { tx.commit()?; return Result { is_ok: true, value: true, error: 0 }; };

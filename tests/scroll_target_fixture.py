@@ -161,7 +161,9 @@ def worker(args):
             console.inject("two"); time.sleep(.04); console.key(0x27)
             console.key(0x0D, "\r")
             wait(console, process, lambda s: "Thinking effort / two" in s["text"], "effort picker")
-            console.key(0x28); console.key(0x28); console.key(0x0D, "\r")
+            console.inject("xhigh")
+            wait(console, process, lambda s: "xhigh" in s["text"], "explicit effort filter")
+            console.key(0x0D, "\r")
             return wait(console, process, lambda s: "Thinking effort /" not in s["text"] and "xhigh" in s["text"], "selected tuple")
         def markers(screen): return [int(v) for v in re.findall(r"hist-(\d+)", "\n".join(r["text"] for r in screen["rows"][2:-6]))]
         def scroll_wait(predicate):
@@ -270,7 +272,9 @@ def worker(args):
         stop()
         overridden = launch("resume", session)
         record("unsent-command-line-selection-is-remembered", "one  medium" in overridden["rows"][0]["text"])
-        console.command("SLOW")
+        console.inject("SLOW")
+        wait(console, process, lambda s: any("│ > SLOW" in r["text"] for r in s["rows"]), "slow prompt entered")
+        console.key(0x0D, "\r")
         active = wait(console, process, lambda s: "SLOW_RUNNING" in s["text"] and "NEXT MESSAGE" in s["text"], "active immutable target")
         record("busy-empty-composer-has-no-placeholder", next(r["text"] for r in active["rows"] if "│ > " in r["text"]).strip(" │>") == "")
         choose_b_two()
@@ -279,6 +283,15 @@ def worker(args):
         wait(console, process, lambda s: "SLOW_DONE" in s["text"] and "NEXT MESSAGE" not in s["text"] and "two  xhigh" in s["rows"][0]["text"], "cleanup and target handoff")
         eventually(lambda: target(session)["connection"] == ids[1], "deferred target persistence")
         record("busy-choice-saved-after-cleanup", target(session)["model"] == "two" and target(session)["effort"] == "xhigh")
+        stop()
+        # Reproduce a worker disappearing between request output and state
+        # finalization. No process owns the lock and no tool/cleanup is pending.
+        sql("UPDATE shared_executions SET active=1,owner_instance_id='abandoned-target-fixture',engine='sengoo',cleanup_required=0 WHERE session_id=?", (session,))
+        launch("resume", session)
+        choose_b_two()
+        eventually(lambda: target(session) == {"schema": 1, "connection": ids[1], "model": "two", "effort": "xhigh"}, "abandoned native selection persistence")
+        screen = console.read(viewport=True)
+        record("abandoned-native-model-selection-has-no-save-notice", "selection could not be saved" not in screen["text"])
         stop()
         renamed = args.scratch / "after 改名😀"; workspace.rename(renamed); workspace = renamed
         run("resume", session, "-p", "RENAMED")

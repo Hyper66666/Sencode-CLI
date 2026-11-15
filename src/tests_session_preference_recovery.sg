@@ -1,0 +1,75 @@
+import session_target;
+import session_permissions;
+import command_line;
+
+def preference_expect(ok: bool, label: &str) -> Result<bool, i64> {
+    if not ok { cli_diagnostic(label); return state_bool_error(99); };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def preference_target(state: &CliState, session: &str) -> Result<bool, i64> {
+    session_target_save(state, session, "fixture-connection", "fixture-model", "high")
+}
+
+def preference_policy(state: &CliState, session: &str) -> Result<bool, i64> {
+    let mut policy = policy_default(); permission_apply(&mut policy, "full");
+    session_permissions_save(state, session, &policy, true, "strict")
+}
+
+def preference_both_blocked(state: &CliState, session: &str, label: &str) -> Result<bool, i64> {
+    let target = preference_target(state, session); let permissions = preference_policy(state, session);
+    preference_expect(not target.is_ok() and not permissions.is_ok(), label)
+}
+
+def preference_recovery(database: &str) -> Result<bool, i64> {
+    let original = cli_state_open(database)?;
+    original.db.exec("INSERT INTO connection_configs(id,kind,profile_scope,display_name,config_json,selected_model_id,created_at,updated_at) VALUES('fixture-connection','customApi','managed','Fixture','{\"baseUrl\":\"https://fixture.invalid/v1\",\"protocol\":\"responses\"}','fixture-model',1,1)")?;
+    let session = cli_state_create_session(&original, cli_current_directory()?.as_str())?;
+    let mut old = cli_state_begin(&original, session.as_str(), "fixture-connection", "fixture-model")?;
+    let current = cli_state_open(database)?;
+    preference_both_blocked(&original, session.as_str(), "same owner cannot mutate a live request")?;
+    preference_both_blocked(&current, session.as_str(), "another client cannot mutate a live request")?;
+    // Model a native worker exiting before state_finish: its OS lock is gone,
+    // but the database still marks the no-tool SG execution active.
+    old.lease.close()?;
+    preference_expect(not session_idle(&current, session.as_str()).is_ok(), "legacy idle predicate reproduces screenshot code 7")?;
+    preference_both_blocked(&original, session.as_str(), "current instance active record still cannot grant itself idle authority")?;
+    current.db.exec("CREATE TEMP TRIGGER fixture_preference_failure BEFORE UPDATE ON shared_modes BEGIN SELECT RAISE(ABORT,'fixture-preference-write-failure'); END")?;
+    preference_both_blocked(&current, session.as_str(), "failed preference write rolls back recovery")?;
+    { let mut row = current.db.prepare("SELECT active FROM shared_executions WHERE session_id=?")?; row.bind_text(1, session.as_str())?; preference_expect(row.step()? and row.integer(0)? == 1, "failed save leaves abandoned activity unchanged")?; (); };
+    preference_expect(not cli_state_modes(&current, session.as_str())?.root().object_has("cli_target") and not cli_state_modes(&current, session.as_str())?.root().object_has("cli_permissions"), "failed save leaves both preferences unchanged")?;
+    current.db.exec("DROP TRIGGER fixture_preference_failure")?;
+    preference_target(&current, session.as_str())?; preference_policy(&current, session.as_str())?;
+    let selected = session_target_load(&current, session.as_str())?;
+    preference_expect(cli_json_string(selected.root(), "model")?.as_str() == "fixture-model", "abandoned native target preference persists")?;
+    preference_expect(cli_json_string(session_permissions_load(&current, session.as_str())?.root(), "mode")?.as_str() == "full", "abandoned native permission preference persists")?;
+    { let mut row = current.db.prepare("SELECT active,fence,cleanup_required FROM shared_executions WHERE session_id=?")?; row.bind_text(1, session.as_str())?; preference_expect(row.step()? and row.integer(0)? == 0 and row.integer(1)? == old.fence and row.integer(2)? == 0, "preference save releases only stale activity without advancing its fence")?; ();
+    };
+    current.db.exec("UPDATE shared_executions SET cleanup_required=1")?;
+    preference_both_blocked(&current, session.as_str(), "uncertified cleanup blocks both preference writes")?;
+    current.db.exec("UPDATE shared_executions SET active=1,cleanup_required=0,engine='desktop'")?;
+    preference_both_blocked(&current, session.as_str(), "abandoned foreign engine stays blocked")?;
+    current.db.exec("UPDATE shared_executions SET engine='sengoo'")?;
+    { let mut insert = current.db.prepare("INSERT INTO shared_tool_ledger(session_id,call_id,execution_id,fence,name,arguments,state,updated_at) VALUES(?,'unknown','unknown',1,'run_command','{}','running',1)")?; insert.bind_text(1, session.as_str())?; insert.step()?; (); };
+    preference_both_blocked(&current, session.as_str(), "unknown running tool remains blocked")?;
+    current.db.exec("UPDATE shared_executions SET active=0")?;
+    preference_both_blocked(&current, session.as_str(), "running tool blocks even an inactive execution")?;
+    current.db.exec("UPDATE shared_tool_ledger SET state='interrupted'")?;
+    preference_target(&current, session.as_str())?; preference_policy(&current, session.as_str())?;
+    let mut next = cli_state_begin(&current, session.as_str(), "fixture-connection", "fixture-model")?;
+    preference_expect(next.fence > old.fence, "only actual native turn admission advances the fence")?;
+    cli_state_finish(&current, &mut next, "idle")?;
+    old.active = false;
+    current.db.exec("UPDATE sessions SET archived=1")?;
+    preference_both_blocked(&current, session.as_str(), "archived session preferences stay blocked")?;
+    preference_both_blocked(&current, "missing-session", "missing session preferences stay blocked")?;
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def main() -> i64 {
+    let arguments = cli_arguments(); if not arguments.is_ok() { return 2; };
+    let database = cli_option(&arguments.value, "database", "").unwrap_or(string_new()); if database.len() == 0 { return 2; };
+    let result = preference_recovery(database.as_str());
+    if not result.is_ok() { println(result.error); let error = sqlite_error_message(); if error.is_ok() { cli_diagnostic(error.value.as_str()); }; return 1; };
+    println("session preferences: abandoned native recovery, live isolation, cleanup, foreign engine, running tools, archived and missing guards passed"); 0
+}

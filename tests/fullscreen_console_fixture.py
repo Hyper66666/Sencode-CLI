@@ -13,6 +13,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import http.server
+import io
 import json
 import math
 import os
@@ -78,6 +79,21 @@ class SlowProvider(http.server.BaseHTTPRequestHandler):
                 assert len(image_parts) == 1, latest_content
                 assert base64.b64decode(image_parts[0]["image_url"]["url"].split(",", 1)[1]).startswith(b"\x89PNG\r\n\x1a\n"), image_parts
                 self.event({"choices": [{"delta": {"content": "image bytes verified"}, "finish_reason": "stop"}]})
+            elif "two-image-paste fixture 中文" in latest or "video-paste fixture 中文" in latest:
+                assert isinstance(latest_content, list), latest_content
+                images = [part for part in latest_content if part.get("type") == "image_url"]
+                expected = 5 if "video-paste fixture 中文" in latest else 2
+                assert len(images) == expected, latest_content
+                decoded = [base64.b64decode(part["image_url"]["url"].split(",", 1)[1], validate=True) for part in images]
+                assert all(data.startswith(b"\x89PNG\r\n\x1a\n") for data in decoded)
+                if expected == 5:
+                    from PIL import Image
+                    assert "0 ms" in latest and "1500 ms" in latest and "2900 ms" in latest and "no audio" in latest
+                    for index, data in enumerate(decoded[:3]):
+                        with Image.open(io.BytesIO(data)) as frame:
+                            pixel = frame.convert("RGB").getpixel((frame.width // 2, frame.height // 2))
+                            assert pixel[index] > 180 and sum(pixel) - pixel[index] < 70, pixel
+                self.event({"choices": [{"delta": {"content": "mixed media bytes verified " + str(expected)}, "finish_reason": "stop"}]})
             elif latest == "local conveniences fixture":
                 self.event({"choices": [{"delta": {"content": "Local answer\n```python\nprint('中文')\n```\n"}, "finish_reason": "stop"}]})
             elif latest == "approval fixture" and not current_tools:
@@ -739,6 +755,20 @@ def production_worker(args):
         assert not (workspace / ".sencode" / "attachments").exists()
         evidence["checks"].append("original-image-blue-atomic-chip-and-real-multimodal-request-no-project-copy")
         evidence["checks"].append("missing-image-preflight-retains-draft-and-makes-no-provider-call")
+        before_mixed = len(SlowProvider.calls)
+        console.inject('\x1b[200~"' + str(image_path) + '""' + str(second_image_path) + '"two-image-paste fixture 中文\x1b[201~')
+        wait(console, process, lambda s: "two-image-paste fixture 中文" in s["text"] and "[image1]" in s["text"] and "[image2]" in s["text"], "adjacent image paths preserve trailing task")
+        console.key(0x0D, "\r")
+        wait(console, process, lambda s: len(SlowProvider.calls) > before_mixed and "mixed media bytes verified 2" in s["text"], "two pasted images reach the provider as bytes")
+        evidence["checks"].append("adjacent-quoted-image-paths-and-trailing-task-real-wire-bytes")
+        if args.video_fixture:
+            before_video = len(SlowProvider.calls)
+            console.inject('\x1b[200~"' + str(args.video_fixture.resolve()) + '""' + str(image_path) + '""' + str(second_image_path) + '"video-paste fixture 中文\x1b[201~')
+            wait(console, process, lambda s: "video-paste fixture 中文" in s["text"] and "Image attached" in s["text"], "mixed video and image paste preserves task after timestamp metadata (chips may scroll above composer viewport)")
+            console.key(0x0D, "\r")
+            wait(console, process, lambda s: len(SlowProvider.calls) > before_video and "mixed media bytes verified 5" in s["text"], "video frame and original image bytes reach the provider")
+            evidence["checks"].append("adjacent-video-and-two-images-with-task-five-real-visual-parts")
+
         stop()
         evidence["checks"].append("final-main-terminal-restoration")
 
@@ -787,6 +817,8 @@ def controller(args):
                                     "--evidence", str(args.evidence)]
         if args.production:
             child_args.append("--production")
+        if args.video_fixture:
+            child_args += ["--video-fixture", str(args.video_fixture.resolve())]
         process = subprocess.Popen(child_args, startupinfo=startup,
                                    creationflags=subprocess.CREATE_NEW_CONSOLE)
         checked(kernel.AssignProcessToJobObject(job, wintypes.HANDLE(process._handle)))
@@ -814,6 +846,7 @@ def main():
     parser.add_argument("--scratch", type=Path)
     parser.add_argument("--ready", type=Path)
     parser.add_argument("--production", action="store_true", help="Drive final CLI with an isolated DB and loopback provider")
+    parser.add_argument("--video-fixture", type=Path)
     args = parser.parse_args()
     args.executable = args.executable.resolve(strict=True)
     args.evidence = args.evidence.resolve()

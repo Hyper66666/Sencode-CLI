@@ -1,3 +1,4 @@
+import video_attachment;
 import controller;
 import management;
 import views;
@@ -319,6 +320,9 @@ def main_run() -> Result<i64, i64> {
 }
 
 def main() -> i64 {
+    let helper = video_attachment_helper();
+    if not helper.is_ok() { println(helper.error); return 1; };
+    if helper.value >= 0 { return helper.value; };
     let result = main_run();
     if not result.is_ok() { let diagnostic = cli_text("Sencode could not complete the operation. Error code: "); diagnostic.push_i64(result.error); cli_diagnostic(diagnostic.as_str()); return if result.error == 2 { 2 } else { if result.error == 19 { 130 } else { 1 } }; };
     result.value

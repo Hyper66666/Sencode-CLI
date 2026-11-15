@@ -14,9 +14,9 @@ if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) {
 Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
 Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Archive/Microsoft.PowerShell.Archive.psd1') -ErrorAction Stop
 
-$tag = 'v0.1.0-preview.20261113'
+$tag = 'v0.1.0-preview.20261116'
 $archiveName = 'sencode-cli-0.1.0-dev.0-windows-x64.zip'
-$expectedHash = '19439583db8395e108d5301954d7fc17d02cc2d9d530dbc02c662eb93e920b8a'
+$expectedHash = '62aa3bf99a4400d80229839218e9dd3b7592cec3e60049ad8367bfed4c8d75fd'
 $url = 'https://github.com/Hyper66666/Sencode-CLI/releases/download/' + $tag + '/' + $archiveName
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('sencode-download-' + [Guid]::NewGuid().ToString('N'))
 $tlsBefore = [Net.ServicePointManager]::SecurityProtocol

@@ -257,6 +257,18 @@ def worker(args):
         stop()
         assert saved_policy(session)["mode"] == "full", saved_policy(session)
         record("unsent-shift-tab-selection-survives-exit")
+        sql("UPDATE shared_executions SET active=1,owner_instance_id='abandoned-policy-fixture',engine='sengoo',cleanup_required=0 WHERE session_id=?", (session,))
+        launch("resume", session, label="完全权限")
+        console.key(0x09, "\t", 0x10)
+        wait(console, process, lambda s: "手动审批" in s["text"], "abandoned native policy selection")
+        eventually(lambda: saved_policy(session)["mode"] == "manual", "abandoned native policy selection was not saved")
+        assert "selection could not be saved" not in console.read(viewport=True)["text"]
+        console.key(0x09, "\t", 0x10)
+        eventually(lambda: saved_policy(session)["mode"] == "auto", "abandoned native auto selection was not saved")
+        console.key(0x09, "\t", 0x10)
+        eventually(lambda: saved_policy(session)["mode"] == "full", "abandoned native full selection was not saved")
+        stop()
+        record("abandoned-native-permission-choices-persist-without-save-notices")
         labels = {"manual": "手动审批", "auto": "自动审批", "full": "完全权限"}
         previous = "full"
         for index, mode in enumerate(("manual", "auto", "full", "manual", "auto", "full")):

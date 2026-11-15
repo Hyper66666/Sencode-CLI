@@ -9,7 +9,7 @@ This is a development candidate. Test configuration and test fixture source are
 not release evidence; consult the recorded acceptance results before distributing
 a build. The existing `sencode` Rust runtime remains a separate product binary.
 
-Windows users can download the [preview installer](https://github.com/Hyper66666/Sencode-CLI/releases/tag/v0.1.0-preview.20261113)
+Windows users can download the [preview installer](https://github.com/Hyper66666/Sencode-CLI/releases/tag/v0.1.0-preview.20261116)
 and follow the [installation guide](docs/installation.md). The CLI needs no compiler
 or administrator access to install and run.
 
@@ -132,6 +132,21 @@ fenced code block from the latest answer.
 Paste a PNG/JPEG path or use Ctrl+V/Alt+V for clipboard images. Original file
 references appear as blue `[image1]`, `[image2]` chips. The cursor moves across
 each chip as a unit; one Backspace removes the reference and leaves the file.
+
+An explicit paste may include several quoted paths followed by the task, for
+example `"C:\photos\first.jpg""C:\photos\second.jpg"compare these layouts`.
+The task text is preserved and the actual images are sent when you press Enter.
+Paths merely mentioned later in ordinary prose are not opened automatically.
+
+On Windows, explicitly selected local videos can be analyzed through three
+sampled frames (start, middle and end) with actual timestamps. MP4/H.264 is
+verified; other formats require a compatible Windows codec. Frames go through
+the selected model's image capability and the usual eight-image/8 MiB limit.
+The video is not uploaded, audio is not analyzed, and three stills cannot convey
+all continuous motion. Generated frames are kept in system TEMP for this
+conversation's image history; the source video and project files are unchanged.
+Video decoding runs in isolated helper processes with a 30-second limit per
+operation. The paste waits for sampling to finish before editing resumes.
 The CLI sends actual image content on explicit submission to a model whose
 configuration advertises image support. Original images are never copied into
 the project. Pixel-only clipboard content uses system TEMP because it has no

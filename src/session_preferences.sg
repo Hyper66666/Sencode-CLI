@@ -1,0 +1,21 @@
+import sessions;
+
+// Caller holds the session OS lock. Match the native turn admission rule for
+// an abandoned SG execution with no pending tool work. Only its stale active
+// bit is released in the preference transaction; a later request claims a turn.
+def session_preferences_idle(tx: &SqliteTransaction, state: &CliState, session: &str) -> Result<bool, i64> {
+    let mut exists = tx.prepare("SELECT archived FROM sessions WHERE id=?")?;
+    exists.bind_text(1, session)?;
+    if not exists.step()? { return state_bool_error(5); };
+    if exists.integer(0)? != 0 { return state_bool_error(7); };
+    let mut blocked = tx.prepare("SELECT 1 FROM shared_executions e WHERE e.session_id=? AND (e.cleanup_required=1 OR (e.active=1 AND (e.engine<>'sengoo' OR e.owner_instance_id=?))) UNION ALL SELECT 1 FROM shared_tool_ledger WHERE session_id=? AND state='running' UNION ALL SELECT 1 FROM meeting_runs WHERE session_id=? AND state NOT IN('completed','cancelled') UNION ALL SELECT 1 FROM fusion_runs WHERE session_id=? AND state NOT IN('decided','partial','interrupted','cancelled') LIMIT 1")?;
+    blocked.bind_text(1, session)?; blocked.bind_text(2, state.instance.as_str())?;
+    blocked.bind_text(3, session)?; blocked.bind_text(4, session)?; blocked.bind_text(5, session)?;
+    if blocked.step()? { return state_bool_error(11); };
+    // The same exclusion in state_begin_execution certifies that an old SG
+    // record has no live owner/tool. Release it before guarded preference
+    // writes; owner ID, execution ID, fence and all tool/history rows survive.
+    let mut release = tx.prepare("UPDATE shared_executions SET active=0 WHERE session_id=? AND active=1 AND engine='sengoo' AND cleanup_required=0 AND owner_instance_id<>?")?;
+    release.bind_text(1, session)?; release.bind_text(2, state.instance.as_str())?; release.step()?;
+    Result { is_ok: true, value: true, error: 0 }
+}

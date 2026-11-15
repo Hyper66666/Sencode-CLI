@@ -26,7 +26,7 @@ struct FrontHost {
     steering_id: String, steering_text: String, steering_enabled: bool,
     export_path: String, export_text: String,
     permission_profile: String, agents: UiAgents,
-    checkpoint_id: String, target_dirty: bool, permissions_dirty: bool, permission_retry_at: i64,
+    checkpoint_id: String, target_dirty: bool, target_retry_at: i64, permissions_dirty: bool, permission_retry_at: i64,
 }
 
 def front_spawn(state: &CliState, options: &AgentOptions) -> Result<FrontHost, i64> {
@@ -37,7 +37,7 @@ def front_spawn(state: &CliState, options: &AgentOptions) -> Result<FrontHost, i
     command.arg("resume")?; command.arg(options.session.as_str())?;
     command.cwd(options.cwd.as_str())?;
     let process = command.spawn_piped()?;
-    Result { is_ok: true, value: FrontHost { process: process, input: cli_bytes(524288), output: cli_bytes(2097152), errors: cli_bytes(65536), active: string_new(), ready: false, exit_requested: false, stopped_at: 0, steering_id: string_new(), steering_text: string_new(), steering_enabled: false, export_path: string_new(), export_text: string_new(), permission_profile: cli_text("strict"), agents: tui_agents_new(), checkpoint_id: string_new(), target_dirty: false, permissions_dirty: false, permission_retry_at: 0 }, error: 0 }
+    Result { is_ok: true, value: FrontHost { process: process, input: cli_bytes(524288), output: cli_bytes(2097152), errors: cli_bytes(65536), active: string_new(), ready: false, exit_requested: false, stopped_at: 0, steering_id: string_new(), steering_text: string_new(), steering_enabled: false, export_path: string_new(), export_text: string_new(), permission_profile: cli_text("strict"), agents: tui_agents_new(), checkpoint_id: string_new(), target_dirty: false, target_retry_at: 0, permissions_dirty: false, permission_retry_at: 0 }, error: 0 }
 }
 
 def front_steering_restore(host: &mut FrontHost, app: &mut UiApp, uncertain: bool) -> Result<bool, i64> {
@@ -50,17 +50,40 @@ def front_steering_restore(host: &mut FrontHost, app: &mut UiApp, uncertain: boo
     tui_status(app, "补充消息尚未插入，已保留在待发队列")
 }
 
+// Submission fallback also handles paths typed or delivered by split paste events.
+def front_media_expand(cwd: &str, text: &str, app: &UiApp) -> Result<JsonDoc, i64> {
+    let selected = attachment_parse_paths(cwd, text)?;
+    if selected.root().object_has("blocked") and selected.root().object_get("blocked")?.bool_value()? { return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 8 }; };
+    if selected.root().object_get("matched")?.bool_value()? {
+        let expanded = images_expand(cli_json_string(selected.root(), "text")?.as_str(), &app.images);
+        if not expanded.is_ok() { attachment_cleanup_generated(&selected)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: expanded.error }; };
+        let result = json_doc_object()?;
+        cli_put_string(&result, result.root(), "text", cli_json_string(expanded.value.root(), "text")?.as_str())?;
+        let images = result.copy(selected.root().object_get("paths")?)?; let previous = expanded.value.root().object_get("images")?; let mut index = 0;
+        while index < previous.array_len()? {
+            let path = previous.array_get(index)?.string_value()?; let mut found = 0;
+            while found < images.array_len()? and images.array_get(found)?.string_value()?.as_str() != path.as_str() { found = found + 1; };
+            if found == images.array_len()? { if images.array_len()? >= 8 { attachment_cleanup_generated(&selected)?; return Result { is_ok: false, value: JsonDoc { handle: 0 }, error: 13 }; }; images.array_push(result.new_string(path.as_str())?)?; (); };
+            index = index + 1;
+        };
+        result.root().object_set("images", images)?;
+        result.root().object_set("generated", result.copy(selected.root().object_get("generated")?)?)?;
+        return Result { is_ok: true, value: result, error: 0 };
+    };
+    images_expand(text, &app.images)
+}
+
 def front_steer(state: &CliState, options: &AgentOptions, host: &mut FrontHost, app: &mut UiApp) -> Result<bool, i64> {
     if not app.busy or host.active.len() == 0 or host.steering_id.len() > 0 or app.queue.len() == 0 { return tui_true(); };
     if not host.steering_enabled { return tui_status(app, "当前引擎或操作不支持插入，消息保留在待发队列"); };
     let text = app.queue.get(0).text.clone()?;
     if str_starts_with(text.as_str(), "/") { return tui_status(app, "斜杠命令将在当前任务结束后执行"); };
-    let expanded = images_expand(text.as_str(), &app.images);
+    let expanded = front_media_expand(options.cwd.as_str(), text.as_str(), app);
     if not expanded.is_ok() { return tui_status(app, "图片引用不可用，补充消息已保留"); };
     let paths = expanded.value.root().object_get("images")?;
     if paths.array_len()? > 0 {
         let supported = controller_images_supported(state, options.connection.as_str(), options.model.as_str());
-        if not supported.is_ok() or not supported.value { return tui_status(app, "当前模型不支持图片，补充消息已保留"); };
+        if not supported.is_ok() or not supported.value { attachment_cleanup_generated(&expanded.value)?; return tui_status(app, "当前模型不支持图片，补充消息已保留"); };
     };
     let document = json_doc_object()?; let id = state_id("steering-")?;
     cli_put_string(&document, document.root(), "type", "steer")?; cli_put_string(&document, document.root(), "id", id.as_str())?;
@@ -68,7 +91,7 @@ def front_steer(state: &CliState, options: &AgentOptions, host: &mut FrontHost, 
     cli_put_string(&document, document.root(), "text", cli_json_string(expanded.value.root(), "text")?.as_str())?;
     if paths.array_len()? > 0 { document.root().object_set("images", document.copy(paths)?)?; (); };
     let sent = front_send(host, &document);
-    if not sent.is_ok() { return tui_status(app, "补充消息暂时无法发送，已保留在待发队列"); };
+    if not sent.is_ok() { attachment_cleanup_generated(&expanded.value)?; return tui_status(app, "补充消息暂时无法发送，已保留在待发队列"); };
     host.steering_id = id; host.steering_text = text; app.inserting = host.steering_text.clone()?; app.queue.remove(0);
     tui_status(app, "将在当前响应或工具批次完成后插入")
 }
@@ -287,10 +310,11 @@ def front_pick_model(state: &CliState, options: &mut AgentOptions, app: &mut UiA
 
 // A future target selected during a turn must not alter its immutable request
 // snapshot. Persist it once the worker has released execution and tool leases.
-def front_remember_target(state: &CliState, options: &AgentOptions, app: &mut UiApp, host: &mut FrontHost) -> Result<bool, i64> {
+def front_remember_target(state: &CliState, options: &AgentOptions, app: &mut UiApp, host: &mut FrontHost, final_attempt: bool) -> Result<bool, i64> {
     if not host.target_dirty { return tui_true(); };
-    host.target_dirty = false;
     let saved = session_target_save(state, options.session.as_str(), options.connection.as_str(), options.model.as_str(), options.effort.as_str());
+    if not saved.is_ok() and saved.error == 11 and not final_attempt { host.target_retry_at = time_monotonic_ms() + 100; return tui_true(); };
+    host.target_dirty = false; host.target_retry_at = 0;
     if not saved.is_ok() { return tui_message(app, "notice", "Model selection could not be saved / session is active or unavailable. The current selection remains in this window."); };
     tui_true()
 }
@@ -312,7 +336,7 @@ def front_switch(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, 
     if not cli_state_session_in_project(state, options.cwd.as_str(), session)? { return state_bool_error(5); };
     front_stop(host)?;
     front_remember_input(state, options, app, true)?;
-    front_remember_target(state, options, app, host)?;
+    front_remember_target(state, options, app, host, true)?;
     front_remember_permissions(state, options, app, host, true)?;
     let target = session_target_restore(state, session, "", "", "")?;
     if target.root().object_get("restored")?.bool_value()? {
@@ -344,14 +368,14 @@ def front_restore_prompt(app: &mut UiApp, text: &str, notice: &str) -> Result<bo
 def front_submit(state: &CliState, host: &mut FrontHost, options: &AgentOptions, app: &mut UiApp, text: &str, operation: &str, maximum: i64, tokens: i64) -> Result<bool, i64> {
     // The bounded pipe owns an accepted request while the child initializes.
     // Marking the app busy below prevents a second request from overtaking it.
-    let expanded = images_expand(text, &app.images);
-    if not expanded.is_ok() { return front_restore_prompt(app, text, "Image reference is unavailable or exceeds eight images / draft retained"); };
+    let expanded = front_media_expand(options.cwd.as_str(), text, app);
+    if not expanded.is_ok() { return front_restore_prompt(app, text, "Media unavailable, unsupported or exceeds limits / draft retained / check the selected files"); };
     let images = expanded.value.root().object_get("images")?;
     if images.array_len()? > 0 {
         let supported = controller_images_supported(state, options.connection.as_str(), options.model.as_str());
-        if not supported.is_ok() or not supported.value { return front_restore_prompt(app, text, "Selected model does not advertise image support / draft retained / choose a vision model"); };
+        if not supported.is_ok() or not supported.value { attachment_cleanup_generated(&expanded.value)?; return front_restore_prompt(app, text, "Selected model does not advertise image support / draft retained / choose a vision model"); };
         let captured = image_request_capture(images);
-        if not captured.is_ok() { return front_restore_prompt(app, text, "Image file is missing, invalid or exceeds limits / draft retained / repair it before sending again"); };
+        if not captured.is_ok() { attachment_cleanup_generated(&expanded.value)?; return front_restore_prompt(app, text, "Image file is missing, invalid or exceeds limits / draft retained / repair it before sending again"); };
     };
     let document = json_doc_object()?; let id = state_id("request-")?;
     cli_put_string(&document, document.root(), "type", "submit")?; cli_put_string(&document, document.root(), "id", id.as_str())?;
@@ -684,7 +708,8 @@ def front_action(state: &CliState, options: &mut AgentOptions, app: &mut UiApp, 
             return tui_status(app, message);
         };
         let paths = pasted.value.root().object_get("paths")?;
-        if paths.array_len()? > 0 { let inserted = tui_image_insert(app, paths); if not inserted.is_ok() {
+        if paths.array_len()? > 0 { let inserted = tui_image_insert_text(app, paths, cli_json_string(pasted.value.root(), "text")?.as_str()); if not inserted.is_ok() {
+            attachment_cleanup_generated(&pasted.value)?;
             // Only the local glue can set this field, and only after its
             // exclusive creation of this paste's pixel-only TEMP image.
             // Original clipboard file paths are never cleanup candidates.
@@ -705,10 +730,12 @@ def front_input(cwd: &str, app: &mut UiApp, event: &TerminalEvent) -> Result<UiA
     if event.kind == 2 and app.picker.len() == 0 and app.approval.len() == 0 and not app.menu_open and not app.reading.active and app.queue_edit_index < 0 {
         let parsed = attachment_parse_paths(cwd, event.data.as_str())?;
         if parsed.root().object_get("matched")?.bool_value()? {
-            let inserted = tui_image_insert(app, parsed.root().object_get("paths")?);
-            if not inserted.is_ok() { tui_status(app, "Image limit: eight per prompt, 128 references per UI, 64 KiB draft")?; (); };
+            let inserted = tui_image_insert_text(app, parsed.root().object_get("paths")?, cli_json_string(parsed.root(), "text")?.as_str());
+            if not inserted.is_ok() { attachment_cleanup_generated(&parsed)?; tui_event(app, event)?; tui_status(app, "Media exceeds image/draft limits / original text retained")?; (); };
             return tui_none();
         };
+        let status = cli_json_string(parsed.root(), "status")?;
+        if status.len() > 0 { let action = tui_event(app, event)?; tui_status(app, status.as_str())?; return Result { is_ok: true, value: action, error: 0 }; };
     };
     tui_event(app, event)
 }
@@ -815,7 +842,7 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
         if not handled.is_ok() { if not app.busy and options.policy.plan { front_finish_plan(options, &mut app, &host)?; (); }; let text = cli_text("Action stopped, code "); text.push_i64(handled.error)?; tui_message(&mut app, "notice", text.as_str())?; (); };
         front_permission_sync(options, &mut app, &host)?;
         if app.history_dirty and not app.busy and host.active.len() == 0 { front_remember_input(state, options, &mut app, false)?; (); };
-        if host.target_dirty and not app.busy and host.active.len() == 0 and host.input.used_len() == 0 { front_remember_target(state, options, &mut app, &mut host)?; needs_paint = true; (); };
+        if host.target_dirty and host.ready and not app.busy and host.active.len() == 0 and host.input.used_len() == 0 and time_monotonic_ms() >= host.target_retry_at { front_remember_target(state, options, &mut app, &mut host, false)?; needs_paint = true; (); };
         if host.permissions_dirty and host.ready and not app.busy and host.active.len() == 0 and host.input.used_len() == 0 and time_monotonic_ms() >= host.permission_retry_at { front_remember_permissions(state, options, &mut app, &mut host, false)?; needs_paint = true; (); };
         if pane.pending and app.picker.as_str() != "terminal-launch" { pane.pending = false; };
         front_worktree_dismiss(&mut worktrees, &mut app)?;
@@ -835,7 +862,7 @@ def frontend_run(state: &CliState, options: &mut AgentOptions, maximum: i64, tok
     pane_close(&mut pane, state)?; front_stop(&mut host)?;
     front_finish_plan(options, &mut app, &host)?;
     let history_saved = front_remember_input(state, options, &mut app, true);
-    front_remember_target(state, options, &mut app, &mut host)?;
+    front_remember_target(state, options, &mut app, &mut host, true)?;
     front_remember_permissions(state, options, &mut app, &mut host, true)?; terminal.leave_fullscreen()?;
     if not history_saved.is_ok() { ui_output("Input history could not be saved. The session may still be active.\n")?; return cli_fail(history_saved.error); };
     if not worktree_closed.is_ok() or not worktree_closed.value { return cli_fail(12); };

@@ -1,4 +1,5 @@
 import workspace;
+import video_attachment;
 import std::terminal;
 import std::random;
 import std::system;
@@ -30,34 +31,112 @@ def attachment_image_path(cwd: &str, value: &String) -> Result<String, i64> {
     Result { is_ok: true, value: path, error: 0 }
 }
 
-// Match only a complete pasted path list. Never read paths mentioned in prose.
+// Only a leading explicit selection is read. Prose/code/history are not scanned.
+def attachment_cleanup_generated(document: &JsonDoc) -> Result<bool, i64> {
+    if document.root().object_has("generated") {
+        let generated = document.root().object_get("generated")?; let mut index = 0;
+        while index < generated.array_len()? {
+            let item = json_doc_object()?;
+            item.root().object_set("paths", item.copy(generated.array_get(index)?.object_get("paths")?)?)?;
+            cli_put_string(&item, item.root(), "temporary_directory", cli_json_string(generated.array_get(index)?, "temporary_directory")?.as_str())?;
+            video_attachment_cleanup(&item)?; index = index + 1;
+        };
+    };
+    Result { is_ok: true, value: true, error: 0 }
+}
+
+def attachment_selection_error(output: &JsonDoc, code: i64) -> Result<JsonDoc, i64> {
+    attachment_cleanup_generated(output)?;
+    output.root().object_set("paths", output.new_array()?)?;
+    output.root().object_set("generated", output.new_array()?)?;
+    cli_put_bool(output, output.root(), "blocked", true)?;
+    cli_put_string(output, output.root(), "status", if code == 13 { "Media exceeds eight images / 8 MiB or decoder limits; original draft retained" } else { "Cannot attach selected media: missing, invalid, unsupported codec or decoder timeout; original draft retained" })?;
+    let result = json_parse(output.serialize_string()?.as_str())?;
+    Result { is_ok: true, value: result, error: 0 }
+}
+
+def attachment_video_extension(extension: &str) -> bool {
+    extension == "mp4" or extension == ".mp4" or extension == "mov" or extension == ".mov" or extension == "m4v" or extension == ".m4v" or extension == "avi" or extension == ".avi" or extension == "wmv" or extension == ".wmv" or extension == "mkv" or extension == ".mkv" or extension == "webm" or extension == ".webm"
+}
+
+def attachment_media_candidate(value: &str) -> Result<bool, i64> {
+    let parsed = path_extension_string(value);
+    if not parsed.is_ok() { return Result { is_ok: true, value: false, error: 0 }; };
+    let extension = str_to_ascii_lower(parsed.value.as_str())?;
+    Result { is_ok: true, value: attachment_video_extension(extension.as_str()) or extension.as_str() == "png" or extension.as_str() == ".png" or extension.as_str() == "jpg" or extension.as_str() == ".jpg" or extension.as_str() == "jpeg" or extension.as_str() == ".jpeg", error: 0 }
+}
+
 def attachment_parse_paths(cwd: &str, text: &str) -> Result<JsonDoc, i64> {
     let output = clipboard_attachment_result(text, "")?;
+    cli_put_bool(&output, output.root(), "blocked", false)?;
+    output.root().object_set("generated", output.new_array()?)?;
     if text.len() == 0 or text.len() > 65536 { return Result { is_ok: true, value: output, error: 0 }; };
-    let trimmed = str_trim(text)?; let candidates = output.new_array()?;
+    let trimmed = str_trim(text)?; let candidates = output.new_array()?; let task = string_new();
     if str_starts_with(trimmed.as_str(), "\"") or str_starts_with(trimmed.as_str(), "'") {
-        let chars = trimmed.chars(); let current = string_new(); let mut quote = 0; let mut valid = true;
+        let chars = trimmed.chars(); let current = string_new(); let mut quote = 0; let mut suffix = false; let mut quote_start = 0; let mut offset = 0;
         loop { let next = chars.next(); if not next.is_some { break; }; let cp = char_codepoint(next.value)?;
-            if quote == 0 { if cp == 34 or cp == 39 { quote = cp; } else { if cp != 32 and cp != 9 and cp != 10 and cp != 13 { valid = false; break; }; }; (); } else {
-                if cp == quote { candidates.array_push(output.new_string(current.as_str())?)?; current.clear(); quote = 0; (); } else { current.push_char(next.value)?; (); }; ();
+            if suffix { task.push_char(next.value)?; (); } else {
+                if quote == 0 {
+                    if cp == 34 or cp == 39 { quote = cp; quote_start = offset; } else {
+                        if cp != 32 and cp != 9 and cp != 10 and cp != 13 { suffix = true; task.push_char(next.value)?; (); }; ();
+                    }; ();
+                } else {
+                    if cp == quote {
+                        if not attachment_media_candidate(current.as_str())? {
+                            // After actual selected files, a quoted sentence is task text.
+                            task.push_str(cli_byte_slice(trimmed.as_str(), quote_start, trimmed.len())?.as_str())?; suffix = true; break;
+                        };
+                        candidates.array_push(output.new_string(current.as_str())?)?; current.clear(); quote = 0; ();
+                    } else { current.push_char(next.value)?; (); }; ();
+                }; ();
             };
+            offset = offset + if cp < 128 { 1 } else { if cp < 2048 { 2 } else { if cp < 65536 { 3 } else { 4 } } };
         }; chars.free();
-        if not valid or quote != 0 { return Result { is_ok: true, value: output, error: 0 }; }; ();
+        if quote != 0 and not suffix { return Result { is_ok: true, value: output, error: 0 }; }; ();
     } else {
-        let lines = trimmed.split("\n"); loop { let next = lines.next(); if not next.is_some { break; }; let path = str_trim(next.value.as_str())?; if path.len() > 0 { candidates.array_push(output.new_string(path.as_str())?)?; (); }; }; lines.free(); ();
+        let lines = trimmed.split("\n"); loop { let next = lines.next(); if not next.is_some { break; }; let path = str_trim(next.value.as_str())?; if path.len() > 0 { if not path_is_absolute(path.as_str()) and str_contains(path.as_str(), " ") { lines.free(); return Result { is_ok: true, value: output, error: 0 }; }; if not attachment_media_candidate(path.as_str())? { lines.free(); return Result { is_ok: true, value: output, error: 0 }; }; candidates.array_push(output.new_string(path.as_str())?)?; (); }; }; lines.free(); ();
     };
     let count = candidates.array_len()?;
-    if count == 0 or count > 8 { return Result { is_ok: true, value: output, error: 0 }; };
-    let paths = output.new_array()?; let mut index = 0;
+    if count == 0 { return Result { is_ok: true, value: output, error: 0 }; };
+    if count > 8 { return attachment_selection_error(&output, 13); };
+    let paths = output.root().object_get("paths")?; let notes = string_new(); let mut index = 0; let mut total = 0; let mut slots = 0;
+    // Validate the entire selection before decoding or creating output files.
     while index < count {
         let candidate = candidates.array_get(index)?.string_value()?;
-        let path = attachment_image_path(cwd, &candidate);
-        if not path.is_ok() { return Result { is_ok: true, value: output, error: 0 }; };
-        paths.array_push(output.new_string(path.value.as_str())?)?; index = index + 1;
+        let full = if path_is_absolute(candidate.as_str()) { candidate.clone()? } else { path_join_string(cwd, candidate.as_str())? };
+        let extension = str_to_ascii_lower(path_extension_string(full.as_str())?.as_str())?;
+        if attachment_video_extension(extension.as_str()) {
+            let kind = file_kind(full.as_str()); let length = file_len(full.as_str());
+            if not kind.is_ok() or kind.value != PATH_KIND_FILE() or not length.is_ok() { return attachment_selection_error(&output, 8); };
+            if length.value < 1 or length.value > 1073741824 { return attachment_selection_error(&output, 13); };
+            slots = slots + 3;
+        } else {
+            let image = attachment_image_path(cwd, &candidate);
+            if not image.is_ok() { return attachment_selection_error(&output, image.error); };
+            total = total + file_len(image.value.as_str())?; slots = slots + 1;
+        };
+        if slots > 8 or total > 8388608 { return attachment_selection_error(&output, 13); }; index = index + 1;
     };
-    output.root().object_set("paths", paths)?; cli_put_bool(&output, output.root(), "matched", true)?;
-    cli_put_string(&output, output.root(), "text", "")?;
-    cli_put_string(&output, output.root(), "status", "Original images attached; no project copy created")?;
+    index = 0;
+    while index < count {
+        let candidate = candidates.array_get(index)?.string_value()?;
+        let full = if path_is_absolute(candidate.as_str()) { candidate.clone()? } else { path_join_string(cwd, candidate.as_str())? };
+        let extension = str_to_ascii_lower(path_extension_string(full.as_str())?.as_str())?;
+        if attachment_video_extension(extension.as_str()) {
+            let prepared = video_attachment_prepare(full.as_str());
+            if not prepared.is_ok() { return attachment_selection_error(&output, prepared.error); };
+            output.root().object_get("generated")?.array_push(output.copy(prepared.value.root())?)?;
+            let frames = prepared.value.root().object_get("paths")?; let mut frame = 0;
+            while frame < frames.array_len()? { let path = frames.array_get(frame)?.string_value()?; total = total + file_len(path.as_str())?; paths.array_push(output.new_string(path.as_str())?)?; frame = frame + 1; };
+            if total > 8388608 { return attachment_selection_error(&output, 13); };
+            notes.push_str(cli_json_string(prepared.value.root(), "text")?.as_str())?; notes.push_str("\n")?; ();
+        } else { paths.array_push(output.new_string(attachment_image_path(cwd, &candidate)?.as_str())?)?; (); };
+        index = index + 1;
+    };
+    notes.push_str(task.as_str())?;
+    cli_put_string(&output, output.root(), "text", notes.as_str())?;
+    cli_put_bool(&output, output.root(), "matched", true)?;
+    cli_put_string(&output, output.root(), "status", "Media attached / video shown as timestamped frames / Enter sends")?;
     Result { is_ok: true, value: output, error: 0 }
 }
 

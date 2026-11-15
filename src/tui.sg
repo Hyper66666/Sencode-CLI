@@ -523,6 +523,10 @@ def tui_set_draft(app: &mut UiApp, text: &str) -> Result<bool, i64> {
 }
 
 def tui_image_insert(app: &mut UiApp, paths: JsonValue) -> Result<bool, i64> {
+    tui_image_insert_text(app, paths, "")
+}
+
+def tui_image_insert_text(app: &mut UiApp, paths: JsonValue, suffix: &str) -> Result<bool, i64> {
     if paths.array_len()? < 1 or paths.array_len()? > 8 { return Result { is_ok: false, value: false, error: 13 }; };
     let references: Vec<UiImageRef> = vec_new(); let mut index = 0;
     while index < app.images.len() { let image: &UiImageRef = app.images.get(index); references.push(UiImageRef { id: image.id, path: image.path.clone()? }); index = index + 1; };
@@ -533,6 +537,7 @@ def tui_image_insert(app: &mut UiApp, paths: JsonValue) -> Result<bool, i64> {
         if found == references.len() { if references.len() >= 128 { return Result { is_ok: false, value: false, error: 13 }; }; references.push(UiImageRef { id: references.len() + 1, path: path.clone()? }); (); };
         if index > 0 { insertion.push_str(" ")?; (); }; insertion.push_str(images_token(references.get(found).id)?.as_str())?; index = index + 1;
     };
+    if suffix.len() > 0 { insertion.push_str(" ")?; insertion.push_str(suffix)?; (); };
     let cursor_advance = insertion.len();
     if app.cursor < app.draft.len() { insertion.push_str(" ")?; (); };
     if app.draft.len() + insertion.len() > 65536 { return Result { is_ok: false, value: false, error: 13 }; };

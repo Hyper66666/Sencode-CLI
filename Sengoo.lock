@@ -43,6 +43,14 @@ source.path = "../Sengoo/packages/sgmcp"
 manifest = "../Sengoo/packages/sgmcp/Sengoo.toml"
 
 [[package]]
+id = "sgmedia@0.1.0+path:../Sengoo/packages/sgmedia"
+name = "sgmedia"
+version = "0.1.0"
+source.kind = "path"
+source.path = "../Sengoo/packages/sgmedia"
+manifest = "../Sengoo/packages/sgmedia/Sengoo.toml"
+
+[[package]]
 id = "sencode_sg@0.1.0-dev.0+path:."
 name = "sencode_sg"
 version = "0.1.0-dev.0"
@@ -79,6 +87,11 @@ to = "sgmcp@0.1.0+path:../Sengoo/packages/sgmcp"
 from = "sgmcp@0.1.0+path:../Sengoo/packages/sgmcp"
 alias = "sgschema"
 to = "sgschema@0.1.0+path:../Sengoo/packages/sgschema"
+
+[[dependency]]
+from = "sencode_sg@0.1.0-dev.0+path:."
+alias = "sgmedia"
+to = "sgmedia@0.1.0+path:../Sengoo/packages/sgmedia"
 
 [[dependency]]
 from = "sencode_sg@0.1.0-dev.0+path:."

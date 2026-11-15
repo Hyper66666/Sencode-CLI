@@ -46,13 +46,18 @@ def main():
             assert result["text"] == "", result
             assert result["temporary_path"] == "", result
         checks.append("quoted-unquoted-relative-and-Unicode-original-paths")
-        for value in [f'"{first}" "{second}"', f"{first}\n{second}", f"'{first}'\r\n'{second}'"]:
+        for value in [f'"{first}" "{second}"', f"{first}\n{second}", f"'{first}'\r\n'{second}'", f'"{first}""{second}"']:
             result = parse(value)
             assert result["matched"] and len(result["paths"]) == 2, result
             assert os.path.samefile(result["paths"][0], first), result
             assert os.path.samefile(result["paths"][1], second), result
         checks.append("multiple-quoted-and-newline-paths")
-        for value in [f"please inspect {first}", f'"{first}" trailing prose', f'"{first}',
+        for value, task in [(f'"{first}" trailing prose', "trailing prose"),
+                            (f'"{first}""{second}"这是产品设计，请参照图片优化前端', "这是产品设计，请参照图片优化前端")]:
+            result = parse(value)
+            assert result["matched"] and result["text"] == task and result["paths"], result
+        checks.append("adjacent-quoted-paths-with-task-text-preserved")
+        for value in ["你好", "SLOW", "explain", f"please inspect {first}", f'"{first}',
                       str(bad), str(scratch / "missing.png"), " ".join([f'"{first}"'] * 9)]:
             result = parse(value)
             assert not result["matched"] and not result["paths"] and result["text"] == value, result
